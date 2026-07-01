@@ -1,0 +1,147 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>GMix — How it works</title>
+<style>
+  :root{
+    --bg:#0d0f14; --panel:#161a23; --panel2:#1d2230; --line:#2a3142;
+    --pink:#ff66aa; --text:#e7ebf3; --muted:#9aa4b8; --accent:#5ec8ff;
+    --good:#7ee787;
+  }
+  *{box-sizing:border-box}
+  body{
+    margin:0; background:radial-gradient(1200px 600px at 50% -10%, #1a1f2b, var(--bg));
+    color:var(--text); font:16px/1.55 -apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;
+    padding:48px 20px 80px;
+  }
+  .wrap{max-width:1000px; margin:0 auto}
+  header{text-align:center; margin-bottom:14px}
+  h1{margin:0; font-size:40px; letter-spacing:.5px}
+  h1 .g{color:var(--pink)}
+  .tag{color:var(--muted); margin-top:6px; font-size:15px}
+  .lead{
+    background:var(--panel); border:1px solid var(--line); border-radius:14px;
+    padding:18px 22px; margin:26px auto 36px; max-width:760px; text-align:center;
+    color:var(--muted);
+  }
+  .lead b{color:var(--text)}
+
+  .flow{display:flex; flex-direction:column; align-items:center; gap:0}
+  .stage{
+    width:100%; max-width:720px; background:linear-gradient(180deg,var(--panel2),var(--panel));
+    border:1px solid var(--line); border-radius:14px; padding:18px 22px;
+    position:relative; box-shadow:0 6px 18px rgba(0,0,0,.25);
+  }
+  .stage .num{
+    position:absolute; left:-14px; top:-14px; width:34px; height:34px; border-radius:50%;
+    background:var(--pink); color:#1b0d16; font-weight:700; display:flex;
+    align-items:center; justify-content:center; font-size:16px; box-shadow:0 2px 8px rgba(0,0,0,.4);
+  }
+  .stage h3{margin:0 0 4px; font-size:19px}
+  .stage h3 .where{font-size:12px; color:var(--accent); font-weight:600; margin-left:8px;
+    border:1px solid #244; padding:1px 7px; border-radius:20px; vertical-align:middle}
+  .stage p{margin:6px 0 0; color:var(--muted); font-size:14.5px}
+  .arrow{color:var(--line); font-size:26px; line-height:1; margin:8px 0}
+  .arrow b{color:var(--pink)}
+  .arrow small{display:block; color:var(--muted); font-size:12px; margin-top:2px}
+
+  .two{display:flex; gap:14px; flex-wrap:wrap; justify-content:center; margin-top:6px}
+  .chip{background:#0f131c; border:1px solid var(--line); border-radius:10px;
+    padding:8px 12px; font-size:12.5px; color:var(--muted)}
+  .chip b{color:var(--text)}
+
+  .facts{display:flex; gap:14px; flex-wrap:wrap; justify-content:center; margin:40px 0 0}
+  .fact{background:var(--panel); border:1px solid var(--line); border-radius:12px;
+    padding:16px 20px; min-width:150px; text-align:center}
+  .fact .big{font-size:26px; font-weight:700; color:var(--good)}
+  .fact .lbl{color:var(--muted); font-size:12.5px; margin-top:4px}
+  footer{text-align:center; color:var(--muted); font-size:13px; margin-top:42px}
+  code{background:#0f131c; border:1px solid var(--line); padding:1px 6px; border-radius:6px;
+    color:var(--accent); font-size:13px}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1><span class="g">GMix</span> — how it works</h1>
+    <div class="tag">temporal frame-blending for high-fps games · Linux / Wayland / Vulkan</div>
+  </header>
+
+  <div class="lead">
+    A game renders at <b>hundreds of fps</b>, but a stream is only <b>60fps</b> — so most
+    frames get thrown away and fast motion looks choppy. GMix captures <b>every</b> frame and
+    blends all of them within each 1/60s into one, giving a clean 60fps video with
+    <b>real motion blur</b> built from actual rendered frames (not a fake shader).
+  </div>
+
+  <div class="flow">
+
+    <div class="stage">
+      <div class="num">1</div>
+      <h3>Game renders<span class="where">osu!</span></h3>
+      <p>osu! draws frames as fast as the GPU allows — often 300–1000 fps. Each frame holds
+         real positional data about the cursor and notes between the 60fps "ticks" a normal
+         recording would keep.</p>
+    </div>
+
+    <div class="arrow">&#8595;<small>every presented frame</small></div>
+
+    <div class="stage">
+      <div class="num">2</div>
+      <h3>Capture layer<span class="where">VkLayer_GMIX (inside osu!)</span></h3>
+      <p>A Vulkan layer hooks the game's frame-present. On each frame it copies the finished
+         image and exports it as a shared GPU buffer — no CPU copy, no encode. Frames never
+         leave the GPU.</p>
+      <div class="two">
+        <div class="chip"><b>zero-copy:</b> shared memory + sync via fd over a socket</div>
+        <div class="chip"><b>injected automatically</b> — game is unmodified</div>
+      </div>
+    </div>
+
+    <div class="arrow">&#8595;<small>shared GPU frame + timestamp</small></div>
+
+    <div class="stage">
+      <div class="num">3</div>
+      <h3>Ring buffer<span class="where">gmix (separate process)</span></h3>
+      <p>GMix imports the shared frames into a rolling buffer of the most recent ones, always
+         keeping the freshest (old backlog is dropped so latency stays low and constant).</p>
+    </div>
+
+    <div class="arrow">&#8595;<small>frames from the last 1/60s</small></div>
+
+    <div class="stage">
+      <div class="num">4</div>
+      <h3>Shutter blend<span class="where">compute shader, 60&nbsp;Hz</span></h3>
+      <p>60 times a second, a GPU compute shader takes every frame captured within the last
+         <b>1/60s</b> and blends them per-pixel — exactly like a real camera shutter. Fast
+         motion smears into a smooth trail; anything still stays sharp.</p>
+    </div>
+
+    <div class="arrow">&#8595;<small>one clean blended frame</small></div>
+
+    <div class="stage">
+      <div class="num">5</div>
+      <h3>Output window<span class="where">Wayland, 60&nbsp;fps</span></h3>
+      <p>The blended result is shown in a normal 60fps window. OBS captures it like any other
+         source — what goes to the stream is a mathematically real average of all the motion
+         that actually happened.</p>
+    </div>
+
+  </div>
+
+  <div class="facts">
+    <div class="fact"><div class="big">~11 ms</div><div class="lbl">added latency (steady)</div></div>
+    <div class="fact"><div class="big">1/60s</div><div class="lbl">shutter window (tunable)</div></div>
+    <div class="fact"><div class="big">0</div><div class="lbl">fake frames — all real data</div></div>
+    <div class="fact"><div class="big">60 fps</div><div class="lbl">clean output for OBS</div></div>
+  </div>
+
+  <footer>
+    GMix v1 · proof of concept · run with
+    <code>gmix -i search=osu! -o w1280 h1024 -preset=flat</code>
+  </footer>
+</div>
+</body>
+</html>

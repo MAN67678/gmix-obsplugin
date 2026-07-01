@@ -1,0 +1,46 @@
+================================================================================
+  GMix v1 — test footage (read me!)
+================================================================================
+
+What you're looking at
+----------------------
+This is gameplay run through GMix, a little tool I've been building.
+
+osu! runs at hundreds of frames per second, but a normal stream/recording is
+only 60fps — so 15 out of every 16 frames the game drew just get thrown away.
+All that real motion between frames is lost, and fast cursor movement ends up
+looking choppy.
+
+GMix grabs ALL of those frames straight off the GPU and blends every frame that
+happened within each 1/60th of a second into one output frame. The result is a
+clean 60fps video with proper motion blur — the cursor and notes leave a smooth
+trail during fast movement, like a real camera shutter, instead of teleporting
+frame to frame.
+
+Why it's different from "motion blur" you've seen before
+--------------------------------------------------------
+- It's NOT a fake/aesthetic blur shader guessing at motion. Every blended
+  pixel is real frame data the game actually rendered.
+- The blur length matches a real 1/60s camera shutter, so it looks natural,
+  not smeary. Static screens (menus, song select) stay perfectly sharp —
+  blur only shows up where there's actual motion.
+- The output is just a normal 60fps window, so OBS captures it like anything
+  else. Nothing fake baked in.
+
+The nerdy bits (skip if you don't care)
+---------------------------------------
+- Linux / Wayland / Vulkan, no game modification.
+- A Vulkan capture layer pulls finished frames out of osu!'s VRAM and hands
+  them to GMix over a zero-copy shared-memory link (no CPU encode in the path).
+- A compute shader does the per-pixel weighted blend at 60fps.
+- End-to-end delay from game to GMix output is about ~11ms and stays constant,
+  so audio still lines up fine.
+
+Status
+------
+This is v1 — a working proof of concept. It currently targets osu! on Linux.
+The blur amount is a single knob (a virtual shutter time); 1/60s is the
+default and looks the cleanest.
+
+Made for fun / as a learning project. Feedback welcome!
+================================================================================

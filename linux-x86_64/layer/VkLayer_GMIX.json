@@ -1,0 +1,23 @@
+{
+    "file_format_version": "1.1.2",
+    "layer": {
+        "name": "VK_LAYER_GMIX",
+        "type": "GLOBAL",
+        "description": "GMix temporal frame capture (osu!/Vulkan)",
+        "implementation_version": "1",
+        "api_version": "1.2.0",
+        "enable_environment": {
+            "ENABLE_GMIX": "1"
+        },
+        "disable_environment": {
+            "DISABLE_GMIX": "1"
+        },
+        "functions": {
+            "vkGetInstanceProcAddr": "GMIX_GetInstanceProcAddr",
+            "vkGetDeviceProcAddr":   "GMIX_GetDeviceProcAddr",
+            "vkNegotiateLoaderLayerInterfaceVersion": "GMIX_NegotiateLoaderLayerInterfaceVersion"
+        },
+        "instance_extensions": [],
+        "device_extensions": []
+    }
+}
