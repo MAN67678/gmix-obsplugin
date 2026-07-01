@@ -93,3 +93,45 @@ left in (off) rather than risk a removal-regression at the finish line.
   consumer import throughput, see note 2).
 - Wire the not-yet-used `LayerIpc` notification socket or remove it.
 - Make `-blur-ms` adjustable without relaunch (e.g. read a control file).
+
+## KNOWN BUG (2026-07-02): GMix only renders in the first scene it's added to
+
+**Symptom:** add "GMix Motion Blur" to scene A -> works. Add "GMix Motion
+Blur" to scene B (via `+` -> GMix Motion Blur again, creating a SECOND
+source) -> scene B stays black/blank. Deleting the source from whichever
+scene isn't working and re-adding it can get it going again, but only one
+scene at a time ever actually displays gameplay.
+
+**Suspected root cause:** every `GmixSource` instance's worker thread calls
+`gmix::ipc::FrameReceiver::listen()` on the same well-known, hardcoded unix
+socket path (`gmix::ipc::defaultFrameSocketPath()`, i.e.
+`~/.cache/gmix/frames.sock`) — see `workerMain()` in
+`src/obs_plugin/gmix_source.cpp`. `bind()` on a given path can only succeed
+for ONE listener at a time. Using OBS's `+` button to add "GMix Motion
+Blur" in a second scene creates a **second, independent** `obs_source_info`
+instance (its own `create()`/worker thread/receiver), not a reference to the
+first one — so the second instance's `listen()` call fails (the socket is
+already bound by the first instance), and it just sits forever logging
+"waiting for producer to connect" while never actually receiving anything
+(the OBS log should confirm this — check for a `listen` failure or a stuck
+"waiting for producer" line with no matching "producer connected" for the
+second instance).
+
+**Workaround for users (put in README):** don't create a second "GMix
+Motion Blur" source per scene. Instead, add the SAME existing source to
+additional scenes: right-click the target scene -> **Add Existing Source**
+(or drag the source from the Sources list while holding the scene target) ->
+pick the existing "GMix Motion Blur" source. This reuses the one
+`GmixSource` instance (and its one socket listener) across scenes, since a
+single OBS source can be a member of multiple scenes simultaneously.
+
+**Real fix (not yet done):** either (a) make the plugin itself
+single-instance — e.g. a process-wide static/singleton owning the one
+receiver+blend pipeline, with each `GmixSource` `create()` call just
+attaching to it as a viewer (ref-counted), so creating N source objects is
+harmless and all of them render the same live feed; or (b) have
+`listen()`'s failure path fall back to a `connect()` attempt against an
+already-listening sibling instance's socket (more complex, not recommended
+over (a)). Option (a) is the natural fix and should be done before this
+ships more broadly — filed here instead of fixed immediately per user
+request ("will look at that later on").

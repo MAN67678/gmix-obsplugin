@@ -159,6 +159,17 @@ Finding the Flatpak OBS's `OBS_INCLUDE_DIR`:
 
     find /var/lib/flatpak/app/com.obsproject.Studio -maxdepth 6 -type d -name obs 2>/dev/null | grep include
 
+## Known issues
+
+- **Only renders in one scene at a time if you add it as a NEW source per
+  scene.** Adding "GMix Motion Blur" via `+` in a second scene creates a
+  second, independent plugin instance, and both compete for the same
+  capture socket — only the first one actually receives frames. **Workaround:**
+  add the *existing* GMix source to additional scenes instead of creating a
+  new one — right-click the scene -> **Add Existing Source** -> pick "GMix
+  Motion Blur". A real fix (a single shared capture instance viewers attach
+  to) is tracked in `etc/DEV_NOTES.md` but not implemented yet.
+
 ## Notes
 
 - Zero-copy relies on `VK_EXT_external_memory_dma_buf` + `VK_IMAGE_TILING_LINEAR`
