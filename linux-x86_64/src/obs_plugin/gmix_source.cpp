@@ -65,6 +65,35 @@ gmix::BlendConfig::Mode presetSettingToMode(const char* v) {
     return gmix::BlendConfig::Mode::Flat;
 }
 
+// ── Diagnostics: EMA-smoothed rate tracker for the periodic status log ─────
+// Mutex-guarded rather than lock-free: this is a low-frequency diagnostic
+// path (ticked at most a few hundred times/sec, read once every few
+// seconds), and some tick() call sites (gmixVideoRender) may run on OBS's
+// render thread rather than the worker thread, so correctness is worth more
+// here than shaving a lock.
+class RateTracker {
+public:
+    void tick() {
+        auto now = std::chrono::steady_clock::now();
+        std::lock_guard<std::mutex> lk(mu_);
+        if (haveLast_) {
+            double intervalMs = std::chrono::duration<double, std::milli>(now - last_).count();
+            emaMs_ = (emaMs_ <= 0.0) ? intervalMs : (emaMs_ * 0.9 + intervalMs * 0.1);
+        }
+        last_ = now;
+        haveLast_ = true;
+    }
+    double fps() const {
+        std::lock_guard<std::mutex> lk(mu_);
+        return emaMs_ > 0.0 ? 1000.0 / emaMs_ : 0.0;
+    }
+private:
+    mutable std::mutex mu_;
+    std::chrono::steady_clock::time_point last_;
+    bool   haveLast_ = false;
+    double emaMs_    = 0.0;
+};
+
 // The capture LAYER (a separate process, injected into the game) does NOT
 // read GMIX_TARGET_PROCESS -- that env var is vestigial. It reads this file
 // once at its own vkCreateInstance time and stays disabled for the process's
@@ -136,9 +165,14 @@ struct FrameQueue {
 
 void receiverThreadFn(gmix::ipc::FrameReceiver& receiver, gmix::VulkanContext& vk,
                       FrameQueue& q, gmix::FrameImagePool& pool,
-                      gmix::SemaphorePool& semPool) {
+                      gmix::SemaphorePool& semPool,
+                      RateTracker& producerRate, RateTracker& consumerRate) {
     gmix::ipc::RecvFrame rf{};
     while (receiver.recvFrame(rf)) {
+        // Ticked here, before the drop-check below: this is every frame the
+        // capture layer actually sent, i.e. the producer/game's real export
+        // rate, regardless of whether the consumer keeps up with it.
+        producerRate.tick();
         if (receiver.hasPendingFrame()) {
             if (rf.memFd >= 0) ::close(rf.memFd);
             if (rf.semFd >= 0) ::close(rf.semFd);
@@ -153,6 +187,7 @@ void receiverThreadFn(gmix::ipc::FrameReceiver& receiver, gmix::VulkanContext& v
         if (!frame->init(vk, img, std::move(sem), rf.header.semSignalValue)) continue;
         q.push(std::move(frame), rf.header.width, rf.header.height,
                rf.header.timestampNs, rf.header.gpuTimestampNs);
+        consumerRate.tick();   // survived the drop -- actually available to the blend
     }
     q.disconnected = true;
 }
@@ -205,6 +240,58 @@ struct GmixEngine {
     std::mutex        blendConfigMu;
     gmix::BlendConfig blendConfig;
 
+    // ── Diagnostics: FPS at each pipeline stage + per-stage latency ─────────
+    // The pipeline has three conceptually distinct latency segments:
+    //   osu! present -> [ shutter window, ~16.6ms BY DESIGN, not measured --
+    //                     the blend intentionally uses frames up to one
+    //                     output-frame-interval behind the newest present;
+    //                     see the FrameQueue/shutterNs comments above ]
+    //                 -> [ blendLatencyMs: dispatch -> retire. Pure GPU/CPU
+    //                     processing cost. Should be SMALL and CONSISTENT --
+    //                     this is the one to watch for a genuine pipeline
+    //                     problem, e.g. GPU contention with the game. ]
+    //                 -> [ drawLatencyMs: retire -> actually drawn by OBS.
+    //                     Bounded by OBS's own render cadence -- since
+    //                     dispatch is tick-gated (see kDstBuffers/tickSeq
+    //                     comments) but a blend can still retire at ANY
+    //                     point relative to OBS's next video_render call,
+    //                     this legitimately averages roughly half an OBS
+    //                     frame interval and can be jittery near a full
+    //                     interval -- that's expected, not a bug. ]
+    // An earlier version measured "newest captured frame's timestamp to
+    // retire" as a single "latencyMs" -- that conflated the (inherent,
+    // fine) capture-to-dispatch PHASE offset between osu!'s and OBS's two
+    // independently-paced ~60Hz clocks with actual processing cost, which
+    // is why it read as low-but-jittery (2-19ms) instead of showing a
+    // stable blend cost -- see etc/DEV_NOTES.md. Replaced with the two
+    // segments above, which is what's actually actionable.
+    //
+    // producerRate : ticked in receiverThreadFn on every frame the CAPTURE
+    //                LAYER actually sent over the socket (before any drop) --
+    //                the producer/game's real export rate.
+    // consumerRate : ticked in receiverThreadFn only for frames that survive
+    //                the backlog-drop and get pushed into the ring -- the
+    //                rate actually available to the blend.
+    // blendRate    : ticked in workerMain each time pollBlendDone() retires a
+    //                blend -- the achieved output-update rate.
+    // drawnRate    : ticked in gmixVideoRender only when the drawn frontIdx
+    //                actually CHANGED since the last draw (across however
+    //                many scenes the source is in) -- how often OBS is
+    //                actually shown a new frame, not just how often it calls
+    //                video_render (which would just echo OBS's own fps).
+    // frontReadyTimeNs : steady_clock ns at the moment a blend retired --
+    //                written by workerMain, read by gmixVideoRender (a
+    //                DIFFERENT thread, OBS's render thread) to compute
+    //                drawLatencyMs, hence atomic.
+    RateTracker producerRate;
+    RateTracker consumerRate;
+    RateTracker blendRate;
+    RateTracker drawnRate;
+    std::atomic<int>      lastDrawnFrontIdx{-1};
+    std::atomic<uint64_t> frontReadyTimeNs{0};
+    std::atomic<double>   blendLatencyMs{0.0};
+    std::atomic<double>   drawLatencyMs{0.0};
+
     ~GmixEngine() { delete blend; }
 };
 
@@ -247,12 +334,19 @@ void releaseEngine() {
     if (!gEngine || --gEngine->refCount > 0) return;
     gEngine->stop = true;
     if (gEngine->worker.joinable()) gEngine->worker.join();
+    // Same lock-order-inversion fix as the resize/import paths in workerMain():
+    // never hold texMu across obs_enter_graphics()/gs_texture_destroy().
+    gs_texture_t* oldTex[gmix::BlendEngine::kDstBuffers] = {};
     {
         std::lock_guard<std::mutex> lk2(gEngine->texMu);
-        obs_enter_graphics();
-        for (auto& t : gEngine->tex) { if (t) gs_texture_destroy(t); t = nullptr; }
-        obs_leave_graphics();
+        for (uint32_t i = 0; i < gmix::BlendEngine::kDstBuffers; ++i) {
+            oldTex[i] = gEngine->tex[i];
+            gEngine->tex[i] = nullptr;
+        }
     }
+    obs_enter_graphics();
+    for (auto t : oldTex) { if (t) gs_texture_destroy(t); }
+    obs_leave_graphics();
     delete gEngine;
     gEngine = nullptr;
 }
@@ -309,10 +403,16 @@ void workerMain(GmixEngine* s) {
         gmix::FrameImagePool framePool;
         gmix::SemaphorePool  semPool;
         std::thread receiverThread(receiverThreadFn, std::ref(receiver), std::ref(s->vk),
-                                   std::ref(queue), std::ref(framePool), std::ref(semPool));
+                                   std::ref(queue), std::ref(framePool), std::ref(semPool),
+                                   std::ref(s->producerRate), std::ref(s->consumerRate));
 
         int frontIdx = -1;
         uint32_t inFlightIdx = 0;
+        // steady_clock ns at the moment the CURRENTLY in-flight dispatch was
+        // submitted -- read back when it retires to compute s->blendLatencyMs
+        // (pure processing cost, dispatch -> retire; see the pollBlendDone()
+        // block below).
+        uint64_t inFlightDispatchTimeNs = 0;
         uint64_t lastBlendArrivals = 0;
         // Round-robins the dispatch target across ALL kDstBuffers dst images
         // instead of a strict front/back ping-pong -- see the kDstBuffers==3
@@ -321,14 +421,47 @@ void workerMain(GmixEngine* s) {
         // PREVIOUS front buffer, so cycling through 3 slots gives one extra
         // dispatch generation of grace before a buffer is reused.
         uint32_t nextWriteIdx = 0;
-        // Cap how often a NEW blend is launched, and the width of the shutter
-        // window blended per dispatch, to OBS's OWN configured output rate
-        // (s->obsFrameSec, kept live by gmixVideoTick()) rather than an
-        // assumed 60Hz, so both track reality if OBS runs at 30/144/etc.
-        // Without the cap, a new blend would launch on EVERY new arrival --
-        // up to osu!'s capture rate (600-1000/s) -- for no visual benefit,
-        // since each output frame is still a one-shutter-window average.
-        auto lastDispatchTime = std::chrono::steady_clock::now() - std::chrono::seconds(1);
+        // Cap how often a NEW blend is launched to "at most once per real OBS
+        // video_tick", tracked via s->tickSeq (bumped by gmixVideoTick() on
+        // every real render frame) -- NOT via an elapsed-wall-time interval.
+        // An earlier version gated on `now - lastDispatchTime >=
+        // minDispatchInterval` (a fixed nominal duration derived from OBS's
+        // CONFIGURED fps). That fixed a systematic under-target drift (see
+        // etc/DEV_NOTES.md), but then measurably showed up as `drawn` fps
+        // trailing `blend` fps during high-producer-fps periods: OBS's own
+        // real per-frame cadence has natural jitter even at a clean configured
+        // 60/1, so gmix's independently-clocked, perfectly-steady dispatch
+        // grid would occasionally race ahead of it, completing a SECOND blend
+        // before OBS ever called video_render to observe the first one --
+        // the classic "two nominally-equal but independently-paced clocks
+        // beat against each other" failure mode, just reintroduced one layer
+        // up from where it was originally fixed (video_tick-driven wakeup).
+        // Gating on tickSeq instead ties dispatch 1:1 to OBS's ACTUAL
+        // real callback cadence, whatever its jitter, eliminating the second
+        // clock outright. The shutter window WIDTH still uses obsFrameSec
+        // (a stable target duration, not a pacing throttle) -- unaffected.
+        //
+        // KNOWN, ACCEPTED minor inefficiency: video_tick fires MORE than once
+        // per real frame while an OBS recording is active (confirmed live,
+        // reproduced across 4 separate recording sessions in one log --
+        // `blend` measured 67-97fps instead of 60 for the whole duration of
+        // each recording, snapping back to 60 within ~2s of it stopping;
+        // likely an extra render/tick pass for the recording output pipeline
+        // alongside the live preview). This wastes some GPU time on blends
+        // nobody ever sees -- `drawn` stays pinned at exactly 60fps the whole
+        // time regardless, so it's NOT a visible artifact or a stall, just
+        // avoidable work. Deliberately left as-is: the "correct" fix needs
+        // either certainty about libobs's exact multi-output tick semantics
+        // (not verified) or a wall-clock safety cap, and a wall-clock cap
+        // done wrong is EXACTLY what caused the drawn-trailing-blend judder
+        // bug fixed above -- not worth the regression risk for a
+        // non-visible inefficiency. Revisit only if it's shown to cause a
+        // real problem (e.g. GPU contention during recording).
+        uint64_t lastDispatchedTickSeq = s->tickSeq.load(std::memory_order_relaxed);
+        // Periodic FPS/latency summary -- see the RateTracker fields on
+        // GmixEngine for what each stage measures.
+        auto lastStatusLogTime = std::chrono::steady_clock::now();
+        constexpr auto kStatusLogInterval = std::chrono::seconds(2);
 
         // Imports each dst buffer's dma-buf ONCE (lazily, first time seen for
         // its current generation) into `arr` -- matches the project's
@@ -401,21 +534,67 @@ void workerMain(GmixEngine* s) {
             if (awaitingSwap) {
                 importDstBuffers(pendingTex, " (staged for resize swap)");
             } else {
-                std::lock_guard<std::mutex> lk(s->texMu);
-                importDstBuffers(s->tex, "");
+                // NEVER hold texMu across obs_enter_graphics()/gs_texture_*
+                // (which importDstBuffers calls internally) -- gmixVideoRender()
+                // runs on OBS's own render thread, which already holds OBS's
+                // graphics context by the time it's called and then tries to
+                // acquire texMu. Holding texMu here first and THEN requesting
+                // the graphics context is the exact reverse order -- a classic
+                // lock-order inversion that can stall OBS's render thread
+                // (symptom: OBS's compositor/window-manager briefly flags it
+                // "not responding" under contention, without a permanent hang).
+                // Snapshot s->tex under a brief lock, import into the snapshot
+                // WITHOUT holding texMu, then merge the newly-created pointers
+                // back under another brief lock -- texMu is never held while
+                // calling into OBS's graphics API.
+                gs_texture_t* texSnapshot[gmix::BlendEngine::kDstBuffers];
+                {
+                    std::lock_guard<std::mutex> lk(s->texMu);
+                    for (uint32_t i = 0; i < gmix::BlendEngine::kDstBuffers; ++i)
+                        texSnapshot[i] = s->tex[i];
+                }
+                importDstBuffers(texSnapshot, "");
+                {
+                    std::lock_guard<std::mutex> lk(s->texMu);
+                    for (uint32_t i = 0; i < gmix::BlendEngine::kDstBuffers; ++i) {
+                        if (!s->tex[i] && texSnapshot[i]) s->tex[i] = texSnapshot[i];
+                    }
+                }
             }
 
             if (s->blend->pollBlendDone()) {
                 frontIdx = static_cast<int>(inFlightIdx);
+                s->blendRate.tick();
+                uint64_t nowNs = static_cast<uint64_t>(
+                    std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        std::chrono::steady_clock::now().time_since_epoch()).count());
+                if (inFlightDispatchTimeNs != 0 && nowNs > inFlightDispatchTimeNs) {
+                    s->blendLatencyMs.store((nowNs - inFlightDispatchTimeNs) / 1e6,
+                                            std::memory_order_relaxed);
+                }
+                // Timestamp this retirement for gmixVideoRender() (a DIFFERENT
+                // thread) to compute drawLatencyMs against once it actually
+                // observes this new frontIdx.
+                s->frontReadyTimeNs.store(nowNs, std::memory_order_relaxed);
                 if (awaitingSwap) {
-                    std::lock_guard<std::mutex> lk(s->texMu);
-                    for (uint32_t i = 0; i < gmix::BlendEngine::kDstBuffers; ++i) {
-                        if (s->tex[i]) { obs_enter_graphics(); gs_texture_destroy(s->tex[i]); obs_leave_graphics(); }
-                        s->tex[i] = pendingTex[i];
-                        pendingTex[i] = nullptr;
+                    // Same lock-order-inversion fix as the import branch above:
+                    // swap the pointers under a brief texMu lock (no graphics
+                    // calls), THEN destroy the displaced old textures with
+                    // texMu already released.
+                    gs_texture_t* oldTex[gmix::BlendEngine::kDstBuffers] = {};
+                    {
+                        std::lock_guard<std::mutex> lk(s->texMu);
+                        for (uint32_t i = 0; i < gmix::BlendEngine::kDstBuffers; ++i) {
+                            oldTex[i] = s->tex[i];
+                            s->tex[i] = pendingTex[i];
+                            pendingTex[i] = nullptr;
+                        }
+                        s->width = s->blend->width();
+                        s->height = s->blend->height();
                     }
-                    s->width = s->blend->width();
-                    s->height = s->blend->height();
+                    obs_enter_graphics();
+                    for (auto t : oldTex) { if (t) gs_texture_destroy(t); }
+                    obs_leave_graphics();
                     awaitingSwap = false;
                     blog(LOG_INFO, "gmix: resize complete, swapped in new %ux%u textures", s->width, s->height);
                 }
@@ -435,11 +614,10 @@ void workerMain(GmixEngine* s) {
             // own frame interval (see above) -- new arrivals can exist far
             // more often than that.
             auto nowTick = std::chrono::steady_clock::now();
-            auto minDispatchInterval = std::chrono::duration_cast<std::chrono::steady_clock::duration>(
-                std::chrono::duration<double>(s->obsFrameSec.load(std::memory_order_relaxed)));
+            uint64_t curTickSeq = s->tickSeq.load(std::memory_order_relaxed);
             uint64_t arrivalsNow = queue.arrivals.load();
             if (!s->blend->blendInFlight() && arrivalsNow != lastBlendArrivals &&
-                nowTick - lastDispatchTime >= minDispatchInterval) {
+                curTickSeq != lastDispatchedTickSeq) {
                 // Live snapshot of the blend preset -- gmixUpdate() can change
                 // it at any time (OBS properties dialog), and it's shared
                 // across every attached GmixSource, so read it fresh here
@@ -497,11 +675,24 @@ void workerMain(GmixEngine* s) {
                                                 static_cast<uint32_t>(waitSems.size()),
                                                 resample)) {
                         inFlightIdx = back;
+                        inFlightDispatchTimeNs = static_cast<uint64_t>(
+                            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                nowTick.time_since_epoch()).count());
                         nextWriteIdx = (nextWriteIdx + 1) % gmix::BlendEngine::kDstBuffers;
                         lastBlendArrivals = arrivalsNow;
-                        lastDispatchTime = nowTick;
+                        lastDispatchedTickSeq = curTickSeq;
                     }
                 }
+            }
+
+            if (nowTick - lastStatusLogTime >= kStatusLogInterval) {
+                blog(LOG_INFO,
+                     "gmix: status: producer=%.1ffps consumer=%.1ffps blend=%.1ffps "
+                     "drawn=%.1ffps blend_latency=%.1fms draw_latency=%.1fms",
+                     s->producerRate.fps(), s->consumerRate.fps(), s->blendRate.fps(),
+                     s->drawnRate.fps(), s->blendLatencyMs.load(std::memory_order_relaxed),
+                     s->drawLatencyMs.load(std::memory_order_relaxed));
+                lastStatusLogTime = nowTick;
             }
 
             // No internal output clock here, unlike the standalone `gmix`
@@ -708,6 +899,26 @@ void gmixVideoRender(void* data, gs_effect_t* effect) {
     gs_eparam_t* image = gs_effect_get_param_by_name(effect, "image");
     gs_effect_set_texture(image, tex);
     gs_draw_sprite(tex, 0, e->width, e->height);
+
+    // Ticked only when the drawn frontIdx actually CHANGED since the last
+    // draw (across however many scenes this source is in, and however many
+    // GmixSource instances call video_render per real OBS frame) -- measures
+    // how often OBS is actually shown a NEW frame, not just how often it
+    // calls video_render (which would just echo OBS's own configured fps).
+    if (e->lastDrawnFrontIdx.exchange(idx, std::memory_order_relaxed) != idx) {
+        e->drawnRate.tick();
+        // retire -> actually drawn. Bounded by OBS's own render cadence, not
+        // gmix's pipeline -- see the drawLatencyMs comment on GmixEngine.
+        uint64_t readyNs = e->frontReadyTimeNs.load(std::memory_order_relaxed);
+        if (readyNs != 0) {
+            uint64_t nowNs = static_cast<uint64_t>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now().time_since_epoch()).count());
+            if (nowNs > readyNs) {
+                e->drawLatencyMs.store((nowNs - readyNs) / 1e6, std::memory_order_relaxed);
+            }
+        }
+    }
 }
 
 struct obs_source_info gGmixSourceInfo = {};

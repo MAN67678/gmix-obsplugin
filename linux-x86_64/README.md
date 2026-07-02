@@ -30,9 +30,9 @@ concept of scores, timing windows, judgements, or input.
    (no virtual camera device, no extra encode/decode round-trip).
 4. Work with osu!lazer's Flatpak sandbox on Linux (persistent capture via
    `flatpak override`, no manual re-launch flags needed after setup).
-5. Let you pick a blend preset (Flat / Linear / Cinematic / Heavy / Advanced)
-   via OBS's own source Properties dialog, saved with your scene collection --
-   see "Blend presets" below.
+5. Let you pick a blend preset (Flat / Linear / Cinematic / Heavy, plus a
+   BETA "Advanced" mode) via OBS's own source Properties dialog, saved with
+   your scene collection -- see "Blend presets" below.
 
 **GMix CANNOT:**
 1. Read or write osu!'s process memory, beatmap data, replay data, or any
@@ -171,18 +171,26 @@ preset"), saved with your scene collection:
 - **Cinematic** — symmetric gaussian falloff. Soft, photographic.
 - **Heavy** — one-sided exponential decay from the newest frame. A long,
   visible trailing ghost.
-- **Advanced** ("optical awareness") — velocity-aware motion blur: estimates
-  a per-pixel motion direction each frame and smears real captured pixels
-  along it, producing a continuous directional streak (closer to the
-  "danser" look) instead of a soft average. Reveals two sliders: **Blur
-  density** (4-32) — taps per real frame along the motion direction; higher
-  packs the streak denser at proportionally higher GPU cost; and **Blur
-  brightness** (0.1-10, default 1.0) — how strongly a bright pixel in one
-  frame (e.g. a cursor) dominates its output pixel over the surrounding
-  darker frames; higher makes the trail more blown-out/glowing, lower keeps
-  it closer to a plain average. Flat/Linear/Cinematic/Heavy all use the
-  plain averaging shader; only Advanced routes to the separate optical-flow
-  shader.
+- **Advanced** ("optical awareness") — **BETA, not the recommended/default
+  choice.** Velocity-aware motion blur: estimates a per-pixel motion
+  direction each frame and smears real captured pixels along it, producing a
+  continuous directional streak (closer to the "danser" look) instead of a
+  soft average. Reveals two sliders: **Blur density** (4-32) — taps per real
+  frame along the motion direction; higher packs the streak denser at
+  proportionally higher GPU cost (measured live: blend time went from a
+  ~2.2ms baseline to a stable ~8-11ms during real gameplay with density
+  turned up — the pipeline absorbed it fine with no fps drop in that test,
+  but it's a real, non-trivial cost, not a rounding error); and **Blur
+  brightness** (0.1-10, default
+  1.0) — how strongly a bright pixel in one frame (e.g. a cursor) dominates
+  its output pixel over the surrounding darker frames; higher makes the
+  trail more blown-out/glowing, lower keeps it closer to a plain average.
+  Flat/Linear/Cinematic/Heavy all use the plain averaging shader and are the
+  well-tested, day-to-day path; only Advanced routes to the separate
+  optical-flow shader, which has seen far less real-world testing (a
+  previous evaluation of this same shader found it "did NOT beat the plain
+  shutter blend" — see `etc/DEV_NOTES.md`). Treat it as an experiment to try,
+  not a preset to default to.
 
 ## Known issues
 

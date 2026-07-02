@@ -4,6 +4,7 @@
 #include "blend/weight_generator.hpp"
 #include "blend/BlendConfig.hpp"
 
+#include <algorithm>
 #include <numeric>
 #include <stdexcept>
 
@@ -123,6 +124,23 @@ TEST_CASE(preset_heavy_decays_from_newest) {
     auto w = generateFromPreset(PresetShape::Heavy, 8);
     // one-sided decay: index 0 (newest) should be the largest weight.
     for (size_t i = 1; i < w.size(); ++i) CHECK(w[0] >= w[i]);
+}
+
+TEST_CASE(preset_cinematic_center_share_stable_across_N) {
+    // Regression test: a fixed gaussian `mult` (relative width in normalized
+    // t E [0,1]) let the center frame's share of the total blend weight
+    // collapse from ~23% at N=8 to ~2.8% at N=64 -- at realistic gameplay
+    // frame counts the blend read as a flat smear ("just ghosting") instead
+    // of a soft photographic falloff, since no part of the window
+    // meaningfully dominated. `mult` now scales with N so the width stays
+    // roughly constant in ABSOLUTE frame count. Center share should stay in
+    // a stable band (not collapsing toward ~0) across the whole N range the
+    // shutter window can actually produce.
+    for (int N : {8, 16, 32, 64}) {
+        auto w = generateFromPreset(PresetShape::Cinematic, N);
+        float peak = *std::max_element(w.begin(), w.end());
+        CHECK(peak > 0.08f);   // >8% of the total -- clearly dominant, not washed out
+    }
 }
 
 TEST_CASE(config_advanced_uses_resample_path_and_uniform_filler) {

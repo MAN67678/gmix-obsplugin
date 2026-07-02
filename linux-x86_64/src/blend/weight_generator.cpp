@@ -44,8 +44,22 @@ std::vector<float> generatePresetCurve(PresetShape shape, int N) {
     }
 
     case PresetShape::Cinematic: {
-        // symmetric gaussian (danser's gaussSymmetric default: mult=1.5).
-        const double mult = 1.5;
+        // Symmetric gaussian (danser's gaussSymmetric default: mult=1.5),
+        // but `mult` SCALES WITH N here -- a fixed mult=1.5 is a fixed
+        // RELATIVE width in normalized t E [0,1] space, so at a bigger N
+        // (more real frames captured in the shutter window -- routine
+        // during actual gameplay at high fps, N up to kMaxBlendFrames=64)
+        // the gaussian doesn't get narrower in ABSOLUTE frame-count terms,
+        // it just gets sampled more finely across the same relative shape.
+        // Measured live: center frame's share of total blend weight fell
+        // from 23% at N=8 to just 2.8% at N=64 with a fixed mult -- no part
+        // of the window meaningfully dominated, so it read as a flat smear
+        // ("just ghosting") instead of a soft photographic falloff. Scaling
+        // mult with N/N0 holds the width roughly constant in ABSOLUTE frame
+        // count instead, keeping center share around ~10-15% regardless of
+        // how many real frames land in the window.
+        constexpr double kRefN = 16.0, kRefMult = 1.5;
+        const double mult = kRefMult * (static_cast<double>(N) / kRefN);
         for (int i = 0; i < N; ++i) {
             const double t = (N > 1) ? static_cast<double>(i) / (N - 1) : 0.5;
             const double s = std::exp(-std::pow(mult * (t * 2.0 - 1.0), 2));
