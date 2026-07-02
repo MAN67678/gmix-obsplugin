@@ -102,6 +102,43 @@ TEST_CASE(config_N1_is_passthrough) {
     CHECK_CLOSE(w[0], 1.0f, 1e-9);
 }
 
+// ─── shaped presets (Linear/Cinematic/Heavy) ─────────────────────────────────
+TEST_CASE(preset_curves_sum_to_one_and_right_length) {
+    for (auto shape : {PresetShape::Linear, PresetShape::Cinematic, PresetShape::Heavy}) {
+        auto w = generateFromPreset(shape, 10);
+        CHECK_EQ(w.size(), 10u);
+        double sum = std::accumulate(w.begin(), w.end(), 0.0);
+        CHECK_CLOSE(sum, 1.0, 1e-5);
+    }
+}
+
+TEST_CASE(preset_linear_peaks_at_center) {
+    auto w = generateFromPreset(PresetShape::Linear, 9);
+    // symmetric triangle: the center sample should be the largest.
+    float center = w[4];
+    for (size_t i = 0; i < w.size(); ++i) CHECK(center >= w[i]);
+}
+
+TEST_CASE(preset_heavy_decays_from_newest) {
+    auto w = generateFromPreset(PresetShape::Heavy, 8);
+    // one-sided decay: index 0 (newest) should be the largest weight.
+    for (size_t i = 1; i < w.size(); ++i) CHECK(w[0] >= w[i]);
+}
+
+TEST_CASE(config_advanced_uses_resample_path_and_uniform_filler) {
+    BlendConfig cfg;
+    cfg.mode = BlendConfig::Mode::Advanced;
+    CHECK(cfg.usesResamplePath());
+    auto w = cfg.weightsFor(8);
+    CHECK_EQ(w.size(), 8u);
+    for (float x : w) CHECK_CLOSE(x, 1.f/8.f, 1e-9);   // ignored by the shader; just a valid filler
+}
+
+TEST_CASE(config_flat_does_not_use_resample_path) {
+    BlendConfig cfg;   // default Mode::Flat
+    CHECK(!cfg.usesResamplePath());
+}
+
 int main() {
     std::printf("==== weight_generator tests ====\n");
     std::printf("==== %d checks, %d failures ====\n", g_test_checks, g_test_failures);

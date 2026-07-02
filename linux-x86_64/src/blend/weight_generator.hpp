@@ -16,6 +16,20 @@
 
 namespace gmix {
 
+// Built-in blend presets ("Flat" is handled directly by BlendConfig::weightsFor
+// as a plain uniform 1/N, so it's not one of these -- these are the SHAPED
+// curves). Mirrors danser-go (the reference osu! renderer)'s weight shapes.
+//   Linear    — symmetric triangle peaking at the center frame. Balanced blur.
+//   Cinematic — symmetric gaussian. Soft photographic falloff.
+//   Heavy     — one-sided exponential decay. Long visible trailing ghost.
+enum class PresetShape { Linear, Cinematic, Heavy };
+
+// Generate the shape curve for a preset at length N (N >= 1), NOT normalized.
+std::vector<float> generatePresetCurve(PresetShape shape, int N);
+
+// Full pipeline: generatePresetCurve(shape, N) → normalize. Length N, Σ ≈ 1.0.
+std::vector<float> generateFromPreset(PresetShape shape, int N);
+
 // Parse "-weight=1 2 1" into a raw float vector (length W = whatever was given).
 // Throws std::invalid_argument on malformed/empty input.
 std::vector<float> parseWeightString(std::string_view s);

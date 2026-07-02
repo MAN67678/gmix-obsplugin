@@ -21,6 +21,15 @@ struct alignas(4) PushConstants {
     uint32_t frameCount;
     uint32_t frameW;
     uint32_t frameH;
+    // Resample-path (resample_blur.comp) fields. blend.comp's own PC block
+    // only declares the first three, but a shorter shader-side PC struct is
+    // fine within the same pipeline layout's push-constant range -- these are
+    // simply never read on the plain path.
+    uint32_t subSamples;
+    float    shutterStrength;
+    float    falloff;
+    float    texelSizeX;
+    float    texelSizeY;
 };
 static_assert(sizeof(PushConstants) <= 128,
               "push constants must fit the guaranteed 128-byte limit");
@@ -49,7 +58,9 @@ uint32_t findMemoryType(VkPhysicalDevice phys, uint32_t typeBits,
 
 } // namespace
 
-BlendEngine::BlendEngine(VulkanContext& vk) : vk_(vk) {}
+BlendEngine::BlendEngine(VulkanContext& vk) : vk_(vk) {
+    for (auto& fd : dmaBufFd_) fd = -1;
+}
 
 BlendEngine::~BlendEngine() {
     destroyAll();
@@ -90,10 +101,12 @@ void BlendEngine::destroyTransient() {
     VkDevice dev = vk_.device();
     if (dev == VK_NULL_HANDLE) return;
     if (pipeline_)         vkDestroyPipeline(dev, pipeline_, nullptr);
+    if (resamplePipeline_) vkDestroyPipeline(dev, resamplePipeline_, nullptr);
     if (pipeLayout_) vkDestroyPipelineLayout(dev, pipeLayout_, nullptr);
     if (dsLayout_)   vkDestroyDescriptorSetLayout(dev, dsLayout_, nullptr);
     if (descPool_)   vkDestroyDescriptorPool(dev, descPool_, nullptr);
     pipeline_   = VK_NULL_HANDLE;
+    resamplePipeline_ = VK_NULL_HANDLE;
     pipeLayout_ = VK_NULL_HANDLE;
     dsLayout_   = VK_NULL_HANDLE;
     descPool_   = VK_NULL_HANDLE;
@@ -459,7 +472,16 @@ bool BlendEngine::createPipeline() {
 
     // GMIX_SHADER_DIR is the build/shaders directory, set via a compile def.
     pipeline_ = buildPipeline(GMIX_SHADER_DIR "/blend.spv");
-    if (pipeline_ == VK_NULL_HANDLE) return false;
+    if (pipeline_ == VK_NULL_HANDLE) return false;   // plain path is required
+
+    // Velocity-aware path (the 'Advanced' preset) is OPTIONAL: if its SPIR-V
+    // is missing/invalid, dispatchAsync() with resample.enabled just falls
+    // back to the plain pipeline rather than failing init().
+    resamplePipeline_ = buildPipeline(GMIX_SHADER_DIR "/resample_blur.spv");
+    if (resamplePipeline_ == VK_NULL_HANDLE) {
+        std::fprintf(stderr, "gmix: blend: resample_blur unavailable, 'Advanced' "
+                             "preset will fall back to the plain blend\n");
+    }
     return true;
 }
 
@@ -476,12 +498,17 @@ VkImageView BlendEngine::dispatch(VkImageView* srcViews, const float* weights,
 bool BlendEngine::dispatchAsync(VkImageView* srcViews, const float* weights,
                                 uint32_t srcCount, uint32_t dstIdx,
                                 const VkSemaphore* waitSems, const uint64_t* waitVals,
-                                uint32_t waitCount) {
+                                uint32_t waitCount, ResampleParams resample) {
     if (!initialized_) return false;
     if (srcCount == 0 || srcCount > (uint32_t)kMaxBlendFrames) return false;
     if (dstIdx >= kDstBuffers) return false;
     // Caller contract: the previous blend must have completed (single fence +
     // single command buffer), so we never reset state still in GPU use.
+
+    // Use the velocity-aware pipeline only when requested AND available;
+    // otherwise fall back to the plain weighted blend.
+    const bool useResample = resample.enabled && resamplePipeline_ != VK_NULL_HANDLE;
+    VkPipeline activePipeline = useResample ? resamplePipeline_ : pipeline_;
 
     VkDevice dev = vk_.device();
 
@@ -541,7 +568,7 @@ bool BlendEngine::dispatchAsync(VkImageView* srcViews, const float* weights,
                          VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0,
                          0, nullptr, 0, nullptr, 1, &dstBar);
 
-    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline_);
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, activePipeline);
     vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipeLayout_,
                             0, 1, &descSet_, 0, nullptr);
 
@@ -549,6 +576,11 @@ bool BlendEngine::dispatchAsync(VkImageView* srcViews, const float* weights,
     pc.frameCount = srcCount;
     pc.frameW = width_;
     pc.frameH = height_;
+    pc.subSamples = resample.subSamples;
+    pc.shutterStrength = resample.shutterStrength;
+    pc.falloff = resample.falloff;
+    pc.texelSizeX = width_  ? 1.0f / static_cast<float>(width_)  : 0.0f;
+    pc.texelSizeY = height_ ? 1.0f / static_cast<float>(height_) : 0.0f;
     vkCmdPushConstants(cmd, pipeLayout_, VK_SHADER_STAGE_COMPUTE_BIT,
                        0, sizeof(PushConstants), &pc);
 

@@ -1,0 +1,137 @@
+#version 450 core
+#extension GL_EXT_scalar_block_layout : enable
+
+// ─────────────────────────────────────────────────────────────────────────────
+// GMix velocity-aware ("optical awareness") motion blur -- the 'Advanced' preset.
+//
+// The plain blend.comp does a flat/shaped weighted average of the captured
+// frames. Because the captured frames in the shutter window are temporally
+// very close, an average just softens edges -- no directional motion trail.
+// This shader instead smears each real frame's pixels ALONG a per-pixel
+// motion direction, filling the gaps between the sparse real positions into a
+// continuous directional streak (the glowing "arc" following a fast cursor).
+//
+// Uses ONLY real captured pixel data: every tap is an imageLoad of a real
+// frame, read at an offset position along the estimated motion vector. No
+// synthetic/interpolated frames are generated.
+//
+// Motion vector is estimated per-pixel via the gradient brightness-constancy
+// constraint (∇I·v + Iₜ = 0  →  v = -Iₜ ∇I / |∇I|²) from the newest frame
+// pair -- a cheap optical-flow proxy. Where there is no gradient or no
+// temporal change (static scene), v collapses to ~0 and the output reduces to
+// the latest frame (sharp, no trail).
+//
+// `subSamples` ("blur density" in the OBS properties UI, 4..32) is the tap
+// count per real frame along the motion direction -- higher packs the
+// directional streak denser at proportionally higher GPU cost.
+// ─────────────────────────────────────────────────────────────────────────────
+
+#define MAX_FRAMES 64   // must match kMaxBlendFrames in src/gmix.hpp
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, rgba8) readonly  uniform image2D srcImages[MAX_FRAMES];
+layout(set = 0, binding = 1, rgba8) writeonly uniform image2D dstImage;
+
+// Binding 2 (weights SSBO) is part of the shared descriptor layout but unused
+// on this path -- recency weighting is computed in-shader from `falloff`.
+layout(scalar, set = 0, binding = 2) readonly buffer Weights {
+    float w[MAX_FRAMES];
+} weights;
+
+// Must match the C++ PushConstants layout (frameCount, frameW, frameH, then
+// the resample-only fields).
+layout(push_constant) uniform PC {
+    uint  frameCount;
+    uint  frameW;
+    uint  frameH;
+    uint  subSamples;       // taps per frame along the motion direction ("blur density")
+    float shutterStrength;  // how strongly bright pixels dominate the trail
+    float falloff;          // recency falloff exponent (higher = shorter trail)
+    float texelSizeX;       // 1.0 / frameW (unused in integer-tap v1, reserved)
+    float texelSizeY;
+} pc;
+
+float luma(vec3 c) { return dot(c, vec3(0.299, 0.587, 0.114)); }
+
+vec4 loadClamped(uint idx, ivec2 p, ivec2 sz) {
+    p = clamp(p, ivec2(0), sz - ivec2(1));
+    return imageLoad(srcImages[idx], p);
+}
+
+float lumaAt(uint idx, ivec2 p, ivec2 sz) {
+    return luma(loadClamped(idx, p, sz).rgb);
+}
+
+void main()
+{
+    uvec2 gid = gl_GlobalInvocationID.xy;
+    if (gid.x >= pc.frameW || gid.y >= pc.frameH) return;
+
+    ivec2 sz  = ivec2(pc.frameW, pc.frameH);
+    ivec2 P   = ivec2(gid);
+
+    uint n = pc.frameCount;
+    if (n == 0u) { imageStore(dstImage, P, vec4(0,0,0,1)); return; }
+
+    // ── Per-pixel motion estimate from the newest frame pair ────────────────
+    vec2 v = vec2(0.0);
+    if (n >= 2u) {
+        float Ix = lumaAt(0u, P + ivec2(1,0), sz) - lumaAt(0u, P - ivec2(1,0), sz);
+        float Iy = lumaAt(0u, P + ivec2(0,1), sz) - lumaAt(0u, P - ivec2(0,1), sz);
+        float It = lumaAt(0u, P, sz) - lumaAt(1u, P, sz);
+        vec2  grad = vec2(Ix, Iy);
+        float gg = dot(grad, grad) + 1e-3;
+        v = -It * grad / gg;                       // pixels / frame
+        // Clamp so a degenerate estimate can't fling taps across the screen.
+        float maxLen = float(max(sz.x, sz.y)) / 8.0;
+        float len = length(v);
+        if (len > maxLen) v *= maxLen / len;
+    }
+
+    float vlen = length(v);
+    vec2  dir  = (vlen > 1e-4) ? (v / vlen) : vec2(0.0);
+
+    // ── Accumulate: each real frame smeared backward along motion ───────────
+    // Frame i (0 = newest) already contains the object ~i steps back along its
+    // path; sub-samples within each frame fill the gap to the next position,
+    // producing a continuous streak rather than discrete ghosts. Newer frames
+    // get higher recency weight -> the trail is brightest at the current
+    // position and fades backward (directional, not symmetric).
+    //
+    // CRITICAL: weight bright pixels EXPONENTIALLY, not linearly. A trail
+    // pixel (an old cursor position) gets a bright cursor from only ONE frame
+    // but the dark background from all the others; a plain normalized average
+    // dilutes that single bright sample to a few percent -> invisible. An
+    // exponential brightness term (exp(luma * shutterStrength)) makes any
+    // frame's bright cursor DOMINATE its output pixel, so every position the
+    // cursor occupied lights up -> a visible glowing arc on the dark bg
+    // (the danser look). On a static scene every frame has equal luma at each
+    // pixel, so the weighting is uniform and the result stays sharp.
+    uint ss = max(pc.subSamples, 1u);
+    vec4  acc  = vec4(0.0);
+    float wsum = 0.0;
+
+    for (uint i = 0u; i < n; ++i) {
+        float recency = 1.0 - float(i) / float(n);     // 1 (newest) .. ~0 (oldest)
+        float fw = pow(max(recency, 0.0), pc.falloff);
+
+        for (uint s = 0u; s < ss; ++s) {
+            // Smear this frame's data backward along the motion direction by
+            // up to ~vlen px (the inter-frame displacement), filling the gap.
+            float t = float(s) / float(ss);
+            vec2  off = dir * (vlen * t);
+            ivec2 sp  = P - ivec2(round(off));
+            vec4  c   = loadClamped(i, sp, sz);
+
+            // Exponential brightness dominance (see note above).
+            float bw = fw * exp(luma(c.rgb) * pc.shutterStrength);
+            acc  += c * bw;
+            wsum += bw;
+        }
+    }
+
+    vec4 outc = (wsum > 0.0) ? (acc / wsum) : loadClamped(0u, P, sz);
+    outc.a = 1.0;
+    imageStore(dstImage, P, outc);
+}

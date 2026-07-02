@@ -12,6 +12,70 @@ namespace gmix {
 // MAX_FRAMES in shaders/blend.comp (== kMaxBlendFrames).
 static constexpr int kMaxFrames = kMaxBlendFrames;
 
+// ─── preset shape curves ─────────────────────────────────────────────────────
+// Each returns N samples in [0,1]-ish (shape only, not normalized).
+std::vector<float> generatePresetCurve(PresetShape shape, int N) {
+    if (N <= 0) throw std::invalid_argument("N must be >= 1");
+
+    std::vector<float> w;
+    w.reserve(static_cast<size_t>(N));
+
+    const auto mid = [](int n) { return (n - 1) * 0.5; };
+
+    // danser-go computes its weights as `1.0 + shape(t)*100`, NOT a bare shape
+    // function -- the +1.0 floor means every blended frame keeps a meaningful
+    // relative contribution (edge:center ratio ~1:9 at its default gauss
+    // multiplier of 1.5) instead of decaying toward zero at the window edges.
+    // A bare gaussian/triangle/exponential effectively only blends the few
+    // frames nearest the peak once N is more than ~6-8, which reads as almost
+    // no blur at all even though weightsFor() is being fed 10+ frames.
+    constexpr double kFloor = 1.0;
+    constexpr double kScale = 100.0;
+
+    switch (shape) {
+    case PresetShape::Linear: {
+        // symmetric triangle peaking at the center frame.
+        const double m = mid(N);
+        for (int i = 0; i < N; ++i) {
+            const double s = 1.0 - std::abs(i - m) / (m + 0.5);
+            w.push_back(static_cast<float>(kFloor + s * kScale));
+        }
+        break;
+    }
+
+    case PresetShape::Cinematic: {
+        // symmetric gaussian (danser's gaussSymmetric default: mult=1.5).
+        const double mult = 1.5;
+        for (int i = 0; i < N; ++i) {
+            const double t = (N > 1) ? static_cast<double>(i) / (N - 1) : 0.5;
+            const double s = std::exp(-std::pow(mult * (t * 2.0 - 1.0), 2));
+            w.push_back(static_cast<float>(kFloor + s * kScale));
+        }
+        break;
+    }
+
+    case PresetShape::Heavy: {
+        // one-sided exponential decay from frame 0 (newest) toward older
+        // frames, producing a long visible trailing ghost.
+        const double tau = std::max(1.0, N / 4.0);
+        for (int i = 0; i < N; ++i) {
+            const double s = std::exp(-i / tau);
+            w.push_back(static_cast<float>(kFloor + s * kScale));
+        }
+        break;
+    }
+    }
+
+    // Clamp tiny negatives from float error to zero (Linear edges can go -ε).
+    for (auto& x : w) x = std::max(0.0f, x);
+    return w;
+}
+
+std::vector<float> generateFromPreset(PresetShape shape, int N) {
+    auto c = generatePresetCurve(shape, N);
+    return normalizeWeights(c);
+}
+
 // ─── weight-string parsing ───────────────────────────────────────────────────
 std::vector<float> parseWeightString(std::string_view s) {
     std::vector<float> out;

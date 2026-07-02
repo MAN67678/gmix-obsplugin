@@ -17,6 +17,26 @@ namespace gmix {
 
 class VulkanContext;
 
+// Velocity-aware ("optical awareness") motion blur params -- the 'Advanced'
+// preset. Routes the dispatch to resample_blur.comp instead of the plain
+// weighted average (blend.comp): estimates a per-pixel motion vector from the
+// newest frame pair and smears each real frame's pixels along it, filling the
+// gaps between sparse real positions into a continuous directional streak.
+// `weights` passed to dispatchAsync() is ignored on this path (recency
+// weighting is computed in-shader from `falloff`).
+//
+// Namespace-scope, not nested in BlendEngine: a nested type's default member
+// initializers aren't usable as a default FUNCTION ARGUMENT of another member
+// of the same still-incomplete enclosing class (they're only valid in a
+// complete-class context, i.e. after BlendEngine itself finishes) -- moving
+// it out here is the standard fix, not a design preference.
+struct ResampleParams {
+    bool     enabled         = false;
+    uint32_t subSamples      = 4;      // "blur density": taps per frame, 4..32
+    float    shutterStrength = 1.0f;   // exp() brightness-dominance
+    float    falloff         = 1.0f;   // recency falloff exponent
+};
+
 class BlendEngine {
 public:
     explicit BlendEngine(VulkanContext& vk);
@@ -42,10 +62,10 @@ public:
                          uint32_t srcCount);
 
     // ── Pipelined (asynchronous) dispatch ──────────────────────────────────
-    // The dst is DOUBLE-BUFFERED so the present thread can keep blitting the
-    // last finished result (the "front") while a new blend runs into the other
-    // buffer (the "back"). dispatchAsync() records + submits into dst[dstIdx]
-    // and returns WITHOUT waiting; the caller polls pollBlendDone() on later
+    // The dst is multi-buffered (kDstBuffers) so a consumer can keep reading
+    // the last finished result (the "front") while a new blend runs into
+    // another buffer. dispatchAsync() records + submits into dst[dstIdx] and
+    // returns WITHOUT waiting; the caller polls pollBlendDone() on later
     // ticks and, once true, treats dstIdx as the new front. This decouples the
     // present cadence from the (variable, sometimes >16.6ms) blend cost: a slow
     // blend just means the front is re-presented an extra tick, never a stall.
@@ -56,11 +76,25 @@ public:
     // producer render-complete signals) the compute submit waits BEFORE reading
     // the sources -- so producer timing is handled on the GPU, not by a host
     // wait on the present thread. Pass 0 for none (tests).
-    static constexpr uint32_t kDstBuffers = 2;
+    //
+    // 3, not 2: pollBlendDone() (a host-side timeline query) only proves
+    // gmix's OWN compute write finished -- for the OBS-plugin consumer,
+    // nothing proves the consumer's GPU has actually finished READING the
+    // previous front buffer by the time it's cycled back around as a write
+    // target (video_render() just records a draw call; there's no real
+    // cross-queue/cross-process fence on that read at all). A strict 2-buffer
+    // ping-pong reuses a buffer on the very next dispatch after it stops
+    // being front -- zero grace. Round-robining across 3 buffers (see the
+    // dispatch-target selection in gmix_source.cpp's workerMain()) gives one
+    // full extra dispatch generation of grace before reuse, which is cheap
+    // (one more capture-resolution RGBA8 image) insurance against exactly
+    // that race, without claiming to eliminate it outright.
+    static constexpr uint32_t kDstBuffers = 3;
     bool dispatchAsync(VkImageView* srcViews, const float* weights,
                        uint32_t srcCount, uint32_t dstIdx,
                        const VkSemaphore* waitSems = nullptr,
-                       const uint64_t* waitVals = nullptr, uint32_t waitCount = 0);
+                       const uint64_t* waitVals = nullptr, uint32_t waitCount = 0,
+                       ResampleParams resample = {});
     bool blendInFlight() const { return blendInFlight_; }
     // True once the in-flight blend's GPU work has completed (non-blocking).
     // Clears the in-flight flag as a side effect when it returns true.
@@ -111,6 +145,10 @@ private:
     VkDescriptorSetLayout dsLayout_     = VK_NULL_HANDLE;
     VkPipelineLayout      pipeLayout_   = VK_NULL_HANDLE;
     VkPipeline            pipeline_     = VK_NULL_HANDLE;
+    // Optional: if resample_blur.spv is missing/fails to build, the engine
+    // still works -- dispatchAsync() with resample.enabled just falls back to
+    // the plain pipeline_ rather than failing init().
+    VkPipeline            resamplePipeline_ = VK_NULL_HANDLE;
     VkDescriptorPool      descPool_     = VK_NULL_HANDLE;
     VkDescriptorSet       descSet_      = VK_NULL_HANDLE;
 
@@ -126,9 +164,12 @@ private:
     VkSampler  dstSampler_  = VK_NULL_HANDLE;   // not needed; kept for future blit
     bool       blendInFlight_ = false;
 
-    // dma-buf export state (see dmaBufCapable()/dmaBufFd() above).
+    // dma-buf export state (see dmaBufCapable()/dmaBufFd() above). Zeroed here
+    // and set to -1 for every slot in the constructor body (not a { -1, -1, ...}
+    // initializer list -- that silently zero-fills, not -1-fills, any slot
+    // beyond the ones actually listed if kDstBuffers ever changes again).
     bool     dmaBufCapable_          = false;
-    int      dmaBufFd_[kDstBuffers]     = { -1, -1 };
+    int      dmaBufFd_[kDstBuffers]     = {};
     uint32_t dmaBufStride_[kDstBuffers] = {};
     uint64_t dmaBufOffset_[kDstBuffers] = {};
 
