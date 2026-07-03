@@ -45,21 +45,18 @@ layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
 layout(set = 0, binding = 0, rgba8) readonly  uniform image2D srcImages[MAX_FRAMES];
 layout(set = 0, binding = 1, rgba8) writeonly uniform image2D dstImage;
 
-// Binding 2 (weights SSBO) is part of the shared descriptor layout but unused
-// on this path -- recency weighting is computed in-shader from `falloff`.
-layout(scalar, set = 0, binding = 2) readonly buffer Weights {
-    float w[MAX_FRAMES];
-} weights;
-
-// Must match the C++ PushConstants layout (frameCount, frameW, frameH, then
-// the resample-only fields).
+// This is now the ONLY blend path (the plain weighted-average blend.comp
+// pipeline and its weights SSBO were removed once Advanced became the
+// plugin's only mode -- see DEV_NOTES 2026-07-03). Per-frame weighting is
+// flat (every real frame in the window counts equally); the only remaining
+// "weighting" is the motion-gated brightness boost below, driven directly by
+// push constants, not a buffer.
 layout(push_constant) uniform PC {
     uint  frameCount;
     uint  frameW;
     uint  frameH;
     uint  subSamples;       // taps per frame along the motion direction ("blur density")
-    float shutterStrength;  // how strongly bright pixels dominate the trail
-    float falloff;          // recency falloff exponent (higher = shorter trail)
+    float shutterStrength;  // trail exposure boost, gated by detected motion
     float texelSizeX;       // 1.0 / frameW (unused in integer-tap v1, reserved)
     float texelSizeY;
 } pc;

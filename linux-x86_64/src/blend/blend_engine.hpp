@@ -1,10 +1,18 @@
 // ─────────────────────────────────────────────────────────────────────────────
-// GMix blend engine — wraps the temporal-blend compute shader.
+// GMix blend engine — wraps the velocity-aware ("optical awareness") motion
+// blur compute shader (resample_blur.comp), the plugin's only blend mode.
 //
-// On each output frame the present loop calls dispatch() with up to N source
-// image views and their pre-normalized weights. The result lands in the
-// engine's persistent dst image, which the presenter then blits to the
-// swapchain. srcCount may vary per call (dynamic N).
+// On each output frame the present loop calls dispatchAsync() with up to N
+// source image views (newest first). The result lands in the engine's
+// persistent, multi-buffered dst image, which the OBS plugin imports
+// zero-copy via dma-buf. srcCount may vary per call (dynamic N).
+//
+// This used to also support a plain weighted-average path (blend.comp) with
+// several preset weight shapes (Flat/Linear/Cinematic/Heavy/Raw) selectable
+// per source. Removed 2026-07-03 when the plugin was stripped down to only
+// the Advanced/optical-flow mode (the only one anyone was actually using
+// live) -- see DEV_NOTES.md for the full history of why Advanced's own
+// accumulation scheme went through several iterations before landing here.
 // ─────────────────────────────────────────────────────────────────────────────
 #pragma once
 
@@ -17,24 +25,11 @@ namespace gmix {
 
 class VulkanContext;
 
-// Velocity-aware ("optical awareness") motion blur params -- the 'Advanced'
-// preset. Routes the dispatch to resample_blur.comp instead of the plain
-// weighted average (blend.comp): estimates a per-pixel motion vector from the
-// newest frame pair and smears each real frame's pixels along it, filling the
-// gaps between sparse real positions into a continuous directional streak.
-// `weights` passed to dispatchAsync() is ignored on this path (recency
-// weighting is computed in-shader from `falloff`).
-//
-// Namespace-scope, not nested in BlendEngine: a nested type's default member
-// initializers aren't usable as a default FUNCTION ARGUMENT of another member
-// of the same still-incomplete enclosing class (they're only valid in a
-// complete-class context, i.e. after BlendEngine itself finishes) -- moving
-// it out here is the standard fix, not a design preference.
+// Velocity-aware motion blur params, passed to dispatchAsync() on every call
+// (this is the only dispatch path -- see the file header above).
 struct ResampleParams {
-    bool     enabled         = false;
     uint32_t subSamples      = 4;      // "blur density": taps per frame, 4..32
-    float    shutterStrength = 1.0f;   // exp() brightness-dominance
-    float    falloff         = 1.0f;   // recency falloff exponent
+    float    shutterStrength = 1.0f;   // motion-gated trail exposure boost
 };
 
 class BlendEngine {
@@ -49,25 +44,22 @@ public:
     // output dimensions are known (and again if they change).
     // dstBufferCount: how many dst images to multi-buffer (see the
     // dstBufferCount()/kMinDstBuffers/kMaxDstBuffers comment below for what
-    // this trades off) -- the "Latency mode" OBS
-    // setting (Fast/Medium/Slow/Very slow -> 2/3/4/5). Fixed for the engine's
-    // whole lifetime once chosen (like gpuIndex): re-init() on a resize
-    // reuses whatever count was passed the FIRST time, since callers pass
-    // the same value on every call in practice; clamped to
-    // [kMinDstBuffers, kMaxDstBuffers].
+    // this trades off). Fixed for the engine's whole lifetime once chosen
+    // (like gpuIndex): re-init() on a resize reuses whatever count was
+    // passed the FIRST time, since callers pass the same value on every call
+    // in practice; clamped to [kMinDstBuffers, kMaxDstBuffers].
     bool init(uint32_t w, uint32_t h, uint32_t dstBufferCount = kDefaultDstBuffers);
 
-    // Blend `srcCount` source images with the given weights into dst.
+    // Blend `srcCount` source images (newest first) into dst.
     // srcViews:    pointer to srcCount VkImageView handles (each a 2D view of
     //              an imported source frame, format BGRA8/RGBA8). Index 0 is
     //              the newest frame.
-    // weights:     srcCount pre-normalized weights (Σ ≈ 1).
     // srcCount:    1..MAX_FRAMES. 1 → passthrough (just copies src 0).
     // Synchronous: submits the blend and blocks until it completes (tests /
     // readback). Returns dst buffer 0's view. The pipelined present path uses
     // dispatchAsync() below instead.
-    VkImageView dispatch(VkImageView* srcViews, const float* weights,
-                         uint32_t srcCount);
+    VkImageView dispatch(VkImageView* srcViews, uint32_t srcCount,
+                         ResampleParams resample = {});
 
     // ── Pipelined (asynchronous) dispatch ──────────────────────────────────
     // The dst is multi-buffered (dstBufferCount(), see below) so a consumer
@@ -99,21 +91,24 @@ public:
     // capture-resolution RGBA8 image per step) insurance against that race,
     // and separately, slack for the blend's own cost to vary (GPU contention
     // with the game, thermal/scheduling drift over a long session) without a
-    // slow blend's dst write racing a still-in-progress OBS read. This is the
-    // "Latency mode" OBS setting's actual mechanism: more buffers = more
-    // tolerance for timing variance, at the cost of (a) more VRAM (one
-    // capture-resolution RGBA8 image each) and (b) the theoretical worst-case
-    // staleness of the front buffer growing by one more dispatch interval.
-    // Fast=2 (tightest, least tolerance -- the pre-fix behavior), Medium=3
-    // (default), Slow=4, Very slow=5.
+    // slow blend's dst write racing a still-in-progress OBS read. More
+    // buffers = more tolerance for timing variance, at the cost of (a) more
+    // VRAM (one capture-resolution RGBA8 image each) and (b) the theoretical
+    // worst-case staleness of the front buffer growing by one more dispatch
+    // interval. This used to be a user-facing "Latency mode" OBS setting
+    // (Fast/Medium/Slow/Very slow -> 2/3/4/5); removed 2026-07-03 along with
+    // the other now-fixed settings, hardcoded to kFixedDstBuffers (5, "Very
+    // slow" -- the most tolerant setting, matching what was actually
+    // configured live when this was simplified). dstBufferCount() stays a
+    // runtime BlendEngine API (harmless, still exercised by tests) even
+    // though the OBS plugin itself no longer varies it.
     static constexpr uint32_t kMinDstBuffers     = 2;
     static constexpr uint32_t kMaxDstBuffers     = 5;
     static constexpr uint32_t kDefaultDstBuffers = 3;
     // Actual count in effect for THIS engine instance, set by init(). Loops
     // that used to iterate the old compile-time kDstBuffers now iterate this.
     uint32_t dstBufferCount() const { return numDstBuffers_; }
-    bool dispatchAsync(VkImageView* srcViews, const float* weights,
-                       uint32_t srcCount, uint32_t dstIdx,
+    bool dispatchAsync(VkImageView* srcViews, uint32_t srcCount, uint32_t dstIdx,
                        const VkSemaphore* waitSems = nullptr,
                        const uint64_t* waitVals = nullptr, uint32_t waitCount = 0,
                        ResampleParams resample = {});
@@ -166,11 +161,10 @@ private:
     VulkanContext& vk_;
     VkDescriptorSetLayout dsLayout_     = VK_NULL_HANDLE;
     VkPipelineLayout      pipeLayout_   = VK_NULL_HANDLE;
+    // The resample_blur.comp pipeline -- REQUIRED now (init() fails if its
+    // SPIR-V is missing/invalid), unlike when it was an optional fallback-
+    // capable alternative to a plain-average default pipeline.
     VkPipeline            pipeline_     = VK_NULL_HANDLE;
-    // Optional: if resample_blur.spv is missing/fails to build, the engine
-    // still works -- dispatchAsync() with resample.enabled just falls back to
-    // the plain pipeline_ rather than failing init().
-    VkPipeline            resamplePipeline_ = VK_NULL_HANDLE;
     VkDescriptorPool      descPool_     = VK_NULL_HANDLE;
     VkDescriptorSet       descSet_      = VK_NULL_HANDLE;
 
@@ -201,11 +195,6 @@ private:
     std::vector<int>      dmaBufFd_;
     std::vector<uint32_t> dmaBufStride_;
     std::vector<uint64_t> dmaBufOffset_;
-
-    // Weights UBO (binding 2). Persistently mapped; rewritten per dispatch.
-    VkBuffer       weightsBuf_  = VK_NULL_HANDLE;
-    VkDeviceMemory weightsMem_  = VK_NULL_HANDLE;
-    float*         weightsMapped_ = nullptr;
 
     // Timeline semaphore signaled by each blend on the compute queue; the
     // present blit waits the relevant value on the graphics queue. Replaces the

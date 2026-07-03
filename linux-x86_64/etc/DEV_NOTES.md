@@ -15,6 +15,108 @@ fail when it had simply never been installed. Always re-copy (and restart
 OBS, since it's not running) after rebuilding, before drawing any conclusion
 from in-OBS behavior.
 
+## CHANGED (2026-07-03, sixteenth): plugin stripped down to Advanced-only, fixed Latency mode, no more preset/latency config files
+
+After fifteen rounds of live testing/fixing the Advanced preset and the
+Latency-mode/preset persistence machinery, user directed a deliberate
+simplification: "we just going to make this very simple with search
+process name and gpu index and the slider" -- i.e. only what's ACTUALLY
+being configured live gets to stay a user-facing option; everything else
+that was built to support presets/Latency-mode choices nobody was using
+gets removed, not just hidden.
+
+**What was removed, and why each piece is now genuinely unreachable (not
+just defaulted):**
+
+- **Blend presets** (Flat/Linear/Cinematic/Heavy/Raw, `BlendConfig::Mode`,
+  the whole plain weighted-average blend path). Advanced was the only one
+  actually configured live (confirmed via the persisted config file:
+  `preset=advanced` every session this whole investigation). Removed:
+  - `shaders/blend.comp` (the plain-average shader) entirely.
+  - `src/blend/weight_generator.hpp/.cpp` + its test
+    (`tests/test_weight_generator.cpp`) -- confirmed, on direct question,
+    that this file was ALREADY dead code specifically for Advanced (its
+    `generateFromPreset()` is never called on that path; `weightsFor()`
+    returned a uniform filler for Advanced that the shader ignored anyway).
+  - `BlendConfig::Mode`, `rawWeights`, `weightsFor()`, `usesResamplePath()`,
+    `falloff` (the last already-dead field from the ninth entry).
+  - `BlendEngine`'s weights SSBO (binding 2) and the whole
+    optional-fallback-pipeline machinery (`resamplePipeline_` alongside a
+    required `pipeline_`) -- there's now exactly one pipeline, built from
+    `resample_blur.spv`, and it's REQUIRED (`init()` fails without it,
+    same as the old plain pipeline used to be).
+  - `dispatch()`/`dispatchAsync()`'s `weights` parameter -- gone from the
+    API entirely, not just unused.
+  - The "Blur preset" dropdown, `gmixPresetModified()`, its auto-fire flag,
+    `presetSettingToMode()`/`presetModeToString()`.
+  - `~/.config/gmix/blend_config` (the persisted preset/density/brightness
+    file) -- see below for what replaced it.
+
+- **Latency mode** (Fast/Medium/Slow/Very slow dropdown, i.e. user-facing
+  control over `dstBufferCount`). The live-confirmed running value was 5
+  ("Very slow") every session. `dstBufferCount` is now
+  `kFixedDstBufferCount = 5` (a plain constant in `gmix_source.cpp`), not a
+  per-source parsed/persisted value.
+  `BlendEngine::kMinDstBuffers/kMaxDstBuffers/dstBufferCount()` stay as
+  runtime API (harmless, `blend_engine_runtime_dst_buffer_count` still
+  exercises non-default counts) -- only the OBS-plugin-facing knob and its
+  `~/.config/gmix/engine_settings` dstBufferCount field are gone
+  (`engine_settings` now persists gpuIndex only). Removed:
+  `gmixLatencyModified()`, its auto-fire flag,
+  `latencyModeSettingToBufferCount()`/`bufferCountToLatencyModeSetting()`,
+  the "Latency mode" dropdown, `GmixSource::dstBufferCount` (the field, not
+  `GmixEngine`'s -- the latter stays, always set to the constant).
+
+**What replaced `~/.config/gmix/blend_config`:** nothing on disk. User's
+own observation, on being told density/brightness apply live: "so we also
+don't need config file because exposer can be change live and saved with
+the scene file." Correct -- that file's actual job was surviving an ENGINE
+REBUILD (destroyed when every source is removed, e.g. for a GPU-index
+change) with a DIFFERENT source's config than whichever one happens to
+recreate it first. That scenario is specific to running multiple
+differently-configured source instances at once, which the README already
+steers users away from (one shared "GMix Motion Blur" source, reused via
+**Add Existing Source**). Replaced with: `gmixCreate()` now pushes the
+CREATING source's own (`obs_data`/scene-collection-persisted)
+density/brightness into a freshly-created engine directly, via
+`applyBlendConfigFromSettings()`, at creation time (refCount == 1 branch) --
+no callback/auto-fire suppression needed there specifically, since
+`gmixCreate()` always represents a genuine attachment, never a synthetic
+properties-dialog fire. The existing refCount > 1 branch (sync FROM an
+already-running engine INTO a newly-attached source's displayed settings,
+from the "seventh" entry) is unchanged.
+
+GPU index KEEPS its persisted file (`engine_settings`, now gpuIndex-only)
+since it's genuinely different: an engine rebuild is the ONLY way to change
+it at all (no live-apply path exists, unlike density/brightness), so
+there's no source-creation-time push to fall back on -- the file is the
+only place the value can come from before any source has been created this
+session. Its modified-callback moved from the (now-deleted) Latency mode
+dropdown to a new `gmixGpuIndexModified()` on the `gpu_index` field
+directly (same auto-fire-suppression pattern, new home).
+
+**New regression test** (`blend_engine_brightness_boost_gated_by_motion` in
+`tests/test_blend_engine.cpp`): dispatches a single solid-color frame with
+`shutterStrength=10.0` (the UI slider's max) and asserts the output is
+byte-identical to the untouched input -- directly re-proving the
+"twelfth" entry's motion-gating fix (a static/textureless scene never
+triggers the boost, regardless of slider value) now that the two
+correctness tests were rewritten for the weights-free API. Replaces the old
+`blend_engine_weighted_accumulate` test, which tested unequal per-source
+weights -- a concept that no longer exists (every real frame is weighted
+flat now, unconditionally).
+
+**Verification:** `gmix_core` + `test_blend_engine` built and passed (4
+tests, 18 checks) BEFORE touching `gmix_source.cpp`, to isolate whether any
+break was in the core library vs. the OBS plugin glue. Then the full OBS
+plugin build (`-DGMIX_BUILD_OBS_PLUGIN=ON`) succeeded clean, `ctest` 2/2
+(down from 3 -- `weight_generator` test removed, its file deleted), fresh
+`~/.config/gmix` wiped and reinstalled to `.so` md5-verified, ready for the
+user's from-scratch fresh-clone re-test (delete everything, re-clone from
+`optical-flow-lucas-kanade` on GitHub, rebuild, retest the full add/OK/
+remove/re-add/switch-to-Advanced flow this session already validated once
+against the pre-strip-down code).
+
 ## CHANGED (2026-07-03, fifteenth): Blur brightness default raised again, 1.2 -> 1.3, after testing in-game vs. menu content
 
 Direct follow-up to the fourteenth entry. User restarted OBS, tested 1.2

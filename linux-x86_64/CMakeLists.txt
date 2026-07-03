@@ -49,7 +49,6 @@ function(gmix_compile_shader src_file)
     )
     add_custom_target(gmix_shader_${_name} DEPENDS "${_out}")
 endfunction()
-gmix_compile_shader("${CMAKE_CURRENT_SOURCE_DIR}/shaders/blend.comp")
 gmix_compile_shader("${CMAKE_CURRENT_SOURCE_DIR}/shaders/resample_blur.comp")
 
 # ── gmix_core: Vulkan context, blend engine, IPC-receive pieces ─────────────
@@ -58,7 +57,6 @@ gmix_compile_shader("${CMAKE_CURRENT_SOURCE_DIR}/shaders/resample_blur.comp")
 add_library(gmix_core OBJECT
     "${CMAKE_CURRENT_SOURCE_DIR}/src/vulkan/context.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/blend/blend_engine.cpp"
-    "${CMAKE_CURRENT_SOURCE_DIR}/src/blend/weight_generator.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/ipc/frame_receiver.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/ipc/imported_frame.cpp")
 target_include_directories(gmix_core PUBLIC
@@ -69,7 +67,7 @@ target_link_libraries(gmix_core PUBLIC
 # blend_engine.cpp embeds the compiled SPIR-V path at runtime.
 target_compile_definitions(gmix_core PUBLIC
     GMIX_SHADER_DIR="${CMAKE_CURRENT_BINARY_DIR}/shaders")
-add_dependencies(gmix_core gmix_shader_blend gmix_shader_resample_blur)
+add_dependencies(gmix_core gmix_shader_resample_blur)
 
 # ── gmix CLI: minimal utility (layer install / GPU list / IPC debug client) ─
 add_executable(gmix
@@ -152,15 +150,6 @@ endif()
 
 # ── Tests ───────────────────────────────────────────────────────────────────
 enable_testing()
-
-# Pure-math weight generator (no GPU).
-add_executable(test_weight_generator tests/test_weight_generator.cpp
-                                 src/blend/weight_generator.cpp)
-target_include_directories(test_weight_generator PRIVATE
-    "${CMAKE_CURRENT_SOURCE_DIR}/src"
-    "${CMAKE_CURRENT_SOURCE_DIR}/tests")
-target_link_libraries(test_weight_generator PRIVATE Threads::Threads)
-add_test(NAME weight_generator COMMAND test_weight_generator)
 
 # GPU blend engine dispatch sanity (needs Vulkan + the compiled SPIR-V).
 add_executable(test_blend_engine tests/test_blend_engine.cpp)

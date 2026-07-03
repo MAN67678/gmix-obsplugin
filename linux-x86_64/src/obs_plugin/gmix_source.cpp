@@ -45,64 +45,18 @@ namespace {
 
 constexpr const char* kSettingTarget      = "target_process";
 constexpr const char* kSettingGpuIndex    = "gpu_index";
-constexpr const char* kSettingPreset      = "blur_preset";
 constexpr const char* kSettingBlurDensity = "blur_density";
 constexpr const char* kSettingBrightness  = "blur_brightness";
-constexpr const char* kSettingLatencyMode = "latency_mode";
 constexpr const char* kDefaultTarget      = "osu!";
 
-constexpr const char* kPresetFlat      = "flat";
-constexpr const char* kPresetLinear    = "linear";
-constexpr const char* kPresetCinematic = "cinematic";
-constexpr const char* kPresetHeavy     = "heavy";
-constexpr const char* kPresetAdvanced  = "advanced";
-
-constexpr const char* kLatencyFast     = "fast";
-constexpr const char* kLatencyMedium   = "medium";
-constexpr const char* kLatencySlow     = "slow";
-constexpr const char* kLatencyVerySlow = "very_slow";
-
-// Fast=2 (tightest, least tolerance), Medium=3 (default, matches the
-// pre-existing kDstBuffers=3), Slow=4, Very slow=5 -- see BlendEngine's
-// dstBufferCount()/kMinDstBuffers/kMaxDstBuffers comment for what this
-// actually trades off (buffer-reuse timing tolerance vs. VRAM).
-uint32_t latencyModeSettingToBufferCount(const char* v) {
-    if (!v) return gmix::BlendEngine::kDefaultDstBuffers;
-    if (std::strcmp(v, kLatencyFast) == 0)     return 2;
-    if (std::strcmp(v, kLatencySlow) == 0)     return 4;
-    if (std::strcmp(v, kLatencyVerySlow) == 0) return 5;
-    return gmix::BlendEngine::kDefaultDstBuffers;   // "medium" or unrecognized
-}
-
-const char* bufferCountToLatencyModeSetting(uint32_t count) {
-    switch (count) {
-    case 2:  return kLatencyFast;
-    case 4:  return kLatencySlow;
-    case 5:  return kLatencyVerySlow;
-    default: return kLatencyMedium;
-    }
-}
-
-gmix::BlendConfig::Mode presetSettingToMode(const char* v) {
-    if (!v) return gmix::BlendConfig::Mode::Flat;
-    if (std::strcmp(v, kPresetLinear) == 0)    return gmix::BlendConfig::Mode::Linear;
-    if (std::strcmp(v, kPresetCinematic) == 0) return gmix::BlendConfig::Mode::Cinematic;
-    if (std::strcmp(v, kPresetHeavy) == 0)     return gmix::BlendConfig::Mode::Heavy;
-    if (std::strcmp(v, kPresetAdvanced) == 0)  return gmix::BlendConfig::Mode::Advanced;
-    return gmix::BlendConfig::Mode::Flat;
-}
-
-const char* presetModeToString(gmix::BlendConfig::Mode mode) {
-    switch (mode) {
-    case gmix::BlendConfig::Mode::Flat:      return kPresetFlat;
-    case gmix::BlendConfig::Mode::Linear:    return kPresetLinear;
-    case gmix::BlendConfig::Mode::Cinematic: return kPresetCinematic;
-    case gmix::BlendConfig::Mode::Heavy:     return kPresetHeavy;
-    case gmix::BlendConfig::Mode::Advanced:  return kPresetAdvanced;
-    case gmix::BlendConfig::Mode::Raw:       return "raw";
-    }
-    return "?";
-}
+// The plugin used to expose a "Blur preset" (Flat/Linear/Cinematic/Heavy/
+// Advanced) and a "Latency mode" (Fast/Medium/Slow/Very slow, i.e.
+// dstBufferCount 2/3/4/5) dropdown. Both removed 2026-07-03 when the plugin
+// was stripped down to only what was actually being used live: Advanced
+// mode, at the most tolerant (5-buffer) Latency mode setting -- see
+// DEV_NOTES.md. dstBufferCount is now this one fixed constant everywhere
+// instead of a user-configurable, persisted-to-disk value.
+constexpr uint32_t kFixedDstBufferCount = 5;   // was "Very slow"
 
 // ── Diagnostics: EMA-smoothed rate tracker for the periodic status log ─────
 // Mutex-guarded rather than lock-free: this is a low-frequency diagnostic
@@ -157,33 +111,44 @@ bool writeTargetProcessConfig(const std::string& target) {
     return out.good();
 }
 
-// ── Persisted engine-wide settings (GPU index, Latency mode) ────────────────
-// GPU index and Latency mode (dstBufferCount) are fundamentally PROCESS-WIDE
-// -- one shared GmixEngine for however many "GMix Motion Blur" sources exist
-// -- but OBS only gives plugins PER-SOURCE settings storage (obs_data_t).
-// With N sources, whichever one OBS happens to construct FIRST decides the
-// value for ALL of them, which depends on OBS's internal source-load order,
-// not anything the user controls. Worse: CONFIRMED live, a brand-new
-// "+"-added source always starts from gmixGetDefaults() (OBS calls create()
-// before the user can touch Properties), so "remove every source and
-// re-add" -- the only way to force a fresh engine -- can never actually
-// produce a non-default value either; there's no way to escape the default
-// under pure per-source storage. This file breaks that: it's the value the
-// NEXT freshly-created engine uses, written ONLY when the user actually
-// interacts with the Latency mode dropdown in Properties (see
-// gmixLatencyModified()'s modified-callback -- NOT from gmixUpdate()'s
-// routine settings-application path, which also runs on ordinary source
-// creation/scene-collection load with whatever default/stale values that
-// particular source happens to have; writing from THAT path would silently
-// clobber a deliberately-set value the moment any other default-configured
-// source gets created).
+// ── Persisted engine-wide setting (GPU index) ───────────────────────────────
+// GPU index is fundamentally PROCESS-WIDE -- one shared GmixEngine for
+// however many "GMix Motion Blur" sources exist -- but OBS only gives
+// plugins PER-SOURCE settings storage (obs_data_t). With N sources,
+// whichever one OBS happens to construct FIRST decides the value for ALL of
+// them, which depends on OBS's internal source-load order, not anything the
+// user controls. Worse: CONFIRMED live, a brand-new "+"-added source always
+// starts from gmixGetDefaults() (OBS calls create() before the user can
+// touch Properties), so "remove every source and re-add" -- the only way to
+// force a fresh engine -- can never actually produce a non-default value
+// either; there's no way to escape the default under pure per-source
+// storage. This file breaks that: it's the value the NEXT freshly-created
+// engine uses, written ONLY when the user actually interacts with the GPU
+// index field in Properties (see gmixGpuIndexModified()'s modified-callback
+// -- NOT from gmixUpdate()'s routine settings-application path, which also
+// runs on ordinary source creation/scene-collection load with whatever
+// default/stale value that particular source happens to have; writing from
+// THAT path would silently clobber a deliberately-set value the moment any
+// other default-configured source gets created).
+//
+// Blur density/brightness do NOT need an equivalent file: unlike GPU index
+// (and, formerly, Latency mode/dstBufferCount), they apply LIVE to the
+// running engine without needing a rebuild (see applyBlendConfigFromSettings
+// below), and with the plugin's simplified single-shared-engine model
+// (see README: use ONE "GMix Motion Blur" source, reused across scenes via
+// "Add Existing Source", not multiple independent source instances) OBS's
+// own scene-collection persistence of this one source's obs_data is enough
+// -- there's no other differently-configured source instance for a freshly
+// rebuilt engine to need to recover a value FROM. gmixCreate() pushes this
+// source's own saved density/brightness into a freshly-created engine
+// directly (see its comment) instead of going through a file.
 std::filesystem::path engineSettingsConfigPath() {
     const char* home = std::getenv("HOME");
     if (!home) return {};
     return std::filesystem::path(home) / ".config" / "gmix" / "engine_settings";
 }
 
-bool writeEngineSettingsConfig(int32_t gpuIndex, uint32_t dstBufferCount) {
+bool writeEngineSettingsConfig(int32_t gpuIndex) {
     auto path = engineSettingsConfigPath();
     if (path.empty()) return false;
     std::error_code ec;
@@ -191,71 +156,21 @@ bool writeEngineSettingsConfig(int32_t gpuIndex, uint32_t dstBufferCount) {
     if (ec) return false;
     std::ofstream out(path);
     if (!out) return false;
-    out << gpuIndex << ' ' << dstBufferCount;
+    out << gpuIndex;
     return out.good();
 }
 
-// Returns false (leaving gpuIndex/dstBufferCount untouched) if the file
-// doesn't exist yet -- the very first engine ever created on this machine,
-// before any Latency mode change has ever been persisted -- so the caller's
-// own (first-source's) values are used, matching the pre-existing behavior.
-bool readEngineSettingsConfig(int32_t& gpuIndex, uint32_t& dstBufferCount) {
+// Returns false (leaving gpuIndex untouched) if the file doesn't exist yet --
+// the very first engine ever created on this machine, before any GPU index
+// change has ever been persisted -- so the caller's own (first-source's)
+// value is used, matching the pre-existing behavior.
+bool readEngineSettingsConfig(int32_t& gpuIndex) {
     auto path = engineSettingsConfigPath();
     std::ifstream in(path);
     if (!in) return false;
-    int32_t gi; uint32_t db;
-    if (!(in >> gi >> db)) return false;
+    int32_t gi;
+    if (!(in >> gi)) return false;
     gpuIndex = gi;
-    dstBufferCount = db;
-    return true;
-}
-
-// ── Persisted blend config (preset/density/brightness) ─────────────────────
-// A SEPARATE file from engine_settings, not because the mechanism differs --
-// it's the exact same pattern -- but because blend config changes far more
-// often (every preset/slider tweak) than gpuIndex/Latency mode, and applying
-// live vs. needing a full engine rebuild are genuinely different concerns.
-//
-// CONFIRMED LIVE this was still needed even AFTER blendConfig started
-// applying live via genuine Properties interaction (see
-// applyBlendConfigFromSettings()): changing Latency mode still requires
-// removing every source to rebuild the engine (inherent, unchanged), and
-// that rebuild constructs a BRAND NEW GmixEngine whose blendConfig starts
-// at its hard default (Flat) -- there was nowhere for the just-set Advanced
-// preset to have persisted TO, since it only ever lived in the now-deleted
-// engine's memory. Same fix as engine_settings: write on every genuine
-// change, read when constructing a fresh engine.
-std::filesystem::path blendConfigPath() {
-    const char* home = std::getenv("HOME");
-    if (!home) return {};
-    return std::filesystem::path(home) / ".config" / "gmix" / "blend_config";
-}
-
-void writeBlendConfigFile(const gmix::BlendConfig& cfg) {
-    auto path = blendConfigPath();
-    if (path.empty()) return;
-    std::error_code ec;
-    std::filesystem::create_directories(path.parent_path(), ec);
-    if (ec) return;
-    std::ofstream out(path);
-    if (!out) return;
-    out << presetModeToString(cfg.mode) << ' ' << cfg.blurDensity << ' ' << cfg.shutterStrength;
-}
-
-// Returns false (leaving cfg untouched) if the file doesn't exist yet --
-// e.g. the very first engine ever created, before any preset change has
-// ever been persisted -- so the caller's own default (Flat) is used.
-bool readBlendConfigFile(gmix::BlendConfig& cfg) {
-    auto path = blendConfigPath();
-    std::ifstream in(path);
-    if (!in) return false;
-    std::string modeStr;
-    uint32_t density = 0;
-    float brightness = 0.0f;
-    if (!(in >> modeStr >> density >> brightness)) return false;
-    cfg.mode = presetSettingToMode(modeStr.c_str());
-    cfg.blurDensity = density;
-    cfg.shutterStrength = brightness;
     return true;
 }
 
@@ -352,11 +267,11 @@ struct GmixEngine {
     gmix::BlendEngine* blend = nullptr;   // heap: BlendEngine has no default ctor
     bool blendReady = false;
     int32_t gpuIndex = -1;
-    // "Latency mode" OBS setting (Fast/Medium/Slow/Very slow -> 2/3/4/5 dst
-    // buffers, see BlendEngine's dstBufferCount() comment for the actual
-    // tradeoff). Engine-wide, fixed for its lifetime once the first source
-    // sets it -- same precedent as gpuIndex above. Clamped in acquireEngine().
-    uint32_t dstBufferCount = gmix::BlendEngine::kDefaultDstBuffers;
+    // Always kFixedDstBufferCount now (see its comment) -- kept as a member,
+    // rather than reading the constant directly everywhere below, so the
+    // rest of this struct/workerMain() didn't need to change when Latency
+    // mode stopped being user-configurable.
+    uint32_t dstBufferCount = kFixedDstBufferCount;
 
     // gs_texture_t handles imported ONCE per dst buffer (see workerMain()).
     // Sized to dstBufferCount in acquireEngine(), before the worker thread
@@ -450,36 +365,23 @@ void workerMain(GmixEngine* s);
 
 // First caller (refCount 0->1) spins up the shared worker thread and headless
 // Vulkan context; later callers just bump the refcount and attach to the
-// already-running pipeline. gpuIndex/dstBufferCount only take effect for the
-// first caller.
-GmixEngine* acquireEngine(int32_t gpuIndex, uint32_t dstBufferCount) {
+// already-running pipeline. gpuIndex only takes effect for the first caller
+// (dstBufferCount is now always kFixedDstBufferCount, see its comment).
+GmixEngine* acquireEngine(int32_t gpuIndex) {
     std::lock_guard<std::mutex> lk(gEngineMu);
     if (!gEngine) {
-        // Prefer the persisted config over this specific caller's own values
+        // Prefer the persisted config over this specific caller's own value
         // -- see the engineSettingsConfigPath() comment for why: per-source
         // storage can't reliably express a process-wide setting. If the file
         // doesn't exist yet (nothing has ever been persisted), fall through
-        // to this caller's own values, matching the original behavior.
-        bool usedPersisted = readEngineSettingsConfig(gpuIndex, dstBufferCount);
+        // to this caller's own value, matching the original behavior.
+        bool usedPersisted = readEngineSettingsConfig(gpuIndex);
         auto* e = new GmixEngine();
         e->gpuIndex = gpuIndex;
-        e->dstBufferCount = std::clamp(dstBufferCount,
-                                       gmix::BlendEngine::kMinDstBuffers,
-                                       gmix::BlendEngine::kMaxDstBuffers);
         e->tex.assign(e->dstBufferCount, nullptr);
         if (usedPersisted) {
             blog(LOG_INFO, "gmix: using persisted engine settings from "
-                           "~/.config/gmix/engine_settings (gpuIndex=%d dstBufferCount=%u)",
-                 gpuIndex, e->dstBufferCount);
-        }
-        // Same idea for blend config (preset/density/brightness) -- see
-        // blendConfigPath()'s comment. e->blendConfig already default-
-        // constructs to Flat if the file doesn't exist yet.
-        if (readBlendConfigFile(e->blendConfig)) {
-            blog(LOG_INFO, "gmix: using persisted blend config from "
-                           "~/.config/gmix/blend_config (preset=%s density=%u brightness=%.1f)",
-                 presetModeToString(e->blendConfig.mode), e->blendConfig.blurDensity,
-                 e->blendConfig.shutterStrength);
+                           "~/.config/gmix/engine_settings (gpuIndex=%d)", gpuIndex);
         }
         if (!e->vk.init(gpuIndex, /*headless=*/true)) {
             blog(LOG_ERROR, "gmix: headless Vulkan init failed -- source will produce no frames");
@@ -497,26 +399,21 @@ GmixEngine* acquireEngine(int32_t gpuIndex, uint32_t dstBufferCount) {
         e->worker = std::thread(workerMain, e);
         gEngine = e;
         blog(LOG_INFO,
-             "gmix: engine created with gpuIndex=%d dstBufferCount=%u (Latency mode) -- "
-             "these are now FIXED for every attached source until ALL \"GMix Motion Blur\" "
-             "sources are removed (changing them on an existing source, or adding a source "
+             "gmix: engine created with gpuIndex=%d (dstBufferCount fixed at %u) -- "
+             "gpuIndex is FIXED for every attached source until ALL \"GMix Motion Blur\" "
+             "sources are removed (changing it on an existing source, or adding a source "
              "with a different value, has no effect on the already-running engine)",
              gpuIndex, e->dstBufferCount);
-    } else if (gEngine->gpuIndex != gpuIndex || gEngine->dstBufferCount != dstBufferCount) {
-        // This source's own saved settings differ from what's already locked
-        // in -- silently ignoring that (matching gpuIndex's existing,
-        // documented precedent) previously gave no indication anything was
-        // even requested, let alone ignored. Confirmed happening live: user
-        // set Latency mode to Slow (4 buffers) on one source but the engine
-        // had already been created at Medium (3) by whichever source OBS
-        // constructed first when the scene collection loaded -- no error, no
-        // buffers=4 in the log, just silent. This warning is that visibility.
+    } else if (gEngine->gpuIndex != gpuIndex) {
+        // This source's own saved GPU index differs from what's already
+        // locked in -- silently ignoring that previously gave no indication
+        // anything was even requested, let alone ignored. This warning is
+        // that visibility.
         blog(LOG_WARNING,
-             "gmix: this source wants gpuIndex=%d dstBufferCount=%u, but the already-running "
-             "engine is fixed at gpuIndex=%d dstBufferCount=%u (set by whichever source was "
-             "created first) -- IGNORED. Remove every \"GMix Motion Blur\" source and re-add "
-             "to apply the new value.",
-             gpuIndex, dstBufferCount, gEngine->gpuIndex, gEngine->dstBufferCount);
+             "gmix: this source wants gpuIndex=%d, but the already-running engine is fixed "
+             "at gpuIndex=%d (set by whichever source was created first) -- IGNORED. Remove "
+             "every \"GMix Motion Blur\" source and re-add to apply the new value.",
+             gpuIndex, gEngine->gpuIndex);
     }
     ++gEngine->refCount;
     return gEngine;
@@ -553,7 +450,6 @@ struct GmixSource {
     obs_source_t* source = nullptr;
     std::string targetProcess = kDefaultTarget;
     int32_t gpuIndex = -1;
-    uint32_t dstBufferCount = gmix::BlendEngine::kDefaultDstBuffers;
     GmixEngine* engine = nullptr;
 };
 
@@ -815,8 +711,8 @@ void workerMain(GmixEngine* s) {
             uint64_t arrivalsNow = queue.arrivals.load();
             if (!s->blend->blendInFlight() && arrivalsNow != lastBlendArrivals &&
                 curTickSeq != lastDispatchedTickSeq) {
-                // Live snapshot of the blend preset -- gmixUpdate() can change
-                // it at any time (OBS properties dialog), and it's shared
+                // Live snapshot of the blend config -- Properties-dialog
+                // interaction can change it at any time, and it's shared
                 // across every attached GmixSource, so read it fresh here
                 // rather than caching a stale copy for the connection's
                 // lifetime.
@@ -857,24 +753,12 @@ void workerMain(GmixEngine* s) {
                         }
                         if (!merged) { waitSems.push_back(sem); waitVals.push_back(v); }
                     }
-                    std::vector<float> weights = config.weightsFor(static_cast<int>(n));
-
                     gmix::ResampleParams resample{};
-                    resample.enabled         = config.usesResamplePath();
                     resample.subSamples      = config.blurDensity;
                     resample.shutterStrength = config.shutterStrength;
-                    // resample.falloff intentionally NOT set (left at
-                    // ResampleParams' default): resample_blur.comp no longer
-                    // reads a per-frame recency falloff at all -- every real
-                    // frame in the window is weighted flat, like the Flat
-                    // preset, to fix a ghosting regression (see DEV_NOTES
-                    // 2026-07-03 "ninth" entry). The field stays in
-                    // BlendConfig/ResampleParams/the push-constant struct for
-                    // now (ABI churn isn't worth it for a dead field), just
-                    // unused on this path.
 
                     uint32_t back = nextWriteIdx;
-                    if (s->blend->dispatchAsync(srcViews.data(), weights.data(),
+                    if (s->blend->dispatchAsync(srcViews.data(),
                                                 static_cast<uint32_t>(n), back,
                                                 waitSems.data(), waitVals.data(),
                                                 static_cast<uint32_t>(waitSems.size()),
@@ -901,28 +785,19 @@ void workerMain(GmixEngine* s) {
                 // budget (a slow draw delays the pixels just as much as a
                 // slow blend does) -- [obs].
                 //
-                // The budget itself is derived from Latency mode
-                // (s->dstBufferCount), not hardcoded, and applies to EVERY
-                // preset, not just Advanced: `dstBufferCount - 1` frame
-                // intervals -- Fast(2 buffers)=1, Medium(3)=2, Slow(4)=3,
-                // Very slow(5)=4. This is the SAME number the buffer count
-                // already encodes as "how many extra dispatch generations of
-                // grace before a buffer gets reused" (see
-                // BlendEngine::dstBufferCount()'s comment) -- Latency mode is
-                // fundamentally "how much blend/draw timing variance are you
-                // willing to tolerate," so the diagnostic budget and the
-                // actual buffering mechanism should use the same number
-                // instead of an unrelated hardcoded one. Surfacing the active
-                // preset in the status log makes an elevated blend_latency
-                // self-explanatory instead of requiring the kind of
-                // after-the-fact correlation-hunting this session needed to
-                // confirm the Cinematic-preset cost earlier. Only warn if it
-                // blows even this budget -- that's the point where a slow
-                // blend/draw starts meaningfully lagging the live capture,
-                // not just costing more GPU time within an already-accepted
-                // allowance.
-                gmix::BlendConfig::Mode curMode;
-                { std::lock_guard<std::mutex> lk(s->blendConfigMu); curMode = s->blendConfig.mode; }
+                // The budget itself is derived from dstBufferCount (fixed at
+                // kFixedDstBufferCount now, was the user-facing "Latency
+                // mode" setting): `dstBufferCount - 1` frame intervals -- 4
+                // at the current fixed 5-buffer count. This is the SAME
+                // number the buffer count already encodes as "how many extra
+                // dispatch generations of grace before a buffer gets reused"
+                // (see BlendEngine::dstBufferCount()'s comment), so the
+                // diagnostic budget and the actual buffering mechanism use
+                // the same number instead of an unrelated hardcoded one.
+                // Only warn if it blows even this budget -- that's the point
+                // where a slow blend/draw starts meaningfully lagging the
+                // live capture, not just costing more GPU time within an
+                // already-accepted allowance.
                 double frameMs = s->obsFrameSec.load(std::memory_order_relaxed) * 1000.0;
                 double blendMs = s->blendLatencyMs.load(std::memory_order_relaxed);
                 double drawMs  = s->drawLatencyMs.load(std::memory_order_relaxed);
@@ -931,11 +806,9 @@ void workerMain(GmixEngine* s) {
                 bool overBudget = (blendMs + drawMs) > frameMs * budgetFrames;
                 if (overBudget && !loggedLatencyBudgetWarning) {
                     blog(LOG_WARNING,
-                         "gmix: preset=%s end-to-end (blend+draw) latency %.1fms exceeds the "
-                         "~%.1fms (%.0f-frame, from Latency mode) budget -- consider a lower "
-                         "blur density (Advanced) or a slower Latency mode for more tolerance",
-                         presetModeToString(curMode), blendMs + drawMs, frameMs * budgetFrames,
-                         budgetFrames);
+                         "gmix: end-to-end (blend+draw) latency %.1fms exceeds the ~%.1fms "
+                         "(%.0f-frame) budget -- consider a lower blur density",
+                         blendMs + drawMs, frameMs * budgetFrames, budgetFrames);
                     loggedLatencyBudgetWarning = true;
                 } else if (!overBudget) {
                     loggedLatencyBudgetWarning = false;
@@ -943,9 +816,9 @@ void workerMain(GmixEngine* s) {
 
                 if (nowTick - lastStatusLogTime >= kStatusLogInterval) {
                     blog(LOG_INFO,
-                         "gmix: status: preset=%s producer=%.1ffps consumer=%.1ffps blend=%.1ffps "
+                         "gmix: status: producer=%.1ffps consumer=%.1ffps blend=%.1ffps "
                          "drawn=%.1ffps blend_latency=%.1fms draw_latency=%.1fms",
-                         presetModeToString(curMode), s->producerRate.fps(), s->consumerRate.fps(),
+                         s->producerRate.fps(), s->consumerRate.fps(),
                          s->blendRate.fps(), s->drawnRate.fps(), blendMs, drawMs);
                     lastStatusLogTime = nowTick;
                 }
@@ -998,89 +871,60 @@ const char* gmixGetName(void*) { return "GMix Motion Blur"; }
 void gmixGetDefaults(obs_data_t* settings) {
     obs_data_set_default_string(settings, kSettingTarget, kDefaultTarget);
     obs_data_set_default_int(settings, kSettingGpuIndex, -1);
-    obs_data_set_default_string(settings, kSettingPreset, kPresetFlat);
     obs_data_set_default_int(settings, kSettingBlurDensity, 4);
     // 1.3, not 1.0 -- 1.0 (pure energy-conserving average, no boost) tested
-    // visibly under-bright for the Advanced preset's motion trail. 1.2 was
-    // an earlier live-confirmed baseline, since raised to 1.3: 1.5 gave the
+    // visibly under-bright for the Advanced-style motion trail. 1.2 was an
+    // earlier live-confirmed baseline, since raised to 1.3: 1.5 gave the
     // best in-game blur but was too bright on menu screens (mostly static,
     // bright UI -- the boost is motion-gated but menus still have plenty of
     // moving elements), and there's no single value that's right for both,
     // so 1.3 splits the difference as the default and the slider is there
-    // for the user to tune per-content. Only affects Advanced
-    // (Flat/Linear/Cinematic/Heavy ignore this field).
+    // for the user to tune per-content.
     obs_data_set_default_double(settings, kSettingBrightness, 1.3);
-    obs_data_set_default_string(settings, kSettingLatencyMode, kLatencyMedium);
 }
 
 // CONFIRMED LIVE: OBS fires a property's modified-callback once automatically
 // as part of building/validating a fresh obs_properties_t (e.g. right after a
 // source is created), NOT only on genuine user interaction with the control.
-// That auto-fire was clobbering the persisted Latency mode config the instant
-// a freshly re-added source got its properties initialized, silently undoing
+// That auto-fire was clobbering the persisted GPU index config the instant a
+// freshly re-added source got its properties initialized, silently undoing
 // whatever had just been read from the file at engine-creation time (the
-// user had to re-pick the dropdown after every single remove/re-add cycle to
+// user had to re-pick it after every single remove/re-add cycle to
 // compensate) -- and separately, was ALSO the reason a brand-new source
-// unconditionally reset the shared blend preset back to Flat the moment it
-// was created (see applyBlendConfigFromSettings()'s comment). Each of these
-// flags is reset by gmixGetProperties() (called once per properties_t build)
-// and consumed by the FIRST modified-callback invocation that follows for
-// that specific control -- all OBS properties-dialog callbacks run on the
-// single UI thread, so a plain flag reliably distinguishes that one
-// synthetic fire from every later GENUINE interaction within the same
+// unconditionally reset the shared blend config back to defaults the moment
+// it was created (see applyBlendConfigFromSettings()'s comment). Each of
+// these flags is reset by gmixGetProperties() (called once per properties_t
+// build) and consumed by the FIRST modified-callback invocation that
+// follows for that specific control -- all OBS properties-dialog callbacks
+// run on the single UI thread, so a plain flag reliably distinguishes that
+// one synthetic fire from every later GENUINE interaction within the same
 // dialog session (which DOES need to write -- that's the whole feature).
 // Separate flags per control since each control's modified-callback gets its
 // own auto-fire, not one shared fire for the whole dialog.
-bool gGmixNextLatencyModifiedIsAutoFire    = false;
-bool gGmixNextPresetModifiedIsAutoFire     = false;
+bool gGmixNextGpuIndexModifiedIsAutoFire   = false;
 bool gGmixNextDensityModifiedIsAutoFire    = false;
 bool gGmixNextBrightnessModifiedIsAutoFire = false;
 
-// Blend preset/density/brightness are a property of the SHARED engine (see
+// Blend density/brightness are a property of the SHARED engine (see
 // GmixEngine::blendConfig's comment), not of any one source -- so this reads
 // straight from the global gEngine rather than needing a GmixSource*, and is
 // called only from genuine modified-callback interactions (see the
 // auto-fire comment above): CONFIRMED LIVE that writing this unconditionally
 // from gmixUpdate()'s routine path let a brand-new source's own default
-// settings silently reset the shared preset for every scene the instant it
-// was created, even with another source deliberately set to Advanced.
+// settings silently reset the shared blend config for every scene the
+// instant it was created, even with another source deliberately tuned.
+// Applies LIVE only -- no persisted file (unlike GPU index): see
+// engineSettingsConfigPath()'s comment for why one isn't needed here.
 void applyBlendConfigFromSettings(obs_data_t* settings) {
     std::lock_guard<std::mutex> lk(gEngineMu);
     if (!gEngine) return;
     gmix::BlendConfig cfg;
-    cfg.mode = presetSettingToMode(obs_data_get_string(settings, kSettingPreset));
     cfg.blurDensity = static_cast<uint32_t>(
         std::clamp<long long>(obs_data_get_int(settings, kSettingBlurDensity), 4, 32));
     cfg.shutterStrength = static_cast<float>(
         std::clamp(obs_data_get_double(settings, kSettingBrightness), 0.1, 10.0));
-    {
-        std::lock_guard<std::mutex> lk2(gEngine->blendConfigMu);
-        gEngine->blendConfig = cfg;
-    }
-    // Persist so the NEXT freshly-created engine (e.g. after a Latency mode
-    // change forces every source to be removed and re-added) starts from
-    // this value instead of the hard Flat default -- see blendConfigPath()'s
-    // comment for why this is needed even though the live-apply above
-    // already works within the CURRENT engine's lifetime.
-    writeBlendConfigFile(cfg);
-}
-
-// Blur density/brightness only mean anything for the Advanced (optical-flow)
-// preset -- hide them for every other preset so the dialog doesn't show dead
-// controls. Visibility toggling happens unconditionally (needed even on the
-// auto-fire, to set up correct INITIAL visibility) -- only the blendConfig
-// write is gated.
-bool gmixPresetModified(void*, obs_properties_t* props, obs_property_t*, obs_data_t* settings) {
-    const char* preset = obs_data_get_string(settings, kSettingPreset);
-    const bool advanced = preset && std::strcmp(preset, kPresetAdvanced) == 0;
-    obs_property_set_visible(obs_properties_get(props, kSettingBlurDensity), advanced);
-    obs_property_set_visible(obs_properties_get(props, kSettingBrightness), advanced);
-    if (gGmixNextPresetModifiedIsAutoFire) {
-        gGmixNextPresetModifiedIsAutoFire = false;
-    } else {
-        applyBlendConfigFromSettings(settings);
-    }
-    return true;   // properties layout changed (visibility) -- ask OBS to redraw
+    std::lock_guard<std::mutex> lk2(gEngine->blendConfigMu);
+    gEngine->blendConfig = cfg;
 }
 
 bool gmixDensityModified(void*, obs_properties_t*, obs_property_t*, obs_data_t* settings) {
@@ -1101,21 +945,18 @@ bool gmixBrightnessModified(void*, obs_properties_t*, obs_property_t*, obs_data_
     return false;
 }
 
-bool gmixLatencyModified(void*, obs_properties_t*, obs_property_t*, obs_data_t* settings) {
-    if (gGmixNextLatencyModifiedIsAutoFire) {
-        gGmixNextLatencyModifiedIsAutoFire = false;
+bool gmixGpuIndexModified(void*, obs_properties_t*, obs_property_t*, obs_data_t* settings) {
+    if (gGmixNextGpuIndexModifiedIsAutoFire) {
+        gGmixNextGpuIndexModifiedIsAutoFire = false;
         return false;
     }
     int32_t gpuIndex = static_cast<int32_t>(obs_data_get_int(settings, kSettingGpuIndex));
-    uint32_t dstBufferCount = latencyModeSettingToBufferCount(
-        obs_data_get_string(settings, kSettingLatencyMode));
-    writeEngineSettingsConfig(gpuIndex, dstBufferCount);
+    writeEngineSettingsConfig(gpuIndex);
     blog(LOG_INFO,
-         "gmix: Latency mode changed -- saved gpuIndex=%d dstBufferCount=%u to "
-         "~/.config/gmix/engine_settings for the NEXT engine creation (the current "
-         "engine, if any, is unaffected until every \"GMix Motion Blur\" source is "
-         "removed and re-added)",
-         gpuIndex, dstBufferCount);
+         "gmix: GPU index changed -- saved gpuIndex=%d to ~/.config/gmix/engine_settings "
+         "for the NEXT engine creation (the current engine, if any, is unaffected until "
+         "every \"GMix Motion Blur\" source is removed and re-added)",
+         gpuIndex);
     return false;   // no properties-layout change needed
 }
 
@@ -1123,46 +964,21 @@ obs_properties_t* gmixGetProperties(void*) {
     obs_properties_t* props = obs_properties_create();
     obs_properties_add_text(props, kSettingTarget,
                             "Capture target (process name fragment)", OBS_TEXT_DEFAULT);
-    obs_properties_add_int(props, kSettingGpuIndex, "GPU index (-1 = auto)", -1, 15, 1);
-
-    obs_property_t* preset = obs_properties_add_list(props, kSettingPreset, "Blur preset",
-                                                      OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_STRING);
-    obs_property_list_add_string(preset, "Flat", kPresetFlat);
-    obs_property_list_add_string(preset, "Linear", kPresetLinear);
-    obs_property_list_add_string(preset, "Cinematic", kPresetCinematic);
-    obs_property_list_add_string(preset, "Heavy", kPresetHeavy);
-    obs_property_list_add_string(preset, "Advanced (optical awareness)", kPresetAdvanced);
-    obs_property_set_modified_callback2(preset, gmixPresetModified, nullptr);
+    obs_property_t* gpuIndex = obs_properties_add_int(
+        props, kSettingGpuIndex, "GPU index (-1 = auto)", -1, 15, 1);
+    obs_property_set_modified_callback2(gpuIndex, gmixGpuIndexModified, nullptr);
 
     obs_property_t* density = obs_properties_add_int_slider(props, kSettingBlurDensity,
-                                  "Blur density (Advanced: oversampling taps/frame)", 4, 32, 1);
+                                  "Blur density (oversampling taps/frame)", 4, 32, 1);
     obs_property_set_modified_callback2(density, gmixDensityModified, nullptr);
     obs_property_t* brightness = obs_properties_add_float_slider(props, kSettingBrightness,
-                                    "Blur brightness (Advanced: trail exposure)", 0.1, 10.0, 0.1);
+                                    "Blur brightness (trail exposure)", 0.1, 10.0, 0.1);
     obs_property_set_modified_callback2(brightness, gmixBrightnessModified, nullptr);
-
-    // Not preset-specific -- applies engine-wide (like GPU index). Changing
-    // it here saves to ~/.config/gmix/engine_settings (gmixLatencyModified())
-    // for the NEXT freshly-created engine; the CURRENT engine (if any) stays
-    // fixed until every "GMix Motion Blur" source is removed and re-added.
-    // More buffers = more tolerance for blend-timing variance (GPU
-    // contention, thermal/scheduling drift over a long session) at the cost
-    // of VRAM and a larger worst-case front-buffer staleness; see
-    // BlendEngine's dstBufferCount() comment for the mechanism.
-    obs_property_t* latency = obs_properties_add_list(
-        props, kSettingLatencyMode, "Latency mode (buffering, applies to next new engine)",
-        OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_STRING);
-    obs_property_list_add_string(latency, "Fast (2 buffers, least tolerance)", kLatencyFast);
-    obs_property_list_add_string(latency, "Medium (3 buffers, default)", kLatencyMedium);
-    obs_property_list_add_string(latency, "Slow (4 buffers)", kLatencySlow);
-    obs_property_list_add_string(latency, "Very slow (5 buffers, most tolerance)", kLatencyVerySlow);
-    obs_property_set_modified_callback2(latency, gmixLatencyModified, nullptr);
 
     // Arm the auto-fire guard for the ONE synthetic modified-callback
     // invocation OBS makes per control while building/validating this fresh
-    // obs_properties_t -- see gGmixNextLatencyModifiedIsAutoFire's comment.
-    gGmixNextLatencyModifiedIsAutoFire    = true;
-    gGmixNextPresetModifiedIsAutoFire     = true;
+    // obs_properties_t -- see gGmixNextGpuIndexModifiedIsAutoFire's comment.
+    gGmixNextGpuIndexModifiedIsAutoFire   = true;
     gGmixNextDensityModifiedIsAutoFire    = true;
     gGmixNextBrightnessModifiedIsAutoFire = true;
 
@@ -1181,78 +997,83 @@ void gmixUpdate(void* data, obs_data_t* settings) {
     const char* target = obs_data_get_string(settings, kSettingTarget);
     s->targetProcess = (target && *target) ? target : kDefaultTarget;
     s->gpuIndex = static_cast<int32_t>(obs_data_get_int(settings, kSettingGpuIndex));
-    s->dstBufferCount = latencyModeSettingToBufferCount(
-        obs_data_get_string(settings, kSettingLatencyMode));
-    // GPU index / Latency mode are fixed for the shared engine's whole
-    // lifetime once the FIRST source creates it (see acquireEngine()) -- so
-    // editing them on an ALREADY-EXISTING source's Properties dialog (as
-    // opposed to setting them before ever creating a source) silently has NO
-    // EFFECT on the already-running engine. Confirmed happening live: user
-    // set Latency mode to Slow, engine stayed at Medium the whole session,
-    // no error anywhere. Surface it here instead of leaving it silent.
-    if (s->engine && s->engine->dstBufferCount != s->dstBufferCount) {
+    // GPU index is fixed for the shared engine's whole lifetime once the
+    // FIRST source creates it (see acquireEngine()) -- so editing it on an
+    // ALREADY-EXISTING source's Properties dialog (as opposed to setting it
+    // before ever creating a source) silently has NO EFFECT on the
+    // already-running engine. Surface it here instead of leaving it silent.
+    if (s->engine && s->engine->gpuIndex != s->gpuIndex) {
         blog(LOG_WARNING,
-             "gmix: Latency mode change to %u buffers will NOT take effect -- the shared "
-             "engine is already running at %u buffers (set by whichever \"GMix Motion Blur\" "
-             "source was created first). Remove every GMix Motion Blur source and re-add to "
-             "apply the new value.",
-             s->dstBufferCount, s->engine->dstBufferCount);
+             "gmix: GPU index change to %d will NOT take effect -- the shared engine is "
+             "already running at gpuIndex=%d (set by whichever \"GMix Motion Blur\" source "
+             "was created first). Remove every GMix Motion Blur source and re-add to apply "
+             "the new value.",
+             s->gpuIndex, s->engine->gpuIndex);
     }
     if (!writeTargetProcessConfig(s->targetProcess)) {
         blog(LOG_WARNING, "gmix: failed to write ~/.config/gmix/target_process -- "
                            "the capture layer will not activate in the game");
     }
 
-    // Blend preset is a property of the shared engine (see GmixEngine's
-    // blendConfig comment), NOT of this specific source -- it is deliberately
-    // NOT written from this routine path anymore. CONFIRMED LIVE: this used
-    // to unconditionally overwrite s->engine->blendConfig every time
-    // gmixUpdate() ran, including the AUTOMATIC call OBS makes when a new/
-    // re-added source is created (using THAT source's own default/saved
+    // Blend density/brightness are a property of the shared engine (see
+    // GmixEngine::blendConfig comment), NOT of this specific source -- they
+    // are deliberately NOT written from this routine path. CONFIRMED LIVE:
+    // this used to unconditionally overwrite s->engine->blendConfig every
+    // time gmixUpdate() ran, including the AUTOMATIC call OBS makes when a
+    // new/re-added source is created (using THAT source's own default/saved
     // settings) -- so simply adding a second source silently reset the
-    // shared preset back to Flat for every scene, even though another
-    // already-existing source had deliberately set Advanced. The write now
+    // shared blend config for every scene, even though another
+    // already-existing source had deliberately tuned it. The write now
     // happens ONLY from genuine Properties-dialog interaction --
-    // gmixPresetModified()/gmixDensityModified()/gmixBrightnessModified(),
-    // using the same auto-fire-suppression pattern as Latency mode (see
-    // gGmixNextLatencyModifiedIsAutoFire's comment for why a modified-
+    // gmixDensityModified()/gmixBrightnessModified(), using the same
+    // auto-fire-suppression pattern as GPU index (see
+    // gGmixNextGpuIndexModifiedIsAutoFire's comment for why a modified-
     // callback firing is NOT by itself proof of genuine user interaction).
-    // Tradeoff, same as Latency mode and accepted for the same reason:
-    // reloading a saved scene collection no longer auto-restores a non-Flat
-    // preset -- it must be reselected once per OBS session.
 }
 
 void* gmixCreate(obs_data_t* settings, obs_source_t* source) {
     auto* s = new GmixSource();
     s->source = source;
-    gmixUpdate(s, settings);   // parses gpuIndex/dstBufferCount, needed below
+    gmixUpdate(s, settings);   // parses gpuIndex, needed below
 
-    s->engine = acquireEngine(s->gpuIndex, s->dstBufferCount);
+    s->engine = acquireEngine(s->gpuIndex);
     // engine == nullptr means headless Vulkan init failed (first source only);
     // return non-null anyway: an inert-but-valid source, per OBS's create() contract.
 
-    // CONFIRMED LIVE: this source's OWN saved settings (target/gpuIndex/
-    // Latency mode, all just parsed above) can be totally stale relative to
-    // an ALREADY-RUNNING engine this call just attached to -- e.g. a fresh
-    // "+"-added source always starts from gmixGetDefaults() (Flat/Medium),
-    // even when it successfully attaches to an engine that's actually
-    // running Advanced/Very-slow (restored from the persisted config files).
-    // The ENGINE's real behavior was already correct in that case -- this
-    // was purely the Properties dialog showing stale defaults, which reads
-    // exactly like a functional failure even though it isn't one. refCount
-    // > 1 (checked AFTER acquireEngine's own increment) means we attached to
-    // something that already existed, as opposed to just having created it
-    // fresh (refCount == 1) -- only then is there something to sync FROM.
+    // refCount > 1 (checked AFTER acquireEngine's own increment) means this
+    // call attached to an ALREADY-RUNNING engine rather than just having
+    // created a fresh one (refCount == 1) -- the two cases need opposite
+    // directions of sync:
     if (s->engine && s->engine->refCount.load(std::memory_order_relaxed) > 1) {
+        // Attached to an existing engine: CONFIRMED LIVE this source's OWN
+        // saved settings (target/gpuIndex/density/brightness, all just
+        // parsed above) can be totally stale relative to it -- e.g. a fresh
+        // "+"-added source always starts from gmixGetDefaults(), even when
+        // it successfully attaches to an engine that's actually running a
+        // deliberately-tuned config (restored from ~/.config/gmix/
+        // engine_settings, or just set live by another source this
+        // session). The ENGINE's real behavior is already correct in that
+        // case -- this is purely the Properties dialog showing stale
+        // defaults, which reads exactly like a functional failure even
+        // though it isn't one. Sync the DISPLAYED settings FROM the engine.
         gmix::BlendConfig cfgSnapshot;
         { std::lock_guard<std::mutex> lk(s->engine->blendConfigMu); cfgSnapshot = s->engine->blendConfig; }
-        obs_data_set_string(settings, kSettingPreset, presetModeToString(cfgSnapshot.mode));
         obs_data_set_int(settings, kSettingBlurDensity, cfgSnapshot.blurDensity);
         obs_data_set_double(settings, kSettingBrightness, cfgSnapshot.shutterStrength);
         obs_data_set_int(settings, kSettingGpuIndex, s->engine->gpuIndex);
-        obs_data_set_string(settings, kSettingLatencyMode,
-                            bufferCountToLatencyModeSetting(s->engine->dstBufferCount));
-        gmixUpdate(s, settings);   // re-parse so s->targetProcess/gpuIndex/dstBufferCount match too
+        gmixUpdate(s, settings);   // re-parse so s->targetProcess/gpuIndex match too
+    } else if (s->engine) {
+        // Just created a fresh engine: it default-constructed BlendConfig to
+        // hard defaults (1.3 brightness etc.), NOT this source's own saved
+        // density/brightness (obs_data_t/scene-collection-persisted) --
+        // gmixUpdate() deliberately never writes blendConfig (see its
+        // comment), so without this, a fresh engine would silently ignore
+        // whatever this source had saved from a previous session. Push this
+        // source's own settings INTO the engine once, here, at creation --
+        // NOT via a modified-callback (gmixCreate() always represents a
+        // genuine attachment, never an auto-fire artifact, so no suppression
+        // flag is needed for this specific call).
+        applyBlendConfigFromSettings(settings);
     }
     return s;
 }

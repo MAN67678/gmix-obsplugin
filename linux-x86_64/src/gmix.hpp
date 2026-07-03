@@ -11,7 +11,7 @@ namespace gmix {
 // App-wide constants.
 inline constexpr uint32_t kDefaultOutputFps = 60;
 inline constexpr int      kMaxBlendFrames   = 64;   // must match MAX_FRAMES in
-                                                    // shaders/blend.comp
+                                                    // shaders/resample_blur.comp
                                                     // (64 frames in a 16.6ms shutter = up to ~3800fps)
 inline constexpr int      kRingCapacity     = 8;    // timestamped frame ring depth
 
