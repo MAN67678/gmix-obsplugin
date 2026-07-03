@@ -58,9 +58,7 @@ uint32_t findMemoryType(VkPhysicalDevice phys, uint32_t typeBits,
 
 } // namespace
 
-BlendEngine::BlendEngine(VulkanContext& vk) : vk_(vk) {
-    for (auto& fd : dmaBufFd_) fd = -1;
-}
+BlendEngine::BlendEngine(VulkanContext& vk) : vk_(vk) {}
 
 BlendEngine::~BlendEngine() {
     destroyAll();
@@ -78,7 +76,7 @@ void BlendEngine::destroyAll() {
     if (blendTimeline_) { vkDestroySemaphore(dev, blendTimeline_, nullptr); blendTimeline_ = VK_NULL_HANDLE; }
     blendValue_ = inFlightValue_ = frontValue_ = 0;
     if (dstSampler_)    { vkDestroySampler(dev, dstSampler_, nullptr); dstSampler_ = VK_NULL_HANDLE; }
-    for (uint32_t i = 0; i < kDstBuffers; ++i) {
+    for (uint32_t i = 0; i < dstImage_.size(); ++i) {
         if (dstView_[i])  { vkDestroyImageView(dev, dstView_[i], nullptr); dstView_[i] = VK_NULL_HANDLE; }
         if (dstImage_[i]) { vkDestroyImage(dev, dstImage_[i], nullptr); dstImage_[i] = VK_NULL_HANDLE; }
         if (dstMem_[i])   { vkFreeMemory(dev, dstMem_[i], nullptr); dstMem_[i] = VK_NULL_HANDLE; }
@@ -113,9 +111,16 @@ void BlendEngine::destroyTransient() {
     descSet_    = VK_NULL_HANDLE;
 }
 
-bool BlendEngine::init(uint32_t w, uint32_t h) {
+bool BlendEngine::init(uint32_t w, uint32_t h, uint32_t dstBufferCount) {
     if (initialized_) destroyAll();
     width_ = w; height_ = h;
+    // Clamp defensively (an out-of-range OBS setting shouldn't be able to
+    // undersize the round-robin or blow past a sane VRAM ceiling); fixed for
+    // this engine's lifetime once the first init() picks it, matching
+    // gpuIndex's precedent -- see the header comment on init()/dstBufferCount().
+    numDstBuffers_ = dstBufferCount < kMinDstBuffers ? kMinDstBuffers
+                    : dstBufferCount > kMaxDstBuffers ? kMaxDstBuffers
+                    : dstBufferCount;
 
     VkDevice dev = vk_.device();
 
@@ -225,10 +230,23 @@ bool BlendEngine::createDstImage() {
         ici.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
     }
 
-    // Two dst buffers (front/back) for the pipelined present path; each is an
-    // independent storage-image render target the blend writes and the
-    // presenter blits from.
-    for (uint32_t i = 0; i < kDstBuffers; ++i) {
+    // Resize to numDstBuffers_ (the "Latency mode" setting) BEFORE the loop
+    // below populates them -- dmaBufFd_ specifically must default to -1 per
+    // slot, not the vector's normal zero-value default (0 looks like a valid
+    // fd), so it's filled explicitly rather than left at std::vector<int>'s
+    // default-constructed 0.
+    dstImage_.assign(numDstBuffers_, VK_NULL_HANDLE);
+    dstMem_.assign(numDstBuffers_, VK_NULL_HANDLE);
+    dstView_.assign(numDstBuffers_, VK_NULL_HANDLE);
+    dmaBufFd_.assign(numDstBuffers_, -1);
+    dmaBufStride_.assign(numDstBuffers_, 0);
+    dmaBufOffset_.assign(numDstBuffers_, 0);
+
+    // `numDstBuffers_` dst buffers (front/back/... per the chosen latency
+    // mode) for the pipelined present path; each is an independent
+    // storage-image render target the blend writes and the presenter blits
+    // from.
+    for (uint32_t i = 0; i < numDstBuffers_; ++i) {
         if (vkCreateImage(dev, &ici, nullptr, &dstImage_[i]) != VK_SUCCESS) {
             std::fprintf(stderr, "gmix: blend: dst image create failed\n");
             return false;
@@ -501,7 +519,7 @@ bool BlendEngine::dispatchAsync(VkImageView* srcViews, const float* weights,
                                 uint32_t waitCount, ResampleParams resample) {
     if (!initialized_) return false;
     if (srcCount == 0 || srcCount > (uint32_t)kMaxBlendFrames) return false;
-    if (dstIdx >= kDstBuffers) return false;
+    if (dstIdx >= numDstBuffers_) return false;
     // Caller contract: the previous blend must have completed (single fence +
     // single command buffer), so we never reset state still in GPU use.
 

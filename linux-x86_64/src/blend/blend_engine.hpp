@@ -47,7 +47,15 @@ public:
 
     // Lazily create the pipeline + dst image sized for (w,h). Call after the
     // output dimensions are known (and again if they change).
-    bool init(uint32_t w, uint32_t h);
+    // dstBufferCount: how many dst images to multi-buffer (see the
+    // dstBufferCount()/kMinDstBuffers/kMaxDstBuffers comment below for what
+    // this trades off) -- the "Latency mode" OBS
+    // setting (Fast/Medium/Slow/Very slow -> 2/3/4/5). Fixed for the engine's
+    // whole lifetime once chosen (like gpuIndex): re-init() on a resize
+    // reuses whatever count was passed the FIRST time, since callers pass
+    // the same value on every call in practice; clamped to
+    // [kMinDstBuffers, kMaxDstBuffers].
+    bool init(uint32_t w, uint32_t h, uint32_t dstBufferCount = kDefaultDstBuffers);
 
     // Blend `srcCount` source images with the given weights into dst.
     // srcViews:    pointer to srcCount VkImageView handles (each a 2D view of
@@ -62,8 +70,9 @@ public:
                          uint32_t srcCount);
 
     // ── Pipelined (asynchronous) dispatch ──────────────────────────────────
-    // The dst is multi-buffered (kDstBuffers) so a consumer can keep reading
-    // the last finished result (the "front") while a new blend runs into
+    // The dst is multi-buffered (dstBufferCount(), see below) so a consumer
+    // can keep reading the last finished result (the "front") while a new
+    // blend runs into
     // another buffer. dispatchAsync() records + submits into dst[dstIdx] and
     // returns WITHOUT waiting; the caller polls pollBlendDone() on later
     // ticks and, once true, treats dstIdx as the new front. This decouples the
@@ -77,19 +86,32 @@ public:
     // the sources -- so producer timing is handled on the GPU, not by a host
     // wait on the present thread. Pass 0 for none (tests).
     //
-    // 3, not 2: pollBlendDone() (a host-side timeline query) only proves
-    // gmix's OWN compute write finished -- for the OBS-plugin consumer,
-    // nothing proves the consumer's GPU has actually finished READING the
-    // previous front buffer by the time it's cycled back around as a write
-    // target (video_render() just records a draw call; there's no real
-    // cross-queue/cross-process fence on that read at all). A strict 2-buffer
-    // ping-pong reuses a buffer on the very next dispatch after it stops
-    // being front -- zero grace. Round-robining across 3 buffers (see the
-    // dispatch-target selection in gmix_source.cpp's workerMain()) gives one
-    // full extra dispatch generation of grace before reuse, which is cheap
-    // (one more capture-resolution RGBA8 image) insurance against exactly
-    // that race, without claiming to eliminate it outright.
-    static constexpr uint32_t kDstBuffers = 3;
+    // pollBlendDone() (a host-side timeline query) only proves gmix's OWN
+    // compute write finished -- for the OBS-plugin consumer, nothing proves
+    // the consumer's GPU has actually finished READING the previous front
+    // buffer by the time it's cycled back around as a write target
+    // (video_render() just records a draw call; there's no real cross-queue/
+    // cross-process fence on that read at all). A strict 2-buffer ping-pong
+    // reuses a buffer on the very next dispatch after it stops being front --
+    // zero grace. Round-robining across MORE buffers (see the dispatch-target
+    // selection in gmix_source.cpp's workerMain()) gives that many EXTRA
+    // dispatch generations of grace before reuse -- cheap (one more
+    // capture-resolution RGBA8 image per step) insurance against that race,
+    // and separately, slack for the blend's own cost to vary (GPU contention
+    // with the game, thermal/scheduling drift over a long session) without a
+    // slow blend's dst write racing a still-in-progress OBS read. This is the
+    // "Latency mode" OBS setting's actual mechanism: more buffers = more
+    // tolerance for timing variance, at the cost of (a) more VRAM (one
+    // capture-resolution RGBA8 image each) and (b) the theoretical worst-case
+    // staleness of the front buffer growing by one more dispatch interval.
+    // Fast=2 (tightest, least tolerance -- the pre-fix behavior), Medium=3
+    // (default), Slow=4, Very slow=5.
+    static constexpr uint32_t kMinDstBuffers     = 2;
+    static constexpr uint32_t kMaxDstBuffers     = 5;
+    static constexpr uint32_t kDefaultDstBuffers = 3;
+    // Actual count in effect for THIS engine instance, set by init(). Loops
+    // that used to iterate the old compile-time kDstBuffers now iterate this.
+    uint32_t dstBufferCount() const { return numDstBuffers_; }
     bool dispatchAsync(VkImageView* srcViews, const float* weights,
                        uint32_t srcCount, uint32_t dstIdx,
                        const VkSemaphore* waitSems = nullptr,
@@ -158,20 +180,27 @@ private:
     // the old alloc/free-every-frame churn that added per-tick jitter.
     VkCommandBuffer       cmd_          = VK_NULL_HANDLE;
 
-    VkImage        dstImage_[kDstBuffers] = {};
-    VkDeviceMemory dstMem_[kDstBuffers]   = {};
-    VkImageView    dstView_[kDstBuffers]  = {};
+    // Sized to numDstBuffers_ (set by init()), not a compile-time constant --
+    // see the "Latency mode" comment on dstBufferCount() above. std::vector
+    // instead of a fixed-size array specifically so that sizing is a runtime
+    // decision, not baked into the type.
+    uint32_t numDstBuffers_ = kDefaultDstBuffers;
+    std::vector<VkImage>        dstImage_;
+    std::vector<VkDeviceMemory> dstMem_;
+    std::vector<VkImageView>    dstView_;
     VkSampler  dstSampler_  = VK_NULL_HANDLE;   // not needed; kept for future blit
     bool       blendInFlight_ = false;
 
-    // dma-buf export state (see dmaBufCapable()/dmaBufFd() above). Zeroed here
-    // and set to -1 for every slot in the constructor body (not a { -1, -1, ...}
-    // initializer list -- that silently zero-fills, not -1-fills, any slot
-    // beyond the ones actually listed if kDstBuffers ever changes again).
-    bool     dmaBufCapable_          = false;
-    int      dmaBufFd_[kDstBuffers]     = {};
-    uint32_t dmaBufStride_[kDstBuffers] = {};
-    uint64_t dmaBufOffset_[kDstBuffers] = {};
+    // dma-buf export state (see dmaBufCapable()/dmaBufFd() above). Resized to
+    // numDstBuffers_ and -1-filled (dmaBufFd_ only) in createDstImage(),
+    // BEFORE any slot is assigned a real fd -- a not-yet-exported slot must
+    // read back -1, never 0 (a valid-looking fd number), which is exactly
+    // the bug a fixed-size `{ -1, -1 }` initializer list caused here before
+    // (silently zero-filled any slot beyond the ones literally listed).
+    bool                  dmaBufCapable_ = false;
+    std::vector<int>      dmaBufFd_;
+    std::vector<uint32_t> dmaBufStride_;
+    std::vector<uint64_t> dmaBufOffset_;
 
     // Weights UBO (binding 2). Persistently mapped; rewritten per dispatch.
     VkBuffer       weightsBuf_  = VK_NULL_HANDLE;

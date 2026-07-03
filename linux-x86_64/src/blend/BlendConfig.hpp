@@ -35,14 +35,19 @@ struct BlendConfig {
     // streak denser at proportionally higher GPU cost. Matches
     // BlendEngine::ResampleParams::subSamples.
     uint32_t blurDensity     = 4;
-    // "Blur brightness" in the OBS properties UI: exp() brightness-dominance
-    // exponent in the trail (resample_blur.comp's `shutterStrength`) -- how
-    // strongly a bright pixel (e.g. a cursor) in one frame dominates its
-    // output pixel over the surrounding darker frames. 4.0 (an old leftover
-    // default from before this was user-exposed) blew out brightness/
-    // contrast for most content; 1.0 is a sane neutral default now that it's
-    // a slider the user can raise themselves.
-    float    shutterStrength = 1.0f;
+    // "Blur brightness" in the OBS properties UI: a motion-gated exposure
+    // boost on the trail (resample_blur.comp's `shutterStrength` -- see that
+    // file for the current mechanism, reworked multiple times on
+    // 2026-07-03; this comment described an earlier exponential-dominance
+    // scheme that no longer exists). 1.0 = pure energy-conserving average,
+    // no boost; user-tested live as visibly under-bright for the Advanced
+    // trail. 1.3 is the live-confirmed default (1.5 gave the best in-game
+    // blur but was too bright on menu screens, no single value suits both);
+    // matches gmixGetDefaults()'s kSettingBrightness default in
+    // gmix_source.cpp, which is what real sources actually use -- this
+    // struct default only matters as the engine's fallback before any
+    // persisted ~/.config/gmix/blend_config exists.
+    float    shutterStrength = 1.3f;
     float    falloff         = 1.0f;   // recency falloff exponent
 
     bool usesResamplePath() const { return mode == Mode::Advanced; }

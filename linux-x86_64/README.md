@@ -173,28 +173,100 @@ preset"), saved with your scene collection:
   visible trailing ghost.
 - **Advanced** ("optical awareness") — **BETA, not the recommended/default
   choice.** Velocity-aware motion blur: estimates a per-pixel motion
-  direction each frame and smears real captured pixels along it, producing a
-  continuous directional streak (closer to the "danser" look) instead of a
-  soft average. Reveals two sliders: **Blur density** (4-32) — taps per real
-  frame along the motion direction; higher packs the streak denser at
-  proportionally higher GPU cost (measured live: blend time went from a
-  ~2.2ms baseline to a stable ~8-11ms during real gameplay with density
-  turned up — the pipeline absorbed it fine with no fps drop in that test,
-  but it's a real, non-trivial cost, not a rounding error); and **Blur
-  brightness** (0.1-10, default
-  1.0) — how strongly a bright pixel in one frame (e.g. a cursor) dominates
-  its output pixel over the surrounding darker frames; higher makes the
-  trail more blown-out/glowing, lower keeps it closer to a plain average.
+  direction each frame and smears real captured pixels along it, oversampling
+  along that direction (dense overlapping taps) and averaging them so the
+  taps' footprints tile into one continuous, energy-conserving streak
+  (closer to a real camera-shutter motion blur) instead of a row of separate
+  ghost copies or an artificially brightened one. Reveals two sliders:
+  **Blur density** (4-32) — taps per real frame along the motion
+  direction; higher packs the streak denser (and smoother — this is the
+  oversampling rate, and also what keeps small/fast content like the cursor
+  from visibly fading into the average). Earlier live measurements (before
+  the plain-average/motion-gated-brightness rework above) saw blend time go
+  from a ~2.2ms baseline to ~8-11ms with density turned up; re-measured live
+  after that rework at density=32: no frame drops, overall performance
+  impact ~3-5% or less — the current shader is meaningfully cheaper than
+  the earlier weighted/MAX accumulation schemes it replaced, not just
+  visually correct. Still a real, non-zero cost, just a much smaller one
+  now; and **Blur brightness** (0.1-10,
+  default **1.3**) — exposure boost applied ONLY where real motion was
+  detected (gated by the estimated per-pixel motion magnitude), so it
+  brightens/dims the trail without touching static, non-moving parts of
+  the scene. 1.0 is neutral (pure average, no boost) but tested visibly
+  under-bright live; 1.5 tested best for in-game motion but too bright on
+  menu screens (mostly static content, but still enough moving UI to
+  trigger the boost) — no single value suits both, so 1.3 is the default
+  and the slider is there to tune per what you're capturing. The max of 10
+  is left in deliberately as a "how absurd can it get" option, not a
+  serious setting.
   Flat/Linear/Cinematic/Heavy all use the plain averaging shader and are the
   well-tested, day-to-day path; only Advanced routes to the separate
   optical-flow shader, which has seen far less real-world testing (a
   previous evaluation of this same shader found it "did NOT beat the plain
   shutter blend" — see `etc/DEV_NOTES.md`). Treat it as an experiment to try,
-  not a preset to default to.
+  not a preset to default to. Its motion estimate uses a small windowed
+  (Lucas-Kanade) optical flow rather than a single-pixel estimate, which is
+  specifically meant to be more stable at low velocities.
+
+## Latency mode
+
+Also in Properties, independent of the blur preset: **Latency mode**
+(Fast/Medium/Slow/Very slow) controls how many GPU dst buffers the blend
+cycles through before reusing one — more buffers give more tolerance for
+the blend's own timing to vary (e.g. GPU contention with the game, or
+drift over a long session) without risking a slow blend racing an
+in-progress read, at the cost of a bit more VRAM (Fast=2, Medium=3
+[default], Slow=4, Very slow=5 — each step is one more capture-resolution
+image).
+
+This is a process-wide setting (like GPU index), not a per-source one, so
+changing it takes two steps:
+
+1. Open Properties on any "GMix Motion Blur" source (existing or new) and
+   pick a Latency mode. This saves your choice for next time, but does
+   **not** affect whatever's already running.
+2. Remove **every** "GMix Motion Blur" source (from every scene) and add
+   one back. The fresh instance picks up the value you just saved in step 1.
+
+Just restarting OBS does *not* apply a change — the same sources reload
+with the same settings they already had. If you skip step 1, or step 2
+doesn't fully remove every instance, check the OBS log for a `gmix:`
+warning explaining what happened.
+
+Latency mode also sets the acceptable end-to-end latency budget the status
+log checks against: `(buffer count − 1)` output-frame intervals — Fast=1,
+Medium=2, Slow=3, Very slow=4. If `blend_latency + draw_latency` exceeds
+that, you'll see a `gmix: preset=... end-to-end (blend+draw) latency
+exceeds the budget` warning; the fix is either a lower blur density
+(Advanced) or a slower Latency mode for more headroom.
 
 ## Known issues
 
-None currently open. (Previously: adding "GMix Motion Blur" as a NEW source
+**Properties dialog can show stale values right after adding a source**
+(cosmetic only, not a functional bug). If you already have a "GMix Motion
+Blur" source running with non-default settings (say, Advanced preset,
+Very slow latency) and then add another instance — either a new `+`-added
+source or after a remove/re-add — that new instance's Properties dialog
+can briefly display the plugin's hard defaults (Flat preset, Medium
+latency) instead of what's actually running. The blur output itself is
+correct; only the dialog's displayed dropdown values can lag. To be sure
+a setting change is both saved and correctly reflected everywhere:
+
+1. Open Properties on any "GMix Motion Blur" source, change the setting,
+   and click **OK** — this saves your choice to disk
+   (`~/.config/gmix/engine_settings`, `~/.config/gmix/blend_config`) so it
+   survives future source/engine recreation.
+2. Remove **every** "GMix Motion Blur" source (from every scene) and add
+   one back. The fresh instance both applies and correctly displays the
+   value you just saved in step 1.
+
+This is the same two-step already required to change **Latency mode** (see
+below) — Latency mode never applies without it, since it resizes the GPU
+buffer pool; preset/density/brightness actually apply live without this
+step, but re-adding is still the reliable way to confirm the dialog itself
+shows the right thing.
+
+(Previously: adding "GMix Motion Blur" as a NEW source
 per scene only rendered in the first scene, since each plugin instance
 raced to bind the same capture socket. Fixed by hoisting the capture/blend
 pipeline into one process-wide shared engine that all source instances

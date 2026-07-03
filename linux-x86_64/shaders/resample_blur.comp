@@ -15,11 +15,23 @@
 // frame, read at an offset position along the estimated motion vector. No
 // synthetic/interpolated frames are generated.
 //
-// Motion vector is estimated per-pixel via the gradient brightness-constancy
-// constraint (∇I·v + Iₜ = 0  →  v = -Iₜ ∇I / |∇I|²) from the newest frame
-// pair -- a cheap optical-flow proxy. Where there is no gradient or no
-// temporal change (static scene), v collapses to ~0 and the output reduces to
-// the latest frame (sharp, no trail).
+// Motion vector is estimated via Lucas-Kanade optical flow: the brightness-
+// constancy constraint (Ix*vx + Iy*vy + It = 0) is aggregated (least-squares)
+// over a small local window around each pixel, from the newest frame pair.
+// A SINGLE-POINT version of this constraint (one pixel, no window) only
+// recovers the flow component ALONG the local gradient direction -- the
+// classic aperture problem -- and is dominated by per-pixel noise rather
+// than real motion signal whenever the temporal difference Iₜ is small,
+// which is exactly the low-velocity case: the noisier the estimate, the
+// more erratic the trail direction, even though visually nothing is really
+// moving. Aggregating the constraint over a window averages that noise out
+// and gives a stable full 2D vector wherever the window has enough local
+// texture/structure to constrain it (a real corner/edge, not a flat area).
+// Where the window is too flat/uniform to constrain a direction (the 2x2
+// normal-equations matrix is near-singular) or there's no temporal change
+// at all, v collapses to ~0 and the output reduces to the latest frame
+// (sharp, no trail) -- same fallback behavior as before, just reached more
+// reliably now.
 //
 // `subSamples` ("blur density" in the OBS properties UI, 4..32) is the tap
 // count per real frame along the motion direction -- higher packs the
@@ -74,15 +86,38 @@ void main()
     uint n = pc.frameCount;
     if (n == 0u) { imageStore(dstImage, P, vec4(0,0,0,1)); return; }
 
-    // ── Per-pixel motion estimate from the newest frame pair ────────────────
+    // ── Per-pixel motion estimate from the newest frame pair (Lucas-Kanade) ──
+    // Aggregate the brightness-constancy constraint over a small 3x3 window
+    // (least-squares normal equations) instead of one point -- see the file
+    // header comment for why this specifically helps low-velocity motion.
     vec2 v = vec2(0.0);
     if (n >= 2u) {
-        float Ix = lumaAt(0u, P + ivec2(1,0), sz) - lumaAt(0u, P - ivec2(1,0), sz);
-        float Iy = lumaAt(0u, P + ivec2(0,1), sz) - lumaAt(0u, P - ivec2(0,1), sz);
-        float It = lumaAt(0u, P, sz) - lumaAt(1u, P, sz);
-        vec2  grad = vec2(Ix, Iy);
-        float gg = dot(grad, grad) + 1e-3;
-        v = -It * grad / gg;                       // pixels / frame
+        float sumIxIx = 0.0, sumIyIy = 0.0, sumIxIy = 0.0;
+        float sumIxIt = 0.0, sumIyIt = 0.0;
+        const int R = 1;   // 3x3 window; cheap relative to the tap loop below
+        for (int dy = -R; dy <= R; ++dy) {
+            for (int dx = -R; dx <= R; ++dx) {
+                ivec2 Q = P + ivec2(dx, dy);
+                float Ix = lumaAt(0u, Q + ivec2(1,0), sz) - lumaAt(0u, Q - ivec2(1,0), sz);
+                float Iy = lumaAt(0u, Q + ivec2(0,1), sz) - lumaAt(0u, Q - ivec2(0,1), sz);
+                float It = lumaAt(0u, Q, sz) - lumaAt(1u, Q, sz);
+                sumIxIx += Ix * Ix;
+                sumIyIy += Iy * Iy;
+                sumIxIy += Ix * Iy;
+                sumIxIt += Ix * It;
+                sumIyIt += Iy * It;
+            }
+        }
+        // Solve the 2x2 normal equations [sumIxIx sumIxIy; sumIxIy sumIyIy] * v
+        // = [-sumIxIt; -sumIyIt] via Cramer's rule. A near-singular matrix
+        // (det ~ 0) means the window is too flat/uniform to constrain a
+        // direction at all (the aperture problem, unresolvable locally) --
+        // leave v = 0 rather than divide by ~0 and produce a wild estimate.
+        float det = sumIxIx * sumIyIy - sumIxIy * sumIxIy;
+        if (abs(det) > 1e-6) {
+            v.x = (-sumIxIt * sumIyIy + sumIyIt * sumIxIy) / det;
+            v.y = (-sumIyIt * sumIxIx + sumIxIt * sumIxIy) / det;
+        }
         // Clamp so a degenerate estimate can't fling taps across the screen.
         float maxLen = float(max(sz.x, sz.y)) / 8.0;
         float len = length(v);
@@ -94,44 +129,63 @@ void main()
 
     // ── Accumulate: each real frame smeared backward along motion ───────────
     // Frame i (0 = newest) already contains the object ~i steps back along its
-    // path; sub-samples within each frame fill the gap to the next position,
-    // producing a continuous streak rather than discrete ghosts. Newer frames
-    // get higher recency weight -> the trail is brightest at the current
-    // position and fades backward (directional, not symmetric).
+    // path; sub-samples within each frame fill the gap to the next position
+    // along the motion vector -- this IS the "oversampling": enough taps that
+    // consecutive sample positions overlap the moving object's own footprint
+    // (a cursor/UI element is several px across; steps are sub-px to a few
+    // px apart), so their footprints tile into one continuous strip instead
+    // of leaving gaps.
     //
-    // CRITICAL: weight bright pixels EXPONENTIALLY, not linearly. A trail
-    // pixel (an old cursor position) gets a bright cursor from only ONE frame
-    // but the dark background from all the others; a plain normalized average
-    // dilutes that single bright sample to a few percent -> invisible. An
-    // exponential brightness term (exp(luma * shutterStrength)) makes any
-    // frame's bright cursor DOMINATE its output pixel, so every position the
-    // cursor occupied lights up -> a visible glowing arc on the dark bg
-    // (the danser look). On a static scene every frame has equal luma at each
-    // pixel, so the weighting is uniform and the result stays sharp.
+    // Combine via a PLAIN UNWEIGHTED AVERAGE -- energy-conserving, like a
+    // real camera shutter integrating light over the exposure: the result
+    // can never exceed the brightest single tap, only spread it out and dim
+    // it. Two earlier attempts got this wrong in opposite directions: a
+    // weighted average (2026-07-03 "eighth"/"ninth" entries) diluted a
+    // sparse bright tap into a series of discrete separated blobs; MAX/
+    // "lighten" (2026-07-03 "tenth" entry) fixed the discreteness but isn't
+    // energy-conserving -- it never dims below the brightest tap it saw, so
+    // ANY moving edge (not just the cursor: approach circles, sliders, any
+    // UI outline) visibly BRIGHTENS instead of blurring, which is exactly
+    // what "everything with velocity bright up instead of just blur" was
+    // pointing at. A plain average now works for BOTH cases: dense
+    // oversampling (subSamples) means enough taps land on/near a moving
+    // object's own footprint to keep it visible without needing an
+    // artificial dominance/lighten trick, while never inflating brightness
+    // for wider moving content the way MAX did.
     uint ss = max(pc.subSamples, 1u);
-    vec4  acc  = vec4(0.0);
-    float wsum = 0.0;
+    vec4  acc   = vec4(0.0);
+    float count = 0.0;
 
     for (uint i = 0u; i < n; ++i) {
-        float recency = 1.0 - float(i) / float(n);     // 1 (newest) .. ~0 (oldest)
-        float fw = pow(max(recency, 0.0), pc.falloff);
-
         for (uint s = 0u; s < ss; ++s) {
             // Smear this frame's data backward along the motion direction by
             // up to ~vlen px (the inter-frame displacement), filling the gap.
             float t = float(s) / float(ss);
             vec2  off = dir * (vlen * t);
             ivec2 sp  = P - ivec2(round(off));
-            vec4  c   = loadClamped(i, sp, sz);
-
-            // Exponential brightness dominance (see note above).
-            float bw = fw * exp(luma(c.rgb) * pc.shutterStrength);
-            acc  += c * bw;
-            wsum += bw;
+            acc   += loadClamped(i, sp, sz);
+            count += 1.0;
         }
     }
 
-    vec4 outc = (wsum > 0.0) ? (acc / wsum) : loadClamped(0u, P, sz);
+    // "Blur brightness" boosts the trail's exposure, but ONLY where there's
+    // real motion -- gated by `vlen` (already computed above for the
+    // resampling). Multiplying every pixel unconditionally (the previous
+    // version) blew out the ENTIRE static scene at high settings, since a
+    // motionless pixel's average equals its raw value regardless of
+    // shutterStrength, so the slider was really just a whole-image exposure
+    // control in disguise -- not what "trail brightness" should mean, and
+    // not what the user expects from sliding it up (screenshot: brightness
+    // = 10 turned the whole preview white, not just the moving cursor's
+    // trail). `boost` ramps from 1.0 (no motion -> shutterStrength has zero
+    // effect) up to `shutterStrength` itself once vlen passes ~1px of
+    // inter-frame motion -- smooth, not a hard cutoff, to avoid a visible
+    // edge where the trail "turns on".
+    float motionAmt = clamp(vlen / 1.0, 0.0, 1.0);
+    float boost = mix(1.0, max(pc.shutterStrength, 0.0), motionAmt);
+
+    vec4 outc = (count > 0.0) ? (acc / count) : loadClamped(0u, P, sz);
+    outc.rgb *= boost;
     outc.a = 1.0;
     imageStore(dstImage, P, outc);
 }

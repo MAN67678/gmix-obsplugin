@@ -325,6 +325,43 @@ TEST_CASE(headless_context_drives_blend_engine) {
     CHECK(dst[0] == 10 && dst[1] == 20 && dst[2] == 30 && dst[3] == 255);
 }
 
+// "Latency mode" -- dstBufferCount is now a runtime init() argument (was a
+// compile-time kDstBuffers=3 constant) so the OBS plugin can offer
+// Fast/Medium/Slow/Very slow (2/3/4/5 buffers). Confirm a non-default count
+// actually takes effect: the reported count, every dstImage()/dstView() up
+// to that count is a real handle, and dispatchAsync() into the LAST valid
+// index (not just index 0) works.
+TEST_CASE(blend_engine_runtime_dst_buffer_count) {
+    VulkanContext vk;
+    if (!vk.init(-1, /*headless=*/true)) { CHECK(!"vulkan init failed"); return; }
+
+    BlendEngine blend(vk);
+    constexpr uint32_t kCount = 5;   // "Very slow"
+    if (!blend.init(kW, kH, kCount)) { CHECK(!"blend init failed"); return; }
+    CHECK_EQ(blend.dstBufferCount(), kCount);
+    for (uint32_t i = 0; i < kCount; ++i) {
+        CHECK(blend.dstImage(i) != VK_NULL_HANDLE);
+        CHECK(blend.dstView(i)  != VK_NULL_HANDLE);
+    }
+
+    SrcImage src;
+    if (!src.create(vk.device(), vk.physicalDevice(), kW, kH, 40, 50, 60, 255)) {
+        CHECK(!"src image create failed"); return;
+    }
+    VkImageView view = src.view;
+    float weight = 1.0f;
+    // Dispatch into the LAST slot (kCount-1), matching gmix_source.cpp's
+    // round-robin, not just the always-tested index 0.
+    if (!blend.dispatchAsync(&view, &weight, 1, kCount - 1)) {
+        CHECK(!"dispatchAsync into last slot failed"); return;
+    }
+    blend.waitBlendDone();
+    CHECK(blend.dstReadyValue() > 0);
+
+    // An out-of-range index must be rejected, not silently clamp/UB.
+    CHECK(!blend.dispatchAsync(&view, &weight, 1, kCount));
+}
+
 int main() {
     std::printf("==== blend_engine GPU test ====\n");
     int rc = (g_test_failures == 0) ? 0 : 1;
