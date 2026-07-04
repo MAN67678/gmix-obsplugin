@@ -21,6 +21,7 @@
 #include <graphics/graphics.h>
 
 #define WIN32_LEAN_AND_MEAN
+#define NOMINMAX   // windows.h's min/max macros otherwise shadow std::min/std::max below
 #include <windows.h>
 
 #include "../d3d11/context.hpp"

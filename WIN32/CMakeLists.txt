@@ -129,11 +129,27 @@ if(GMIX_BUILD_OBS_PLUGIN)
     add_library(obs-gmix-source MODULE "${CMAKE_CURRENT_SOURCE_DIR}/src/obs_plugin/gmix_source.cpp")
     set_target_properties(obs-gmix-source PROPERTIES
         OUTPUT_NAME "obs-gmix-source"
-        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/obs_plugin/bin/64bit")
+        # MODULE targets' primary .dll artifact is placed via
+        # LIBRARY_OUTPUT_DIRECTORY on Windows too (unlike SHARED targets,
+        # which split into RUNTIME_OUTPUT_DIRECTORY for the .dll and
+        # ARCHIVE_OUTPUT_DIRECTORY for the .lib) -- confirmed empirically:
+        # RUNTIME_OUTPUT_DIRECTORY alone left the .dll sitting in the build
+        # root instead of here. Set both so this doesn't silently regress if
+        # the target type ever changes.
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/obs_plugin/bin/64bit"
+        LIBRARY_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/obs_plugin/bin/64bit")
     get_filename_component(OBS_INCLUDE_PARENT "${OBS_INCLUDE_DIR}" DIRECTORY)
+    # obs-config.h #includes "obsconfig.h", a file CMake generates (via
+    # configure_file) into libobs's OWN build tree, not its source tree --
+    # when building against a from-source OBS checkout (rather than an
+    # installed SDK package that already bundles it), this must be located
+    # and added separately. Harmless/unused if already reachable another way.
+    find_path(OBS_CONFIG_INCLUDE_DIR obsconfig.h
+        DOC "Directory containing OBS Studio's generated obsconfig.h (typically <obs build dir>/config)")
     target_include_directories(obs-gmix-source PRIVATE
         "${OBS_INCLUDE_DIR}"
-        "${OBS_INCLUDE_PARENT}")
+        "${OBS_INCLUDE_PARENT}"
+        "${OBS_CONFIG_INCLUDE_DIR}")
     target_link_libraries(obs-gmix-source PRIVATE gmix_core)
     # obs_*/gs_*/blog symbols resolve against OBS's own obs.lib import library
     # at link time on Windows (unlike the Linux .so, which defers resolution

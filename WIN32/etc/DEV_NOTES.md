@@ -5,12 +5,15 @@
 > over unchanged (see the mapping table below). This file only covers what's
 > genuinely different on Windows, plus what's built vs. not yet built here.
 
-## Status: builds clean under MSVC; capture/blend pipeline not yet run against a real game/OBS
+## Status: builds clean under MSVC, INCLUDING the OBS plugin against a real OBS SDK; capture pipeline not yet run against a real game/OBS
 
 This started as a from-scratch source port written without access to a
 Windows build environment, then was actually compiled and smoke-tested with
-a real MSVC Build Tools + Windows SDK install (`cmake -G Ninja` + `link.exe`,
-no OBS SDK available so `GMIX_BUILD_OBS_PLUGIN` stayed OFF). Verified so far:
+a real MSVC Build Tools + Windows SDK install (`cmake -G Ninja` + `link.exe`).
+`GMIX_BUILD_OBS_PLUGIN` was later turned on against a real OBS Studio source
+checkout + its already-built `libobs` (`C:\Users\man-win\dev\obs-studio`,
+`obs.lib` at `build_x64\libobs\RelWithDebInfo\obs.lib`) -- see "obs-gmix-source
+builds against the real SDK" below. Verified so far:
 
 - `gmix_core` (D3D11 context, blend engine, IPC receive, imported-frame pool)
   and `gmix.exe` compile and link cleanly.
@@ -32,6 +35,43 @@ no OBS SDK available so `GMIX_BUILD_OBS_PLUGIN` stayed OFF). Verified so far:
   the CPU reference in all three cases -- this is the strongest evidence yet
   that the actual blend math (weights buffer, cbuffer, resource-array
   indexing workaround, UAV write) is correct on real hardware.
+
+### obs-gmix-source builds against the real SDK
+
+Confirmed against `C:\Users\man-win\dev\obs-studio` (a full OBS Studio source
+checkout with `libobs` already built): `obs-module.h`/`obs.h`/
+`graphics/graphics.h` compile as expected, `gs_texture_open_shared`'s real
+signature (`gs_texture_t *gs_texture_open_shared(uint32_t handle)`) matches
+what `gmix_source.cpp` already assumed, and the resulting
+`obs-gmix-source.dll` exports exactly the 6 symbols `OBS_DECLARE_MODULE()`/
+`OBS_MODULE_USE_DEFAULT_LOCALE()` are supposed to generate
+(`obs_module_load`, `obs_module_ver`, etc. -- verified via `dumpbin /exports`)
+and correctly imports real runtime entry points from `obs.dll` (`dumpbin
+/imports` shows `obs_data_get_string`, `obs_register_source_s`,
+`obs_enter_graphics`, etc.). To reproduce elsewhere, configure with:
+
+    -DGMIX_BUILD_OBS_PLUGIN=ON
+    -DOBS_INCLUDE_DIR=<obs-studio checkout>/libobs
+    -DOBS_IMPORT_LIB=<obs-studio checkout>/build_x64/libobs/RelWithDebInfo/obs.lib
+    -DOBS_CONFIG_INCLUDE_DIR=<obs-studio checkout>/build_x64/config
+
+(`OBS_CONFIG_INCLUDE_DIR` is new -- see bug #6 below; an installed OBS SDK
+package rather than a from-source checkout may not need it.)
+
+Two more real bugs found getting this far (added to the numbered list below):
+a missing include path for `obsconfig.h` (a file CMake generates into
+libobs's *build* tree, not its source tree), and a `std::min`/`windows.h`
+`min` macro collision in `gmix_source.cpp`. Also had to fix
+`obs-gmix-source`'s output directory, which silently landed in the build
+root instead of `obs_plugin/bin/64bit/` (a `MODULE`-vs-`SHARED` CMake output-
+directory-property difference, not an OBS-specific issue).
+
+**Still not run inside a real OBS process** -- building cleanly and having
+the right exports/imports is strong evidence the API usage is correct, but
+the actual `obs_module_load()` → `gmixCreate()` → `GmixPipeline::acquire()`
+runtime path (D3D11 device creation from inside obs64.exe, named-pipe
+listen, `gs_texture_open_shared` actually importing a texture) has not been
+exercised.
 
 **Not yet verified**: the actual capture pipeline end-to-end (proxy DLL
 injected into a real osu!stable process, GL/D3D11 interop or readback
@@ -99,6 +139,29 @@ below); more are likely waiting in the not-yet-exercised runtime paths.
    paths already do correctly (this bug was confined to the test's synthetic
    frame builder, not the production code). Worth remembering for any future
    code that touches a keyed-mutex resource directly: acquire first, always.
+6. **`obs-config.h` (from `obs.h`) `#include`s `"obsconfig.h"`, a file CMake
+   `configure_file()`s into libobs's *build* directory, not anywhere in its
+   source tree.** Building `obs-gmix-source` against a from-source OBS
+   checkout (rather than a packaged SDK that already bundles this) failed
+   with `Cannot open include file: 'obsconfig.h'` until the CMakeLists
+   gained an `OBS_CONFIG_INCLUDE_DIR` option pointing at `<obs build
+   dir>/config`.
+7. **`gmix_source.cpp` failed with cryptic `error C2589`/`C2059` syntax
+   errors around every `std::min(...)` call** once actually compiled with
+   `<windows.h>` in the include graph (via the real `obs.h`, which pulls it
+   in) -- `windows.h`'s `min`/`max` function-like macros textually replace
+   any bare `min(`/`max(` token sequence, including `std::min(`, turning it
+   into nonsense. Fixed with `#define NOMINMAX` before `#include <windows.h>`
+   in that file specifically (the only WIN32 source that calls `std::min`
+   literally in a translation unit that also includes `windows.h`; others
+   use `std::clamp`, which isn't textually affected, or don't include
+   `windows.h` at all).
+8. **`obs-gmix-source`'s `.dll` silently landed in the build root instead of
+   `obs_plugin/bin/64bit/`** despite `RUNTIME_OUTPUT_DIRECTORY` being set.
+   Root cause: CMake `MODULE` library targets (unlike `SHARED`) use
+   `LIBRARY_OUTPUT_DIRECTORY` for their `.dll` on Windows too, not the
+   `RUNTIME_OUTPUT_DIRECTORY`/`ARCHIVE_OUTPUT_DIRECTORY` split `SHARED`
+   targets get. Fixed by setting both properties to the same path.
 
 ## What's built (phase 1 scope, osu!stable/OpenGL producer)
 
