@@ -164,6 +164,24 @@ target_include_directories(test_weight_generator PRIVATE
     "${CMAKE_CURRENT_SOURCE_DIR}/tests")
 add_test(NAME weight_generator COMMAND test_weight_generator)
 
-# NOTE: test_blend_engine (GPU dispatch) and test_ipc (transport round-trip)
-# are not yet ported -- they need a D3D11 device / named-pipe harness
-# respectively. See WIN32/etc/DEV_NOTES.md's "Not yet built" section.
+# GPU blend engine dispatch sanity (needs a real D3D11 device + the compiled
+# blend.cso -- see the GMIX_SHADER_DIR compile definition on gmix_core, which
+# this target also links).
+add_executable(test_blend_engine "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_blend_engine.cpp")
+target_include_directories(test_blend_engine PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}/src"
+    "${CMAKE_CURRENT_SOURCE_DIR}/tests")
+target_link_libraries(test_blend_engine PRIVATE gmix_core)
+add_test(NAME blend_engine COMMAND test_blend_engine)
+
+# IPC round-trip (named pipe; no GPU). frame_sender.cpp is only otherwise
+# compiled into the proxy DLL, so it's added explicitly here too, same as
+# the Linux test_ipc target adds frame_sender.cpp alongside gmix_core.
+add_executable(test_ipc
+    "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_ipc.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/ipc/frame_sender.cpp")
+target_include_directories(test_ipc PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}/src"
+    "${CMAKE_CURRENT_SOURCE_DIR}/tests")
+target_link_libraries(test_ipc PRIVATE gmix_core)
+add_test(NAME ipc COMMAND test_ipc)

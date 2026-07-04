@@ -24,14 +24,22 @@ no OBS SDK available so `GMIX_BUILD_OBS_PLUGIN` stayed OFF). Verified so far:
   intended shape (verified via `dumpbin /exports`): `wglSwapBuffers` is a
   real local export, ~367 others (`glBegin`, `wglCreateContext`, etc.) are
   genuine forwarders to `opengl32_orig`.
+- `test_ipc` (named-pipe handshake/FrameHeader round-trip + backlog-drop
+  detection via `hasPendingFrame()`): 31/31 checks pass.
+- `test_blend_engine` (real D3D11 compute dispatch on the AMD RX 480: solid
+  4-source equal-weight blend, 3-source unequal-weight blend, 1-source
+  passthrough): 4/4 checks pass, **exact** pixel match (0 mismatches) against
+  the CPU reference in all three cases -- this is the strongest evidence yet
+  that the actual blend math (weights buffer, cbuffer, resource-array
+  indexing workaround, UAV write) is correct on real hardware.
 
 **Not yet verified**: the actual capture pipeline end-to-end (proxy DLL
 injected into a real osu!stable process, GL/D3D11 interop or readback
-capture, named-pipe handoff, D3D11 compute blend, OBS import) -- none of
-that has been exercised against a running game or OBS build yet. Three real
-bugs were found and fixed purely by getting a clean compile (see "Bugs found
-by actually building this" below); more are likely waiting in the
-not-yet-exercised runtime paths.
+capture, named-pipe handoff feeding real (not synthetic) frames, OBS import)
+-- none of that has been exercised against a running game or OBS build yet.
+Several real bugs were found and fixed purely by getting a clean compile and
+by writing/running the GPU test (see "Bugs found by actually building this"
+below); more are likely waiting in the not-yet-exercised runtime paths.
 
 ### Bugs found by actually building this (fixed)
 
@@ -76,6 +84,21 @@ not-yet-exercised runtime paths.
    `D3D11CreateDevice` returns `DXGI_ERROR_SDK_COMPONENT_MISSING` instead of
    just running undebugged when that component is absent. Fixed by retrying
    once without the debug flag on that specific failure.
+5. **A resource created with `D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX` silently
+   drops any write issued before the keyed mutex is ever acquired.** Found
+   while writing `test_blend_engine.cpp`'s synthetic source-frame helper: it
+   called `UpdateSubresource()` to fill a solid color, then acquired the
+   mutex afterwards -- the compute shader's `srcImages[k].Load()` came back
+   as `(0,0,0,0)` for every pixel, which looked exactly like a shader-side
+   read bug (and cost real time to isolate -- confirmed via a throwaway
+   diagnostic shader that read the SRV directly, after first ruling out the
+   UAV-write path and the cbuffer read path independently). The fix is
+   ordering: `AcquireSync(0, ...)` **before** the write, `ReleaseSync(1)`
+   after -- exactly the producer-side protocol `frame_protocol.hpp` already
+   documents, and exactly what `gl_dx_interop_capture.cpp`'s real capture
+   paths already do correctly (this bug was confined to the test's synthetic
+   frame builder, not the production code). Worth remembering for any future
+   code that touches a keyed-mutex resource directly: acquire first, always.
 
 ## What's built (phase 1 scope, osu!stable/OpenGL producer)
 
@@ -93,6 +116,9 @@ not-yet-exercised runtime paths.
 - `src/obs_plugin/gmix_source.cpp` — the OBS plugin, **with the multi-scene
   bug fixed at the design level** (see below) rather than reproduced.
 - `src/cli.*`, `src/main.cpp` — `gmix.exe --install-proxy` / `--list-gpus`.
+- `tests/test_ipc.cpp`, `tests/test_blend_engine.cpp` — named-pipe round-trip
+  + backlog-drop test, and a real-GPU compute-blend correctness test (both
+  passing -- see "Status" above).
 
 ## What's NOT built
 
@@ -103,10 +129,6 @@ not-yet-exercised runtime paths.
 - **The debug `--attach` IPC client** the Linux `gmix` CLI has (`ipc_client.cpp`)
   -- out of scope for this pass; `gmix.exe` here only does `--install-proxy`/
   `--list-gpus`.
-- **`test_blend_engine`/`test_ipc` equivalents** (GPU dispatch / named-pipe
-  round-trip tests) -- only the pure-math `test_weight_generator` was ported.
-  Writing these requires an actual D3D11 device / pipe harness to iterate
-  against, which wasn't available while drafting this port.
 - Multi-GPU-adapter retry in the proxy's D3D11 device creation (currently
   picks the default hardware adapter; if that's not the same adapter the
   game's GL context is actually bound to, `wglDXOpenDeviceNV` will fail and
