@@ -5,7 +5,7 @@
 > over unchanged (see the mapping table below). This file only covers what's
 > genuinely different on Windows, plus what's built vs. not yet built here.
 
-## Status: builds clean under MSVC, INCLUDING the OBS plugin against a real OBS SDK; capture pipeline not yet run against a real game/OBS
+## Status: obs-gmix-source verified running correctly inside a real OBS process; producer (game capture) side not yet run against a real game
 
 This started as a from-scratch source port written without access to a
 Windows build environment, then was actually compiled and smoke-tested with
@@ -66,12 +66,51 @@ libobs's *build* tree, not its source tree), and a `std::min`/`windows.h`
 root instead of `obs_plugin/bin/64bit/` (a `MODULE`-vs-`SHARED` CMake output-
 directory-property difference, not an OBS-specific issue).
 
-**Still not run inside a real OBS process** -- building cleanly and having
-the right exports/imports is strong evidence the API usage is correct, but
-the actual `obs_module_load()` → `gmixCreate()` → `GmixPipeline::acquire()`
-runtime path (D3D11 device creation from inside obs64.exe, named-pipe
-listen, `gs_texture_open_shared` actually importing a texture) has not been
-exercised.
+### obs-gmix-source runs correctly inside a real, cleanly-installed OBS process
+
+Confirmed by actually installing it and launching real `obs64.exe`
+(OBS Studio 32.1.2 retail install) and reading its log:
+
+    gmix: obs-gmix-source (Windows) loaded
+    ...
+    Loaded Modules:
+        obs-gmix-source.dll
+    ...
+    gmix: waiting for producer to connect...
+    ...
+    - source: 'GMix Motion Blur' (gmix_source)
+
+That last "waiting for producer to connect..." line is `workerMain()`'s own
+`blog()` call (verified by grepping the exact string in the source -- an
+earlier, unrelated leftover prototype plugin also happened to log a
+similarly-worded line, which caused a false-positive read the first time
+through; see "the ID-collision detour" below for how that was caught and
+resolved). Reaching that line means, live, inside a real OBS process:
+`gmixCreate()` ran, `GmixPipeline::acquire()` started, `D3D11Context::init()`
+successfully created a device from *inside obs64.exe* (not just a standalone
+test harness), the worker thread spawned, and `FrameReceiver::listen()`
+successfully created the named pipe -- the entire OBS-side runtime path
+except actually receiving a frame (nothing was connected to the pipe in this
+test; that needs the producer side, i.e. a real game or a synthetic
+FrameSender). OBS stayed responsive throughout, no crash, no errors logged.
+
+**The ID-collision detour (worth knowing about for next time):** the first
+attempt found a *different, unrelated* leftover OBS plugin already installed
+at `C:\Program Files\obs-studio\obs-plugins\64bit\gmix-obs-source.dll` (note
+the hyphen -- an earlier, separate GMix prototype, not this port) that
+registers a source with the exact same id, `"gmix_source"`. Since it loaded
+first, our module's `obs_register_source()` call was silently rejected
+(`"Source 'gmix_source' already exists! Duplicate library?"`), and a
+misleadingly similar-looking "waiting for producer" log line from *that*
+plugin was initially misread as ours (it uses a hyphenated pipe name,
+`\\.\pipe\gmix-frames`, vs. our underscored `\\.\pipe\gmix_frames` --
+grepping the *exact* string, not just "gmix", is what caught the mistake).
+Diagnosed by temporarily renaming `gGmixSourceInfo.id` to a unique test value
+and confirming clean registration; permanently resolved by removing the old
+plugin. **`WIN32/setup.bat`** (new) automates this for anyone else hitting
+the same collision: it self-elevates via UAC, removes both the old
+prototype's files and any previous copy of this port's plugin, installs the
+freshly built `obs-gmix-source.dll` + locale data, and relaunches OBS.
 
 **Not yet verified**: the actual capture pipeline end-to-end (proxy DLL
 injected into a real osu!stable process, GL/D3D11 interop or readback
@@ -182,6 +221,11 @@ below); more are likely waiting in the not-yet-exercised runtime paths.
 - `tests/test_ipc.cpp`, `tests/test_blend_engine.cpp` — named-pipe round-trip
   + backlog-drop test, and a real-GPU compute-blend correctness test (both
   passing -- see "Status" above).
+- `data/locale/en-US.ini`, `setup.bat` — the OBS plugin's locale data file
+  (mirrors `linux-x86_64/data/locale/en-US.ini`), and a self-elevating
+  installer that removes any old GMix plugin(s) and installs a fresh build
+  into a real OBS install (see "obs-gmix-source runs correctly inside a real
+  OBS process" above for why this exists).
 
 ## What's NOT built
 
