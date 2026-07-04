@@ -50,6 +50,10 @@ if not exist "%OBS_DIR%\bin\64bit\obs64.exe" (
 
 echo Closing OBS if it's running...
 taskkill /IM obs64.exe /F >nul 2>&1
+:: taskkill returns before the OS has necessarily released obs-gmix-source.dll's
+:: file lock -- copying immediately after can silently fail (or overwrite
+:: nothing) if the DLL is still mapped for a moment. Give it a beat.
+timeout /t 2 /nobreak >nul
 
 echo Removing old GMix plugin(s)...
 if exist "%PLUGIN_DST_DIR%\gmix-obs-source.dll" (
@@ -82,9 +86,20 @@ copy /y "%LOCALE_SRC%" "%DATA_DST_DIR%\locale\" >nul
 echo.
 echo Done. Installed:
 echo   %PLUGIN_DST_DIR%\obs-gmix-source.dll
+for %%F in ("%PLUGIN_SRC%") do set "SRC_TIME=%%~tF"
+for %%F in ("%PLUGIN_DST_DIR%\obs-gmix-source.dll") do set "DST_TIME=%%~tF"
+echo     source build time:    %SRC_TIME%
+echo     installed file time:  %DST_TIME%
 echo   %DATA_DST_DIR%\locale\en-US.ini
 echo.
-echo Launching OBS...
-start "" "%OBS_DIR%\bin\64bit\obs64.exe"
-
+:: NOT auto-launching OBS here: this script runs elevated (UAC), and
+:: launching a normal application from an elevated process does not
+:: reliably produce a normal, non-elevated OBS session (confirmed
+:: empirically -- OBS never actually came up when started this way,
+:: silently, with no error). Launching OBS the normal way yourself (Start
+:: Menu / desktop shortcut) avoids that whole class of problem.
+echo Now start OBS normally (Start Menu / desktop shortcut) -- do NOT run
+echo obs64.exe as administrator, or it may misbehave (game capture hooks,
+echo file permissions, etc. expect a normal user session).
+echo.
 pause

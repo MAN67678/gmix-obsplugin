@@ -3,8 +3,10 @@
 // side of the port. Lives inside the proxy opengl32.dll, injection-free (see
 // opengl32_proxy.cpp), analogous in role to linux-x86_64's
 // src/capture/VulkanLayerCapture.{hpp,cpp} but hooking wglSwapBuffers instead
-// of vkQueuePresentKHR, and writing into a RING of named, cross-process
-// shareable D3D11 textures instead of Vulkan OPAQUE_FD exports.
+// of vkQueuePresentKHR, and writing into a RING of cross-process shareable
+// D3D11 textures instead of Vulkan OPAQUE_FD exports (shared via
+// DuplicateHandle, not by name -- see frame_protocol.hpp's PROTOCOL HISTORY
+// comment for why OpenSharedResourceByName was dropped).
 //
 // Requires WGL_NV_DX_interop2 -- confirmed NVIDIA-only in practice (AMD/Intel
 // drivers do not implement it). See WIN32/README.md for the CPU-readback
@@ -78,6 +80,11 @@ private:
     struct RingSlot {
         ID3D11Texture2D* tex = nullptr;
         IDXGIKeyedMutex* mutex = nullptr;
+        void*            localSharedHandle = nullptr;  // unnamed HANDLE from CreateSharedHandle,
+                                                        // kept open for the slot's lifetime so it
+                                                        // can be re-DuplicateHandle'd into a new
+                                                        // consumer on every (re)connection
+        bool             handleSentThisConnection = false;  // reset on (re)connect -- see connectorLoop()
         void*            interopObject = nullptr;  // HANDLE from wglDXRegisterObjectNV
         unsigned int     glTexture = 0;
         unsigned int     glFbo = 0;                // FBO wrapping glTexture, for the blit path

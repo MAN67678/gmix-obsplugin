@@ -19,19 +19,22 @@ PooledTexture::~PooledTexture() {
 
 namespace {
 
-// Open one named shared D3D11 texture + its keyed mutex. Returns nullptr on
-// any failure (name not found yet -- e.g. the producer hasn't created this
-// slot -- or an adapter/LUID mismatch between producer and consumer devices).
-std::shared_ptr<PooledTexture> openTextureByName(D3D11Context& ctx, uint32_t producerPid,
-                                                 uint32_t slot, uint32_t dxgiFormat) {
-    auto name = ipc::sharedTextureName(producerPid, slot);
+// Open one shared D3D11 texture (by a HANDLE already DuplicateHandle'd into
+// this process -- see frame_protocol.hpp's PROTOCOL HISTORY comment for why
+// not a name) + its keyed mutex. Always closes `handleValue`: the raw Win32
+// handle is only needed for the OpenSharedResource1 call itself, per the
+// documented "close the handle once you have the resource" pattern -- D3D
+// keeps its own reference. Returns nullptr on any failure.
+std::shared_ptr<PooledTexture> openTextureByHandle(D3D11Context& ctx, uint32_t slot,
+                                                   uint64_t handleValue, uint32_t dxgiFormat) {
+    HANDLE h = reinterpret_cast<HANDLE>(handleValue);
     auto pt = std::make_shared<PooledTexture>();
 
-    HRESULT hr = ctx.device1()->OpenSharedResourceByName(
-        name.c_str(), DXGI_SHARED_RESOURCE_READ,
-        __uuidof(ID3D11Texture2D), reinterpret_cast<void**>(&pt->tex));
+    HRESULT hr = ctx.device1()->OpenSharedResource1(
+        h, __uuidof(ID3D11Texture2D), reinterpret_cast<void**>(&pt->tex));
+    CloseHandle(h);
     if (FAILED(hr) || !pt->tex) {
-        std::fprintf(stderr, "gmix: import: OpenSharedResourceByName failed for slot %u "
+        std::fprintf(stderr, "gmix: import: OpenSharedResource1 failed for slot %u "
                               "(hr=0x%08lx) -- producer/consumer on different GPUs?\n",
                      slot, static_cast<unsigned long>(hr));
         return nullptr;
@@ -56,29 +59,31 @@ std::shared_ptr<PooledTexture> openTextureByName(D3D11Context& ctx, uint32_t pro
 
 } // namespace
 
-std::shared_ptr<PooledTexture> FrameTexturePool::acquire(D3D11Context& ctx, uint32_t producerPid,
-                                                         uint32_t slot, uint32_t w, uint32_t h,
-                                                         uint32_t dxgiFormat) {
-    if (producerPid != producerPid_ || w != w_ || h != h_ || dxgiFormat != fmt_) {
-        slots_.clear();   // producer restarted or dimensions changed: drop the whole pool
-        producerPid_ = producerPid; w_ = w; h_ = h; fmt_ = dxgiFormat;
+std::shared_ptr<PooledTexture> FrameTexturePool::acquire(D3D11Context& ctx, uint32_t slot,
+                                                         uint64_t sharedHandleValue,
+                                                         uint32_t w, uint32_t h, uint32_t dxgiFormat) {
+    if (w != w_ || h != h_ || dxgiFormat != fmt_) {
+        slots_.clear();   // dimensions changed: drop the whole pool
+        w_ = w; h_ = h; fmt_ = dxgiFormat;
     }
     // Guard against a corrupt/garbage slot (protocol mismatch) ballooning the
     // pool -- mirrors the Linux FrameImagePool's kMaxSlots guard.
     constexpr uint32_t kMaxSlots = 256;
-    if (slot >= kMaxSlots) return openTextureByName(ctx, producerPid, slot, dxgiFormat);
+    if (slot >= kMaxSlots) {
+        return sharedHandleValue ? openTextureByHandle(ctx, slot, sharedHandleValue, dxgiFormat) : nullptr;
+    }
 
     if (slot >= slots_.size()) slots_.resize(slot + 1);
-    if (slots_[slot]) return slots_[slot];   // already opened this slot: reuse it
+    if (sharedHandleValue == 0) return slots_[slot];   // "already cached" -- may be null if producer erred
 
-    auto pt = openTextureByName(ctx, producerPid, slot, dxgiFormat);
+    auto pt = openTextureByHandle(ctx, slot, sharedHandleValue, dxgiFormat);
     if (pt) slots_[slot] = pt;
     return pt;
 }
 
 void FrameTexturePool::clear() {
     slots_.clear();
-    producerPid_ = w_ = h_ = fmt_ = 0;
+    w_ = h_ = fmt_ = 0;
 }
 
 bool ImportedFrame::init(std::shared_ptr<PooledTexture> tex, uint64_t acquireKey) {

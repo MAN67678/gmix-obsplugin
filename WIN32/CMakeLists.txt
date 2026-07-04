@@ -201,3 +201,14 @@ target_include_directories(test_ipc PRIVATE
     "${CMAKE_CURRENT_SOURCE_DIR}/tests")
 target_link_libraries(test_ipc PRIVATE gmix_core)
 add_test(NAME ipc COMMAND test_ipc)
+
+# Synthetic producer -- a manual verification tool (NOT registered as a
+# ctest), not a pass/fail unit test. Feeds a real running obs-gmix-source
+# instance real cross-process shared textures over the production pipe,
+# without needing a game or the proxy DLL. See its header comment for usage.
+add_executable(synthetic_producer
+    "${CMAKE_CURRENT_SOURCE_DIR}/tests/synthetic_producer.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/ipc/frame_sender.cpp")
+target_include_directories(synthetic_producer PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}/src")
+target_link_libraries(synthetic_producer PRIVATE d3d11 dxgi)

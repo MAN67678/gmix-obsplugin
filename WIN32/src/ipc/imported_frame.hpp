@@ -3,15 +3,18 @@
 // acquireKey) into a real ID3D11Texture2D + SRV the blend engine can read.
 // D3D11 analogue of linux-x86_64/src/ipc/imported_frame.{hpp,cpp}.
 //
-// The capture proxy DLL reuses a FIXED ring of named shared textures
-// (kExportRing, see gl_dx_interop_capture.hpp) and stamps each frame with its
-// export slot. The consumer opens each slot's texture ONCE (FrameTexturePool)
-// and reuses it -- exactly the same "avoid a per-frame import" lesson the
-// Linux side learned the hard way (see DEV_NOTES.md). Unlike Vulkan's
-// OPAQUE_FD + timeline semaphore, there is no separate semaphore object here:
-// the synchronization primitive (IDXGIKeyedMutex) is obtained via
-// QueryInterface on the SAME shared texture, so opening the texture by name
-// is the only import step needed.
+// The capture proxy DLL reuses a FIXED ring of shared textures (kExportRing,
+// see gl_dx_interop_capture.hpp) and stamps each frame with its export slot.
+// The consumer opens each slot's texture ONCE (FrameTexturePool) and reuses
+// it -- exactly the same "avoid a per-frame import" lesson the Linux side
+// learned the hard way (see DEV_NOTES.md). Unlike Vulkan's OPAQUE_FD +
+// timeline semaphore, there is no separate semaphore object here: the
+// synchronization primitive (IDXGIKeyedMutex) is obtained via QueryInterface
+// on the SAME shared texture, so opening the texture is the only import step
+// needed. Opened via a DuplicateHandle'd HANDLE (FrameHeader::
+// sharedHandleValue), not a name -- see frame_protocol.hpp's PROTOCOL
+// HISTORY comment for why (OpenSharedResourceByName is broken on some
+// drivers, confirmed on an AMD RX 480).
 // ─────────────────────────────────────────────────────────────────────────────
 #pragma once
 
@@ -42,23 +45,26 @@ struct PooledTexture {
 };
 
 // Per-connection cache of PooledTextures keyed by export slot, for the
-// current dimensions/format/producerPid. Rebuilds itself if those change.
+// current dimensions/format. Rebuilds itself if those change.
 class FrameTexturePool {
 public:
-    // Return the pooled texture for `slot`, opening it by name (see
-    // gmix::ipc::sharedTextureName) on first use for that slot (rebuilding
-    // the whole pool if producerPid/w/h/format changed). Returns nullptr if
-    // the open failed.
-    std::shared_ptr<PooledTexture> acquire(D3D11Context& ctx, uint32_t producerPid,
-                                           uint32_t slot, uint32_t w, uint32_t h,
-                                           uint32_t dxgiFormat);
+    // Returns the pooled texture for `slot`. `sharedHandleValue` is only
+    // meaningful (and only consumed) on a cache miss: 0 always means "use
+    // whatever's already cached for this slot" (returns nullptr if nothing
+    // is cached yet -- a protocol violation by the producer). A non-zero
+    // value is a HANDLE already DuplicateHandle'd into THIS process by the
+    // producer (see FrameSender::duplicateHandleToConsumer); it is opened via
+    // OpenSharedResource1, cached, and the raw Win32 handle is closed
+    // immediately after (D3D keeps its own reference).
+    std::shared_ptr<PooledTexture> acquire(D3D11Context& ctx, uint32_t slot,
+                                           uint64_t sharedHandleValue,
+                                           uint32_t w, uint32_t h, uint32_t dxgiFormat);
 
     // Drop all cached textures (call once the connection's GPU work is idle).
     void clear();
 
 private:
     std::vector<std::shared_ptr<PooledTexture>> slots_;
-    uint32_t producerPid_ = 0;
     uint32_t w_ = 0, h_ = 0;
     uint32_t fmt_ = 0;
 };

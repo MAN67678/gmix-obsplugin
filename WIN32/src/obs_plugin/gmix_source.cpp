@@ -130,11 +130,18 @@ struct FrameQueue {
 };
 
 void receiverThreadFn(gmix::ipc::FrameReceiver& receiver, gmix::D3D11Context& ctx,
-                      FrameQueue& q, gmix::FrameTexturePool& pool, uint32_t producerPid) {
+                      FrameQueue& q, gmix::FrameTexturePool& pool) {
     gmix::ipc::FrameHeader hdr{};
     while (receiver.recvFrame(hdr)) {
-        if (receiver.hasPendingFrame()) continue;   // drop stale backlog, no handles to release
-        auto tex = pool.acquire(ctx, producerPid, hdr.exportSlot, hdr.width, hdr.height, hdr.dxgiFormat);
+        bool stale = receiver.hasPendingFrame();
+        // Must run even when dropping a stale frame: hdr.sharedHandleValue is
+        // a real HANDLE the producer only sends ONCE per slot per connection
+        // (see frame_protocol.hpp) -- skipping this on a drop would both leak
+        // that handle (duplicated into our process, never closed) and
+        // permanently lose the only chance to import this slot for the rest
+        // of the connection (every later frame for it carries 0).
+        auto tex = pool.acquire(ctx, hdr.exportSlot, hdr.sharedHandleValue, hdr.width, hdr.height, hdr.dxgiFormat);
+        if (stale) continue;
         if (!tex) continue;
         auto frame = std::make_shared<gmix::ImportedFrame>();
         if (!frame->init(tex, hdr.acquireKey)) continue;
@@ -157,7 +164,31 @@ public:
 
     ~GmixPipeline() {
         stop_ = true;
-        if (worker_.joinable()) worker_.join();
+        // stop_ alone cannot wake the worker thread if it's currently
+        // blocked inside a synchronous ConnectNamedPipe/ReadFile call (e.g.
+        // no producer has connected yet) -- confirmed empirically: removing
+        // the last "GMix Motion Blur" source while idle left the worker
+        // thread permanently stuck forever, silently (OBS's UI stayed
+        // responsive throughout -- the actual source teardown/destructor
+        // call happens on a background thread, not the UI thread, so a
+        // stuck join() here is invisible), squatting the pipe name for the
+        // rest of the OBS session (every subsequent attempt to re-add the
+        // source logged "failed to create named pipe").
+        //
+        // CloseHandle(receiver_'s pipe) from THIS (destructor) thread does
+        // NOT reliably interrupt that blocking call on ANOTHER thread --
+        // confirmed both by hitting the bug again after trying exactly that,
+        // and by Microsoft's own documentation: closing a handle out from
+        // under a thread blocked in synchronous (non-overlapped) I/O on it
+        // is unsupported/undefined. CancelSynchronousIo() is the actual
+        // documented mechanism -- it targets the THREAD (not the handle)
+        // and forces whatever blocking synchronous call it's in to return
+        // with ERROR_OPERATION_ABORTED.
+        if (worker_.joinable()) {
+            CancelSynchronousIo(worker_.native_handle());
+            worker_.join();
+        }
+        receiver_.close();
         std::lock_guard<std::mutex> lk(texMu_);
         obs_enter_graphics();
         for (auto& t : tex_) { if (t) gs_texture_destroy(t); t = nullptr; }
@@ -194,17 +225,19 @@ private:
         gmix::BlendConfig config;   // Flat mode, defaults -- only used for weightsFor()
 
         while (!stop_.load()) {
-            gmix::ipc::FrameReceiver receiver;
+            // receiver_.listen() closes any previous instance internally
+            // (see FrameReceiver::listen()), so reusing the member across
+            // reconnect cycles is safe -- same object every iteration.
             auto pipeName = gmix::ipc::defaultFramePipeName();
-            if (!receiver.listen(pipeName)) {
+            if (!receiver_.listen(pipeName)) {
                 blog(LOG_ERROR, "gmix: failed to create named pipe %ls", pipeName.c_str());
                 return;
             }
             blog(LOG_INFO, "gmix: waiting for producer to connect...");
 
             gmix::ipc::FrameHandshake hs{};
-            if (!receiver.acceptProducer(hs)) {
-                receiver.close();
+            if (!receiver_.acceptProducer(hs)) {
+                receiver_.close();
                 if (stop_.load()) return;
                 continue;
             }
@@ -230,8 +263,8 @@ private:
             queue.trackedW = hs.frameW;
             queue.trackedH = hs.frameH;
             gmix::FrameTexturePool texPool;
-            std::thread receiverThread(receiverThreadFn, std::ref(receiver), std::ref(ctx_),
-                                       std::ref(queue), std::ref(texPool), hs.producerPid);
+            std::thread receiverThread(receiverThreadFn, std::ref(receiver_), std::ref(ctx_),
+                                       std::ref(queue), std::ref(texPool));
 
             int frontIdx = -1;
             uint32_t inFlightIdx = 0;
@@ -323,7 +356,7 @@ private:
                 std::this_thread::sleep_for(std::chrono::milliseconds(1));
             }
 
-            receiver.close();
+            receiver_.close();
             if (receiverThread.joinable()) receiverThread.join();
             if (stop_.load()) break;
             blog(LOG_INFO, "gmix: producer disconnected, waiting for a new one");
@@ -333,6 +366,10 @@ private:
     gmix::D3D11Context ctx_;
     gmix::BlendEngine* blend_ = nullptr;
     bool blendReady_ = false;
+
+    // A member (not a workerMain()-loop-local) specifically so ~GmixPipeline()
+    // can force-unblock the worker thread on shutdown -- see its comment.
+    gmix::ipc::FrameReceiver receiver_;
 
     std::thread worker_;
     std::atomic<bool> stop_{false};

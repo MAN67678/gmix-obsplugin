@@ -180,6 +180,14 @@ void GlDxInteropCapture::connectorLoop() {
                 std::lock_guard<std::mutex> lk(senderMu_);
                 sender_ = std::move(s);
                 handshakeSent_ = false;
+                // A new connection means a (possibly different) consumer
+                // process -- every ring slot's handle must be re-
+                // DuplicateHandle'd into it at least once before use; see
+                // frame_protocol.hpp's PROTOCOL HISTORY comment. Guarded by
+                // the same senderMu_ lock (already held here) that
+                // captureViaInterop()/captureViaReadback() take around their
+                // own reads/writes of this flag.
+                for (auto& rs : ring_) rs.handleSentThisConnection = false;
             }
         }
         for (int i = 0; i < 10 && connectorRunning_; ++i)
@@ -210,25 +218,26 @@ bool GlDxInteropCapture::ensureRing(uint32_t w, uint32_t h) {
             return false;
         }
 
-        // Register a name so the consumer can OpenSharedResourceByName it --
-        // see ipc/frame_protocol.hpp's sharedTextureName(). The local handle
-        // CreateSharedHandle returns can be closed immediately; the name
-        // stays resolvable for as long as `rs.tex` (this process's D3D11
-        // resource) is alive.
+        // Create an UNNAMED shared handle -- see frame_protocol.hpp's
+        // PROTOCOL HISTORY comment for why NOT OpenSharedResourceByName
+        // (broken on some drivers). Unlike the discarded named-handle
+        // approach, this handle is KEPT OPEN for the slot's lifetime: it's
+        // re-DuplicateHandle'd into whichever consumer process is currently
+        // connected (see connectorLoop()/captureViaInterop()), so it must
+        // stay valid as long as the slot does.
         IDXGIResource1* dxgiRes1 = nullptr;
         if (rs.tex->QueryInterface(__uuidof(IDXGIResource1), reinterpret_cast<void**>(&dxgiRes1)) == S_OK) {
-            auto name = ipc::sharedTextureName(producerPid_, static_cast<uint32_t>(i));
-            HANDLE tmp = nullptr;
+            HANDLE h = nullptr;
             HRESULT hr = dxgiRes1->CreateSharedHandle(nullptr, DXGI_SHARED_RESOURCE_READ | DXGI_SHARED_RESOURCE_WRITE,
-                                                      name.c_str(), &tmp);
+                                                      nullptr, &h);
             dxgiRes1->Release();
-            if (FAILED(hr)) {
+            if (FAILED(hr) || !h) {
                 std::fprintf(stderr, "gmix: capture: CreateSharedHandle failed (slot %d, hr=0x%08lx)\n",
                              i, static_cast<unsigned long>(hr));
                 destroyRing();
                 return false;
             }
-            if (tmp) CloseHandle(tmp);
+            rs.localSharedHandle = h;
         } else {
             std::fprintf(stderr, "gmix: capture: IDXGIResource1 unavailable\n");
             destroyRing();
@@ -280,6 +289,8 @@ void GlDxInteropCapture::destroyRing() {
         if (rs.glFbo && g_gl.glDeleteFramebuffers) { g_gl.glDeleteFramebuffers(1, &rs.glFbo); rs.glFbo = 0; }
         if (rs.glTexture && g_gl.glDeleteTextures) { g_gl.glDeleteTextures(1, &rs.glTexture); rs.glTexture = 0; }
         if (rs.mutex) { rs.mutex->Release(); rs.mutex = nullptr; }
+        if (rs.localSharedHandle) { CloseHandle(static_cast<HANDLE>(rs.localSharedHandle)); rs.localSharedHandle = nullptr; }
+        rs.handleSentThisConnection = false;
         if (rs.tex)   { rs.tex->Release();   rs.tex = nullptr; }
     }
     ringW_ = ringH_ = 0;
@@ -336,6 +347,14 @@ bool GlDxInteropCapture::captureViaInterop(HDC /*hdc*/, uint32_t w, uint32_t h) 
         ok = sender_->sendHandshake(w, h, hdr.dxgiFormat, producerPid_);
         if (ok) handshakeSent_ = true;
     }
+    // Only duplicate+send this slot's handle the first time it's used on
+    // this connection -- see frame_protocol.hpp's PROTOCOL HISTORY comment.
+    // rs.handleSentThisConnection is reset by connectorLoop() under this
+    // same senderMu_ lock whenever a new connection is established.
+    if (ok && !rs.handleSentThisConnection) {
+        hdr.sharedHandleValue = sender_->duplicateHandleToConsumer(rs.localSharedHandle);
+        if (hdr.sharedHandleValue != 0) rs.handleSentThisConnection = true;
+    }
     if (ok) ok = sender_->sendFrame(hdr);
     if (!ok) sender_.reset();
     return ok;
@@ -386,6 +405,10 @@ bool GlDxInteropCapture::captureViaReadback(HDC /*hdc*/, uint32_t w, uint32_t h)
     if (!handshakeSent_) {
         ok = sender_->sendHandshake(w, h, hdr.dxgiFormat, producerPid_);
         if (ok) handshakeSent_ = true;
+    }
+    if (ok && !rs.handleSentThisConnection) {
+        hdr.sharedHandleValue = sender_->duplicateHandleToConsumer(rs.localSharedHandle);
+        if (hdr.sharedHandleValue != 0) rs.handleSentThisConnection = true;
     }
     if (ok) ok = sender_->sendFrame(hdr);
     if (!ok) sender_.reset();

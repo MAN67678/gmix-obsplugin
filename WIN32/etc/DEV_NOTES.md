@@ -5,7 +5,7 @@
 > over unchanged (see the mapping table below). This file only covers what's
 > genuinely different on Windows, plus what's built vs. not yet built here.
 
-## Status: obs-gmix-source verified running correctly inside a real OBS process; producer (game capture) side not yet run against a real game
+## Status: full producer->consumer zero-copy pipeline verified end-to-end against a real OBS process (synthetic producer; the proxy DLL itself still untested against a real game)
 
 This started as a from-scratch source port written without access to a
 Windows build environment, then was actually compiled and smoke-tested with
@@ -109,16 +109,81 @@ Diagnosed by temporarily renaming `gGmixSourceInfo.id` to a unique test value
 and confirming clean registration; permanently resolved by removing the old
 plugin. **`WIN32/setup.bat`** (new) automates this for anyone else hitting
 the same collision: it self-elevates via UAC, removes both the old
-prototype's files and any previous copy of this port's plugin, installs the
-freshly built `obs-gmix-source.dll` + locale data, and relaunches OBS.
+prototype's files and any previous copy of this port's plugin, and installs
+the freshly built `obs-gmix-source.dll` + locale data. It deliberately does
+**not** auto-launch OBS afterward -- an elevated script cannot reliably start
+a normal, non-elevated OBS session (confirmed empirically: `start ""
+obs64.exe` from inside the UAC-elevated script silently produced no running
+OBS process at all); start OBS normally yourself after the script finishes.
 
-**Not yet verified**: the actual capture pipeline end-to-end (proxy DLL
-injected into a real osu!stable process, GL/D3D11 interop or readback
-capture, named-pipe handoff feeding real (not synthetic) frames, OBS import)
--- none of that has been exercised against a running game or OBS build yet.
-Several real bugs were found and fixed purely by getting a clean compile and
-by writing/running the GPU test (see "Bugs found by actually building this"
-below); more are likely waiting in the not-yet-exercised runtime paths.
+### Full producer->consumer zero-copy pipeline verified end-to-end (synthetic producer)
+
+`WIN32/tests/synthetic_producer.cpp` (new -- see its header comment) plays
+the producer role without a real game: it creates its own ring of
+cross-process shareable, keyed-mutex D3D11 textures, connects to the real
+production pipe a running `obs-gmix-source` instance is listening on, and
+streams solid-color frames. Getting this to actually work surfaced two
+substantial, real bugs -- one a driver limitation invalidating a core design
+decision, one a genuine shutdown deadlock -- both now fixed and confirmed by
+the OBS log showing, for the first time, `gmix: first blend retired, front=0
+-- video_render should now draw`: a real frame was imported cross-process,
+blended on the GPU, and handed to OBS as a live texture.
+
+**Bug A -- `ID3D11Device1::OpenSharedResourceByName` is broken on this AMD
+driver, unconditionally, even same-process/same-device.** The entire
+original texture-sharing design (a texture named
+`Local\gmix_frame_<pid>_<slot>`, looked up by the consumer with no handle
+ever crossing the wire -- chosen specifically to avoid `DuplicateHandle`)
+failed with `E_INVALIDARG` on every attempt. Isolated with a throwaway
+same-process probe (create a named shared handle, then immediately try to
+open it by name from the SAME device that created it) before touching any
+cross-process code -- confirmed `OpenSharedResourceByName` fails
+unconditionally on this AMD RX 480 driver, while classic handle-based
+`OpenSharedResource1` succeeds immediately. **Fixed by switching the entire
+wire protocol** (bumped `kProtocolVersion`/`kMagic`) from named lookup to
+classic `DuplicateHandle`: the producer calls `GetNamedPipeServerProcessId`
+(it's the pipe's client; the consumer/OBS is the server) + `OpenProcess` +
+`DuplicateHandle` to get a HANDLE valid in the consumer's process, and sends
+that raw value in a new `FrameHeader::sharedHandleValue` field -- only on the
+FIRST frame sent for a given ring slot per connection (0 thereafter, meaning
+"already cached", tracked via `RingSlot::handleSentThisConnection`, reset on
+each new connection) to avoid duplicating (and leaking) a fresh handle every
+single frame. See `frame_protocol.hpp`'s "PROTOCOL HISTORY" comment for the
+full writeup; touched `frame_protocol.hpp`, `frame_sender.*`,
+`imported_frame.*`, `gl_dx_interop_capture.*`, `synthetic_producer.cpp`, and
+`obs_plugin/gmix_source.cpp`'s `receiverThreadFn` (which now must call
+`pool.acquire()` even on a dropped/stale frame, since dropping the ONE frame
+carrying a slot's only handle would otherwise both leak it and permanently
+lose the ability to import that slot for the rest of the connection).
+
+**Bug B -- a real shutdown deadlock in `GmixPipeline`'s singleton lifecycle**
+(ironic, since that singleton was itself the fix for the Linux "only renders
+in the first scene" bug -- see below). Removing the last "GMix Motion Blur"
+source (dropping the `GmixPipeline` shared_ptr's last reference) calls
+`~GmixPipeline()`, which set `stop_ = true` and called `worker_.join()` -- but
+the worker thread is very likely blocked inside a synchronous
+`ConnectNamedPipe`/`ReadFile` call (e.g. no producer connected yet), and a
+plain bool flag can't wake a thread out of a blocking OS call. The first fix
+attempt (`receiver_.close()` from the destructor thread before `join()`)
+did **not** work either -- confirmed by hitting the bug again -- because
+closing a handle out from under a DIFFERENT thread's synchronous
+(non-overlapped) blocking I/O on it is explicitly unsupported/undefined per
+Microsoft's own documentation. The actual fix: `CancelSynchronousIo`, which
+targets a **thread handle** (not a file handle) and forces whatever
+synchronous I/O call that thread is currently blocked in to return with
+`ERROR_OPERATION_ABORTED` -- `CancelSynchronousIo(worker_.native_handle())`
+before `join()`. Confirmed fixed: the OBS log's "failed to create named
+pipe" error (which fired every time a source was removed-then-re-added
+while idle, before this fix) no longer appears. Note this was invisible in
+testing as a hang/freeze -- OBS's own UI stayed fully responsive throughout,
+because OBS defers the actual source-destructor call to a background
+thread, not the UI thread, so the permanently-stuck worker thread was a
+silent, easy-to-miss leak rather than an obvious freeze.
+
+Also worth recording: `WIN32/data/locale/en-US.ini` didn't exist before this
+port was actually installed and tested, and the OBS plugin's `data/`
+directory conventions (`<install>/data/obs-plugins/<module>/locale/...`)
+weren't exercised until `setup.bat` needed to stage them for real.
 
 ### Bugs found by actually building this (fixed)
 
@@ -302,8 +367,12 @@ one worker thread, one blend engine, ref-counted via `shared_ptr`) that every
 `GmixSource` instance attaches to via `GmixPipeline::acquire()`. Adding
 "GMix Motion Blur" to N scenes creates N source instances, all reading the
 same pipeline's current front texture -- no listener collision, no
-first-scene-only limitation. **Not yet tested against a real multi-scene OBS
-setup** (see "Status" above).
+first-scene-only limitation. Verified the single-instance-per-process
+lifecycle (create/destroy/recreate cycle via repeatedly removing and
+re-adding the source) works correctly, including the shutdown-deadlock fix
+above -- **not yet specifically verified with two DIFFERENT scenes each
+holding their own instance of the source simultaneously**, only repeated
+add/remove of one at a time.
 
 ## Likely next directions (not yet built)
 

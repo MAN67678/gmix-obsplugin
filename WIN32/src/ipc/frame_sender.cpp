@@ -71,7 +71,32 @@ bool FrameSender::sendFrame(const FrameHeader& hdr) {
     return true;
 }
 
+uint64_t FrameSender::duplicateHandleToConsumer(void* localHandle) {
+    if (!pipe_ || !localHandle) return 0;
+
+    if (!consumerProcess_) {
+        DWORD serverPid = 0;
+        // This producer is the pipe's CLIENT (connect()ed via CreateFileW);
+        // the consumer is the server (created the pipe via CreateNamedPipeW).
+        if (!GetNamedPipeServerProcessId(static_cast<HANDLE>(pipe_), &serverPid)) return 0;
+        HANDLE h = OpenProcess(PROCESS_DUP_HANDLE, FALSE, serverPid);
+        if (!h) return 0;
+        consumerProcess_ = h;
+    }
+
+    HANDLE remote = nullptr;
+    if (!DuplicateHandle(GetCurrentProcess(), static_cast<HANDLE>(localHandle),
+                         static_cast<HANDLE>(consumerProcess_), &remote, 0, FALSE, DUPLICATE_SAME_ACCESS)) {
+        return 0;
+    }
+    return reinterpret_cast<uint64_t>(remote);
+}
+
 void FrameSender::disconnect() {
+    if (consumerProcess_) {
+        CloseHandle(static_cast<HANDLE>(consumerProcess_));
+        consumerProcess_ = nullptr;
+    }
     if (pipe_) {
         CloseHandle(static_cast<HANDLE>(pipe_));
         pipe_ = nullptr;
