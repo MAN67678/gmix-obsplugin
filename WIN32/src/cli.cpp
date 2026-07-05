@@ -14,9 +14,6 @@ CliArgs parseCli(int argc, char** argv) {
             args.help = true;
         } else if (a == "--list-gpus") {
             args.listGpus = true;
-        } else if (a == "--install-proxy") {
-            if (i + 1 >= argc) throw std::invalid_argument("--install-proxy requires a directory argument");
-            args.installProxyDir = argv[++i];
         } else if (a == "--gpu") {
             if (i + 1 >= argc) throw std::invalid_argument("--gpu requires an index argument");
             args.gpuIndex = std::stoi(argv[++i]);
@@ -35,12 +32,12 @@ void printUsage(std::ostream& os) {
         "  gmix --list-gpus\n"
         "      List D3D11 adapters (same numbering the OBS plugin's GPU index setting uses).\n"
         "\n"
-        "  gmix --install-proxy <game-directory> [--gpu N]\n"
-        "      Install the capture proxy (opengl32.dll + a renamed copy of the real\n"
-        "      driver DLL, opengl32_orig.dll) into <game-directory> (e.g. osu!'s\n"
-        "      install folder). Re-run any time the game updates its own files.\n"
+        "  gmix --help\n"
         "\n"
-        "  gmix --help\n";
+        "To activate capture in a running game, use gmix-inject.exe (see capture/\n"
+        "next to this build's output) -- it loads GmixCapture.dll into the game\n"
+        "process via runtime injection; nothing needs to be installed/copied into\n"
+        "the game's own directory.\n";
 }
 
 } // namespace gmix

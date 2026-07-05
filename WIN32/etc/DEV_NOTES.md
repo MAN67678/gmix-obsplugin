@@ -5,7 +5,120 @@
 > over unchanged (see the mapping table below). This file only covers what's
 > genuinely different on Windows, plus what's built vs. not yet built here.
 
-## Status: full producer->consumer zero-copy pipeline verified end-to-end against a real OBS process (synthetic producer; the proxy DLL itself still untested against a real game)
+## Status (2026-07-05, end of session): pipeline runs end-to-end against REAL osu!stable + real OBS, but real-world performance/smoothness is NOT resolved -- read "UNRESOLVED at end of session" below before touching this again
+
+## UNRESOLVED at end of session: real in-game fps still degraded, OBS output still "stale/laggy"
+
+**Do not assume the perf work described further down in this file is
+complete.** It fixed real, confirmed bugs (see the timeline below) but the
+end state, confirmed by the user actually playing, is still not right:
+osu!'s "unlimited" framerate setting should reach thousands of fps; with
+this capture active it doesn't, and the OBS preview visibly looks
+stale/laggy at times.
+
+**Prime suspect, NOT YET fixed or even confirmed, just diagnosed:** the very
+last diagnostic added this session (`captureViaInterop`'s
+`diagAcquireFailCount_`/`diagAcquireAttemptCount_`, logged as `acquire
+fails=N/M (X%)` in `%TEMP%\gmix_proxy_debug.log`) showed a **constant ~81%
+`IDXGIKeyedMutex::AcquireSync` failure rate** -- independent of whether the
+game was running fast (~215fps) or in its degraded ~60fps state. Since each
+failed acquire burns the full `kAcquireTimeoutMs` (4ms) blocking the GAME's
+own render thread before giving up, an 81% fail rate at ~200-250 attempts/
+sec accounts for a huge fraction of every second being spent on blocking
+waits that never succeed -- almost certainly the real explanation for why
+fps never gets close to "thousands," and very plausibly related to the
+stale-looking OBS output too (whatever fraction of exports DO succeed are
+competing with this contention).
+
+**Leading hypothesis for the root cause (untested):** a capacity mismatch
+between the producer's export ring and the consumer's frame queue depth:
+- Producer: `kExportRing = 48` in `gl_dx_interop_capture.hpp` -- only 48
+  physical D3D11 texture slots exist, cycled round-robin.
+- Consumer: `FrameQueue::kCap = gmix::kMaxBlendFrames` (64, from
+  `gmix.hpp`) in `gmix_source.cpp` -- the sliding window can hold up to 64
+  `RingEntry`/`ImportedFrame` objects alive at once, and **evicts by COUNT**
+  (`while (ring.size() > kCap) ring.pop_front();`), not by whether a frame
+  was actually consumed by a blend dispatch.
+- Since 64 > 48, the consumer can legitimately be holding onto (not yet
+  evicted, hence not yet destructed, hence not yet having released its
+  `IDXGIKeyedMutex`) more distinct frame entries than there are physical
+  ring slots. Once the producer wraps around and reuses a slot that some
+  still-alive `ImportedFrame` elsewhere in the consumer's 64-deep window
+  also points at, `AcquireSync` on that slot will fail until that stale
+  entry is finally evicted/destructed -- exactly the kind of persistent,
+  load-independent contention the diagnostic showed.
+- **Next step for whoever picks this up:** either shrink `FrameQueue::kCap`
+  to something safely below `kExportRing`, or (probably better) raise
+  `kExportRing` well above 64 (the header comment already claims 48 "must
+  exceed the consumer's max blend window" but doesn't actually satisfy
+  that against the real 64 cap), or change `FrameQueue`'s eviction to be
+  based on actual keyed-mutex release rather than raw count. Then re-check
+  the `acquire fails=` diagnostic -- it should drop to ~0% if this was the
+  real cause.
+
+**Secondary, likely-unrelated-but-real finding (also untested/unfixed):**
+the "shutter" is not a literal 16.6ms timestamp-filtered window. The
+consumer estimates how many ring entries to feed into a blend dispatch via
+`n = round(queue.captureFps() / 60.0)` in `gmix_source.cpp`'s `workerMain`
+-- an EMA'd average-rate-based frame COUNT, not a check of each frame's
+actual `timestampNs` against "now minus 16.6ms." This works fine when the
+capture rate is stable, but during exactly the kind of rate instability
+this session was chasing, the estimate can be stale/wrong, feeding a blend
+window that doesn't actually correspond to a real 16.6ms shutter. Flagged
+by the user directly (see their capture/blend/draw pipeline model note);
+worth a real fix (filter `window_frames` by `nowNs() - timestampNs <=
+shutterNs` instead of trusting the rate estimate) independent of the
+acquire-fail-rate bug above.
+
+### Session timeline (what was actually fixed vs. not, in order)
+
+1. Runtime injection (`gmix-inject.exe`) + inline hook on `gdi32!SwapBuffers`
+   -- **fixed and confirmed working** against real osu!stable (see the
+   pivot section below for why this replaced DLL shadowing).
+2. GL interop mechanism churned through three revisions before landing:
+   `WGL_NV_DX_interop2` (assumed NVIDIA-only, wrong) -> `GL_EXT_
+   memory_object_win32`+`GL_EXT_win32_keyed_mutex` (keyed-mutex half doesn't
+   resolve on this AMD driver, fell back to slow CPU readback) -> reverted
+   back to `WGL_NV_DX_interop2` after a real functional probe proved it
+   works on this driver -- **confirmed working, zero-copy, via live
+   capture**.
+3. Original export throttle (200us/~5000fps cap, copied from the Linux
+   Vulkan layer) caused real osu! gameplay to drop to ~10fps, because
+   `sendFrame()`'s blocking `WriteFile` runs inline on the game's own render
+   thread -- **fixed** by lowering to 4ms/~250fps and shortening the
+   keyed-mutex acquire timeout from 50ms to 4ms.
+4. User reported real in-game frame time still ~7ms (vs. osu!'s normal
+   sub-1ms unlimited) and asked for game-fps vs. producer-fps + per-export
+   timing diagnostics -- **added** (`presentCount_`, `diagLockSumNs_`/
+   `diagSendSumNs_` and friends, logged in `gl_dx_interop_capture.cpp`).
+5. User pointed at a reference project (`GMIX-Project-WIN32`) achieving
+   "thousands of fps" with no per-frame throttle at all; comparing its
+   `producer/gl_hook.cpp` showed it never calls anything like
+   `wglDXLockObjectsNV`/`UnlockObjectsNV` (a real CPU-blocking cross-API
+   sync point) -- switched the GL import mechanism to `GL_EXT_
+   memory_object_win32` (no per-frame lock step needed) while keeping the
+   existing `IDXGIKeyedMutex` protocol, called as a plain D3D11 API call
+   around the GL blit with `glFlush()` before release.
+6. That `glFlush()` version was **NOT SAFE** -- confirmed by testing: OBS-
+   side receiver/blend fps collapsed to ~3-4fps with `blend->now` latency
+   spiking to 100-280ms, because `glFlush()` only submits work, it doesn't
+   wait for completion, so the keyed mutex was released before the GPU
+   actually finished the blit, racing the consumer's read. **Fixed** by
+   switching to `glFinish()` (waits for GL's own queue to drain).
+7. Even after the `glFinish()` fix, the user still saw staleness ("still
+   looks stale/laggy at times") -- added the acquire-fail-rate diagnostic
+   described above, which found the ~81% constant failure rate. **Session
+   ended here, unresolved** -- see the capacity-mismatch hypothesis above
+   for the next step.
+
+**Lesson for next time, stated plainly:** verify extension/API support and
+performance claims with actual functional tests and real hardware
+measurements, not vendor reputation, extension-string presence, or a
+reference implementation's claimed numbers taken at face value -- and when
+a fix is proposed, get it CONFIRMED by the user actually playing before
+calling it done. Several "this should fix it" turns in this session were
+wrong or incomplete; the honest state is captured above, not in any
+earlier optimistic status line in this file.
 
 This started as a from-scratch source port written without access to a
 Windows build environment, then was actually compiled and smoke-tested with
@@ -185,6 +298,142 @@ port was actually installed and tested, and the OBS plugin's `data/`
 directory conventions (`<install>/data/obs-plugins/<module>/locale/...`)
 weren't exercised until `setup.bat` needed to stage them for real.
 
+### The DLL-shadowing design abandoned; runtime injection + inline hook adopted, and confirmed working against real osu!stable
+
+Everything in the previous section was verified using `synthetic_producer.cpp`
+standing in for the real game. Testing the actual proxy `opengl32.dll`
+against real, running osu!stable revealed the entire DLL-shadowing capture
+mechanism was non-functional, for two independent, compounding reasons:
+
+1. **osu!stable's .NET/OpenTK renderer calls `gdi32!SwapBuffers`, never
+   `wglSwapBuffers`.** This is the documented, standard way OpenGL
+   double-buffering works on Windows (`SwapBuffers` is a `gdi32.dll` export
+   that internally does the real buffer swap) -- not an osu!-specific quirk.
+   A proxy that only shadows `opengl32.dll` and hooks its `wglSwapBuffers`
+   export can never see the real present call for an app built this way, no
+   matter how correct the shadowing/forwarding logic is.
+2. **Even if the right function had been targeted, .NET P/Invoke resolves
+   native calls dynamically** (looked up at call time via the CLR's marshaling
+   layer, not through a static PE import-table entry), so classic IAT-patch-
+   style interception -- which is what "shadow a DLL via search order" really
+   relies on -- has nothing to patch regardless of which function is involved.
+
+Confirmed via the 32-bit-PowerShell-host module enumeration technique (64-bit
+`tasklist`/PowerShell cannot see inside a WOW64 process's module list) that
+osu! loads the real system `opengl32.dll` directly, never the shadowed proxy.
+
+**Fix, per explicit direction ("no touching osu file. hook into osu's render
+pipeline live with openGL. unload cleanly when the game close"):** replaced
+the entire capture-DLL delivery and interception mechanism:
+
+- `gmix-inject.exe` (`proxy_dll/inject.cpp`) performs genuine runtime
+  injection into the already-running target process: `CreateToolhelp32Snapshot`
+  to find the pid by name, `VirtualAllocEx`+`WriteProcessMemory` to place the
+  DLL path string remotely, `CreateRemoteThread` calling `LoadLibraryW`
+  directly in the target process. No game file is ever read, written, or
+  renamed.
+- `GmixCapture.dll` (renamed from the old proxy; `capture_main.cpp` is its new
+  `DllMain`) installs an **inline hook** (`inline_hook.cpp`): patches the
+  first ≥5 bytes of the REAL exported function's machine code with a `jmp
+  rel32` to a detour, after relocating the displaced whole instructions (via a
+  fail-safe x86 instruction-length decoder -- refuses to hook if it can't
+  steal only whole, non-branch instructions) into a `VirtualAlloc`'d
+  trampoline. This works regardless of how a caller resolved the function
+  (P/Invoke, static import, manual `GetProcAddress`) because it rewrites the
+  function's actual code, not any table. Hooks BOTH `gdi32!SwapBuffers`
+  (primary -- what osu!stable actually calls) and `opengl32!wglSwapBuffers`
+  (secondary/best-effort, for any app that does call it directly).
+- **Unload**: `DLL_PROCESS_DETACH` deliberately does NOT restore the patched
+  bytes or free the trampoline. This is safe, not sloppy: `DLL_PROCESS_DETACH`
+  for an injected DLL that's never `FreeLibrary`'d only fires at process exit,
+  at which point the whole address space is torn down immediately after --
+  attempting to unhook at that moment would only risk racing some other
+  thread still mid-call through the patched code, for zero benefit. Closing
+  the game is sufficient for a fully clean system state; nothing persists.
+- Adapted the injector and inline-hook implementation from a more mature
+  sibling project (`C:\Users\man-win\dev\GMIX-Project-WIN32`, `producer/
+  inject.cpp` and `producer/gl_hook.cpp`) rather than reinventing it, per
+  explicit direction to research before continuing to write code.
+
+**First attempted a GL interop rework** in the same pass, from
+`WGL_NV_DX_interop2` (device-registration model, believed NVIDIA-only in
+practice per general web research) to `GL_EXT_memory_object_win32` +
+`GL_EXT_win32_keyed_mutex` (handle-based import, advertised as cross-vendor
+per the Khronos registry). **This assumption turned out to be wrong in both
+directions, corrected the same day (2026-07-05):**
+
+- Injecting the `GL_EXT_memory_object_win32` version into real osu!stable
+  showed those extension functions failing to fully resolve on this AMD RX
+  480 driver (specifically `GL_EXT_win32_keyed_mutex`'s entry points come
+  back NULL — confirmed AMD has never shipped that particular extension, on
+  any generation, per follow-up research), so capture silently fell back to
+  `captureViaReadback` (CPU readback) instead of achieving zero-copy at all.
+- A user report of a reference project (`C:\Users\man-win\dev\
+  GMIX-Project-WIN32`) claiming working zero-copy on this exact same GPU
+  prompted a closer look — that project uses `GL_EXT_semaphore_win32`
+  (binary semaphores), NOT keyed-mutex sync, which pointed at keyed-mutex
+  specifically being the unsupported piece, not memory-object import itself.
+- Rather than reworking to a fence/semaphore-based sync scheme, a direct
+  standalone probe (create a real D3D11 device + shared texture, then
+  actually CALL `wglDXOpenDeviceNV`/`wglDXRegisterObjectNV`/
+  `wglDXLockObjectsNV`, not just check whether the function pointers
+  resolve) showed **`WGL_NV_DX_interop2` genuinely works end-to-end on this
+  AMD driver** (26.5.2) — Open, Register, and Lock all succeeded. The
+  "NVIDIA-only" belief was based on general web-research consensus, never
+  actually tested against this project's own hardware; it was simply wrong
+  for this (recent) driver.
+- **Reverted to `WGL_NV_DX_interop2`** as the interop mechanism (simpler
+  than a semaphore/fence rework, and already proven) — see
+  `gl_dx_interop_capture.hpp`'s header comment for the full account.
+  `GL_EXT_memory_object_win32`/`GL_EXT_semaphore_win32` DO also resolve on
+  this driver (confirmed by the same probe) and remain a viable fallback
+  avenue if a future driver regresses `WGL_NV_DX_interop2` support, but
+  weren't wired up since the simpler, already-working mechanism was
+  available.
+
+**Lesson recorded for next time:** verify extension/API support with an
+actual functional call on the target hardware, not vendor reputation, an
+extension string's mere presence, or whether `GetProcAddress`/
+`wglGetProcAddress` returns non-null (a driver can resolve a stub that fails
+at call time, and conversely an extension believed unsupported by a vendor
+can turn out to work fine on a newer driver).
+
+**Confirmed working end-to-end against real, running osu!stable** (2026-07-05,
+final `WGL_NV_DX_interop2` version): injecting `GmixCapture.dll` into a live
+`osu!.exe` process while OBS (with a "GMix Motion Blur" source already added)
+was running produced, in order: both inline hooks installed successfully, a
+D3D11 device created inside osu!'s process, `wglDXOpenDeviceNV` succeeding,
+a named-pipe connection to OBS's already-listening `obs-gmix-source`, and —
+in the OBS log — `producer connected: 1280x1025 pid=<osu!'s pid>`, both ring
+textures imported as `gs_texture_t`, and `first blend retired, front=0 --
+video_render should now draw`. Capture continued steadily via the real
+interop path (not the CPU fallback) with osu! remaining fully responsive.
+
+**A second, separate bug surfaced immediately after this**: the export
+throttle (`kExportInterval`, copied from the Linux Vulkan layer's 200µs /
+~5000fps value) allowed an export attempt on nearly every present at osu!'s
+uncapped framerate. Unlike Linux, `sendFrame()`'s named-pipe `WriteFile` is
+synchronous/blocking and runs *inline* with osu!'s own render thread (this
+function executes inside the hooked `gdi32!SwapBuffers` call) — at that
+throttle, real gameplay dropped to ~10fps because a consumer that can't
+drain the pipe that fast stalls the game itself, not just the capture path.
+Fixed by lowering the throttle to ~250fps (4ms) and the keyed-mutex acquire
+timeout from 50ms to 4ms (fail fast and skip a frame rather than stall the
+game for tens of milliseconds on mutex contention) — see the constants'
+comments in `gl_dx_interop_capture.cpp`. Confirmed via the new diag logging
+(see below) that this doesn't regress capture: producer/receiver/blend fps
+track together with sub-millisecond capture→receive latency.
+
+**Diagnostic logging added** (per request, to make future stalls/regressions
+diagnosable without re-deriving them from scratch): a shared, cross-process-
+comparable `gmix::ipc::nowNs()` (`QueryPerformanceCounter`-based) in
+`frame_protocol.hpp`, used for a `producer fps=` figure on the producer's
+existing throttled status log, and a once/second `gmix: diag: ...` line in
+the OBS log reporting producer/receiver/blend/draw fps, backlog-dropped fps,
+and three latency numbers (capture→receive, capture→blend-dispatch, and how
+stale the currently-displayed blended frame is). See `FrameQueue`'s and
+`GmixPipeline`'s new atomic counters in `gmix_source.cpp`.
+
 ### Bugs found by actually building this (fixed)
 
 1. **`blend.hlsl`: SM5.0 forbids non-literal resource-array indexing, even
@@ -350,10 +599,14 @@ weren't exercised until `setup.bat` needed to stage them for real.
    sides just auto-pick the default hardware adapter, which is correct on
    the common single-discrete-GPU case this was drafted against).
 
-5. **`WGL_NV_DX_interop2` is NVIDIA-only in practice.** See
-   `../README.md`'s "biggest platform-compatibility gap" section. The
-   CPU-readback fallback (`captureViaReadback`) exists specifically so the
-   plugin still functions (correctly, just not zero-copy) on AMD/Intel.
+5. **`WGL_NV_DX_interop2` is NOT actually NVIDIA-exclusive, despite its name
+   and general web-research consensus** -- confirmed genuinely functional on
+   a current AMD RX 480 driver via a direct probe (see the interop-mechanism
+   history section above). Don't take vendor-reputation or an extension
+   string's presence as gospel; test the real function calls. The
+   CPU-readback fallback (`captureViaReadback`) still exists for whatever
+   driver genuinely lacks it (`wglDXOpenDeviceNV` returning null is the
+   actual, tested gate -- see `../README.md`'s platform-compatibility note).
 
 ## KNOWN BUG on Linux, FIXED HERE: "GMix only renders in the first scene"
 

@@ -6,8 +6,12 @@ project(gmix_win32 LANGUAGES CXX)
 # zero-copy OBS Studio plugin. Windows analogue of ../linux-x86_64/CMakeLists.txt.
 # Build targets:
 #   obs-gmix-source — the OBS plugin (capture receive + blend + shared-handle render)
-#   opengl32 (proxy DLL) — capture proxy dropped next to osu!stable.exe (phase 1 producer)
-#   gmix            — minimal CLI: --install-proxy / --list-gpus
+#   gmix_capture    — GmixCapture.dll: injected capture layer (phase 1 producer,
+#                     see proxy_dll/capture_main.cpp's header comment for why this
+#                     replaced the original "shadow opengl32.dll" design)
+#   gmix-inject     — gmix-inject.exe: loads gmix_capture.dll into a running target
+#                     process (CreateRemoteThread+LoadLibraryW; see proxy_dll/inject.cpp)
+#   gmix            — minimal CLI: --list-gpus
 #
 # Requires MSVC (uses #pragma comment(lib, ...) for D3D11/DXGI import libs)
 # and the Windows SDK (d3d11_1.h, dxgi1_2.h, fxc.exe).
@@ -63,57 +67,33 @@ target_include_directories(gmix PRIVATE
     "${CMAKE_CURRENT_SOURCE_DIR}/src")
 target_link_libraries(gmix PRIVATE gmix_core)
 
-# ── Proxy opengl32.dll capture layer (phase 1: osu!stable/OpenGL producer) ──
-# Generates a full-passthrough .def at configure+build time (see
-# proxy_dll/generate_def.ps1's header comment for why this can't be a static
-# .def file) and forwards everything except wglSwapBuffers to a renamed copy
-# of the real driver DLL that `gmix --install-proxy` places alongside it.
-find_program(POWERSHELL_EXE NAMES pwsh.exe powershell.exe REQUIRED)
-set(GMIX_PROXY_DEF "${CMAKE_CURRENT_BINARY_DIR}/opengl32_proxy.generated.def")
-add_custom_command(
-    OUTPUT "${GMIX_PROXY_DEF}"
-    COMMAND ${POWERSHELL_EXE} -NoProfile -ExecutionPolicy Bypass
-            -File "${CMAKE_CURRENT_SOURCE_DIR}/proxy_dll/generate_def.ps1"
-            -OutFile "${GMIX_PROXY_DEF}"
-    VERBATIM
-    COMMENT "Generating opengl32 proxy .def from the real system opengl32.dll's export table")
-add_custom_target(gmix_proxy_def DEPENDS "${GMIX_PROXY_DEF}")
-
-add_library(gmix_proxy_opengl32 SHARED
-    "${CMAKE_CURRENT_SOURCE_DIR}/proxy_dll/opengl32_proxy.cpp"
+# ── Capture layer (phase 1: osu!stable/OpenGL producer) ────────────────────
+# GmixCapture.dll: loaded via genuine runtime injection (gmix-inject.exe),
+# NOT dropped/shadowed next to the game's exe -- see capture_main.cpp's and
+# inject.cpp's header comments for why the original DLL-shadowing design was
+# abandoned (osu!stable's .NET/OpenTK renderer calls gdi32!SwapBuffers, never
+# wglSwapBuffers, and .NET P/Invoke has no static import-table slot to shadow
+# anyway). Installs an inline hook on the real gdi32!SwapBuffers/opengl32!
+# wglSwapBuffers machine code at runtime instead (see inline_hook.cpp).
+add_library(gmix_capture SHARED
+    "${CMAKE_CURRENT_SOURCE_DIR}/proxy_dll/capture_main.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/proxy_dll/gl_dx_interop_capture.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/proxy_dll/inline_hook.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/ipc/frame_sender.cpp")
-# NOT added to the sources list above: CMake's own "this is a .def, pass
-# /DEF: automatically" handling for a SOURCE-listed .def conflicts with the
-# explicit target_link_options /DEF: below (both fire, and the resulting
-# double /DEF: made link.exe silently fail to recognize the `name = other.
-# name` forwarder syntax, so every forwarded GL export came back as an
-# "unresolved external symbol" instead of a forwarder RVA). Depend on the
-# generating target directly instead.
-add_dependencies(gmix_proxy_opengl32 gmix_proxy_def)
-set_target_properties(gmix_proxy_opengl32 PROPERTIES
-    OUTPUT_NAME "opengl32"
-    # Distinct from OUTPUT_NAME: our own import lib would otherwise also be
-    # named opengl32.lib, colliding with the real Windows SDK opengl32.lib
-    # this target links against (see the comment above target_link_libraries)
-    # -- "output filename matches input filename" from link.exe otherwise.
-    ARCHIVE_OUTPUT_NAME "gmix_proxy_opengl32"
-    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/proxy"
-    LIBRARY_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/proxy")
-target_include_directories(gmix_proxy_opengl32 PRIVATE
+set_target_properties(gmix_capture PROPERTIES
+    OUTPUT_NAME "GmixCapture"
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/capture"
+    LIBRARY_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/capture")
+target_include_directories(gmix_capture PRIVATE
     "${CMAKE_CURRENT_SOURCE_DIR}/src")
-# The Windows SDK's own opengl32.lib import library is linked here NOT to
-# call into it (we never do -- proxy_common.cpp calls the real DLL only via
-# GetProcAddress) but because MSVC's `name = module.name` .def forwarder
-# syntax only accepts a `name` the linker can already resolve as a known
-# import symbol; it uses that purely to validate the entry exists somewhere,
-# then writes the LITERAL "opengl32_orig.<name>" text from our own .def into
-# the export table regardless of which import lib satisfied the check. Without
-# this, every forwarded entry fails as an "unresolved external symbol" even
-# though forwarders normally need no local definition at all.
-target_link_libraries(gmix_proxy_opengl32 PRIVATE d3d11 dxgi opengl32)
-target_link_options(gmix_proxy_opengl32 PRIVATE "/DEF:${GMIX_PROXY_DEF}")
-add_dependencies(gmix gmix_proxy_opengl32)   # so `gmix --install-proxy` always has a fresh build to copy
+target_link_libraries(gmix_capture PRIVATE d3d11 dxgi opengl32)
+
+# gmix-inject.exe: loads gmix_capture.dll into a running target process
+# (CreateRemoteThread+LoadLibraryW). Ships next to GmixCapture.dll.
+add_executable(gmix-inject "${CMAKE_CURRENT_SOURCE_DIR}/proxy_dll/inject.cpp")
+set_target_properties(gmix-inject PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/capture")
+add_dependencies(gmix-inject gmix_capture)   # so it always sits next to a fresh GmixCapture.dll
 
 # ── obs-gmix-source: the OBS plugin (D3D11 shared-handle delivery) ─────────
 option(GMIX_BUILD_OBS_PLUGIN "Build the obs-gmix-source OBS Studio plugin" OFF)

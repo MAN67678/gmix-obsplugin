@@ -86,9 +86,16 @@ struct FrameQueue {
     std::atomic<bool> disconnected{false};
     uint32_t resizeW = 0, resizeH = 0;
     std::atomic<uint64_t> arrivals{0};
+    std::atomic<uint64_t> staleDropped{0};   // diag: frames received but dropped as backlog
     std::atomic<uint64_t> emaIntervalNs{0};
     uint64_t lastRateTs = 0;
     bool     lastRateGpu = false;
+    // Diag: capture(producer)->receive(here) latency for the most recently
+    // pushed frame, in ns. hdr.timestampNs (== cpuTs here) and nowNs() are
+    // both QueryPerformanceCounter-based (see frame_protocol.hpp's nowNs()),
+    // so this subtraction is valid despite crossing the producer/consumer
+    // process boundary.
+    std::atomic<int64_t> lastCaptureToReceiveLatencyNs{0};
 
     static constexpr size_t kCap = gmix::kMaxBlendFrames;
 
@@ -113,6 +120,9 @@ struct FrameQueue {
         }
         lastRateTs = rateTs;
         lastRateGpu = gpuDomain;
+        lastCaptureToReceiveLatencyNs.store(
+            static_cast<int64_t>(gmix::ipc::nowNs()) - static_cast<int64_t>(cpuTs),
+            std::memory_order_relaxed);
         ring.push_back({std::move(f), cpuTs});
         while (ring.size() > kCap) ring.pop_front();
         ++arrivals;
@@ -141,7 +151,7 @@ void receiverThreadFn(gmix::ipc::FrameReceiver& receiver, gmix::D3D11Context& ct
         // permanently lose the only chance to import this slot for the rest
         // of the connection (every later frame for it carries 0).
         auto tex = pool.acquire(ctx, hdr.exportSlot, hdr.sharedHandleValue, hdr.width, hdr.height, hdr.dxgiFormat);
-        if (stale) continue;
+        if (stale) { ++q.staleDropped; continue; }
         if (!tex) continue;
         auto frame = std::make_shared<gmix::ImportedFrame>();
         if (!frame->init(tex, hdr.acquireKey)) continue;
@@ -204,6 +214,11 @@ public:
     }
     uint32_t width()  const { return width_; }
     uint32_t height() const { return height_; }
+
+    // Called from gmixVideoRender (OBS's render thread) every time a "GMix
+    // Motion Blur" source actually draws -- diag-only counter for the
+    // periodic fps/latency report in workerMain() below.
+    void noteDrawCall() { ++drawCalls_; }
 
 private:
     GmixPipeline() = default;
@@ -276,6 +291,15 @@ private:
             const auto kMinDispatchInterval = std::chrono::nanoseconds(1'000'000'000ull / 60);
             auto lastDispatchTime = std::chrono::steady_clock::now() - kMinDispatchInterval;
 
+            // Diag reporting (per request): producer/receiver/blend/draw fps
+            // plus per-hop latency, once/sec. fps figures are deltas of the
+            // respective counters over the report window; latencies use
+            // gmix::ipc::nowNs() (QueryPerformanceCounter, cross-process-
+            // comparable -- see frame_protocol.hpp) against the ORIGINAL
+            // producer capture timestamp carried in each frame.
+            auto lastDiagLog = std::chrono::steady_clock::now();
+            uint64_t lastDiagArrivals = 0, lastDiagStale = 0, lastDiagBlends = 0, lastDiagDraws = 0;
+
             while (!queue.disconnected && !stop_.load()) {
                 if (queue.pendingResize.exchange(false)) {
                     blend_->waitBlendDone();
@@ -314,6 +338,8 @@ private:
                 if (blend_->pollBlendDone()) {
                     frontIdx = static_cast<int>(inFlightIdx);
                     frontIdx_.store(frontIdx, std::memory_order_release);
+                    ++blendCompletions_;
+                    lastBlendCompleteNs_.store(static_cast<int64_t>(gmix::ipc::nowNs()), std::memory_order_relaxed);
                     static bool loggedFirstFrame = false;
                     if (!loggedFirstFrame) {
                         blog(LOG_INFO, "gmix: first blend retired, front=%d -- video_render should now draw", frontIdx);
@@ -345,8 +371,49 @@ private:
                             inFlightIdx = back;
                             lastBlendArrivals = arrivalsNow;
                             lastDispatchTime = nowTick;
+                            // Diag: capture->blend-dispatch latency for the
+                            // NEWEST frame included in this blend (frames[0]
+                            // == window_frames[wsz-1], the most recently
+                            // arrived one).
+                            lastCaptureToBlendLatencyNs_.store(
+                                static_cast<int64_t>(gmix::ipc::nowNs()) -
+                                    static_cast<int64_t>(window_frames[wsz - 1].timestampNs),
+                                std::memory_order_relaxed);
                         }
                     }
+                }
+
+                auto sinceDiag = nowTick - lastDiagLog;
+                if (sinceDiag >= std::chrono::seconds(1)) {
+                    double elapsedS = std::chrono::duration<double>(sinceDiag).count();
+                    uint64_t curArrivals = queue.arrivals.load();
+                    uint64_t curStale = queue.staleDropped.load();
+                    uint64_t curBlends = blendCompletions_.load();
+                    uint64_t curDraws = drawCalls_.load();
+                    double receiverFps = static_cast<double>(curArrivals - lastDiagArrivals) / elapsedS;
+                    double staleFps = static_cast<double>(curStale - lastDiagStale) / elapsedS;
+                    double blendFps = static_cast<double>(curBlends - lastDiagBlends) / elapsedS;
+                    double drawFps = static_cast<double>(curDraws - lastDiagDraws) / elapsedS;
+                    double captureToReceiveMs = queue.lastCaptureToReceiveLatencyNs.load() / 1e6;
+                    double captureToBlendMs = lastCaptureToBlendLatencyNs_.load() / 1e6;
+                    // Approximation: how old the currently-front blended
+                    // texture is right now, i.e. what video_render is
+                    // actually drawing this instant -- not a per-draw-call
+                    // measurement (OBS's own render loop paces draws; we
+                    // don't hook it beyond the counter above).
+                    double blendToNowMs = (static_cast<int64_t>(gmix::ipc::nowNs()) -
+                                           lastBlendCompleteNs_.load()) / 1e6;
+                    blog(LOG_INFO,
+                        "gmix: diag: producer=%.1ffps receiver=%.1ffps (dropped=%.1ffps) "
+                        "blend=%.1ffps draw=%.1ffps | latency capture->receive=%.2fms "
+                        "capture->blend=%.2fms blend->now=%.2fms",
+                        queue.captureFps(), receiverFps, staleFps, blendFps, drawFps,
+                        captureToReceiveMs, captureToBlendMs, blendToNowMs);
+                    lastDiagArrivals = curArrivals;
+                    lastDiagStale = curStale;
+                    lastDiagBlends = curBlends;
+                    lastDiagDraws = curDraws;
+                    lastDiagLog = nowTick;
                 }
 
                 // No internal output clock -- OBS's own render loop paces
@@ -379,6 +446,13 @@ private:
     std::mutex texMu_;
 
     uint32_t width_ = 0, height_ = 0;
+
+    // Diag counters/latencies for workerMain()'s periodic report -- see
+    // noteDrawCall() above and the "diag reporting" block in workerMain().
+    std::atomic<uint64_t> blendCompletions_{0};
+    std::atomic<uint64_t> drawCalls_{0};
+    std::atomic<int64_t>  lastCaptureToBlendLatencyNs_{0};
+    std::atomic<int64_t>  lastBlendCompleteNs_{0};
 
     static inline std::mutex s_mu;
     static inline std::weak_ptr<GmixPipeline> s_instance;
@@ -451,6 +525,7 @@ void gmixVideoRender(void* data, gs_effect_t* effect) {
     if (!s->pipeline) return;
     gs_texture_t* tex = s->pipeline->frontTexture();
     if (!tex) return;
+    s->pipeline->noteDrawCall();
     // Non-custom-draw sources are called with `effect` already active/looping
     // by OBS's own render core -- same note as the Linux plugin's identical
     // comment on why we don't wrap this in our own gs_effect_loop().

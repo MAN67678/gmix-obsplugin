@@ -58,10 +58,28 @@
 // ─────────────────────────────────────────────────────────────────────────────
 #pragma once
 
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+
 #include <cstdint>
 #include <string>
 
 namespace gmix::ipc {
+
+// Monotonic, system-wide-comparable timestamp (QueryPerformanceCounter-
+// based). QPC is calibrated once system-wide, not per-process, so
+// subtracting a timestamp captured in the producer from one captured in the
+// consumer yields a real wall-clock duration despite crossing a process
+// boundary -- the same trick the CLI's cross-process latency readout
+// already relies on. Producer and consumer both use this exact helper (for
+// FrameHeader::timestampNs and all diagnostic-latency computations) so
+// there's only one implementation to keep in sync.
+inline uint64_t nowNs() {
+    LARGE_INTEGER freq, ctr;
+    QueryPerformanceFrequency(&freq);
+    QueryPerformanceCounter(&ctr);
+    return static_cast<uint64_t>(static_cast<double>(ctr.QuadPart) * 1e9 / static_cast<double>(freq.QuadPart));
+}
 
 // Magic so the consumer can sanity-check the producer speaks our protocol.
 // Distinct from the Linux magic (0x47584D58) so a stray cross-platform

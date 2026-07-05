@@ -19,9 +19,10 @@ namespace gmix::capture {
 
 namespace {
 
-// ── GL/WGL types this file needs that <windows.h>/<d3d11.h> don't define ───
+// ── GL types this file needs that <windows.h>/<d3d11.h> don't define ───────
 using GLenum = unsigned int;
 using GLuint = unsigned int;
+using GLuint64 = unsigned long long;
 using GLint = int;
 using GLsizei = int;
 using GLbitfield = unsigned int;
@@ -35,48 +36,63 @@ constexpr GLbitfield GL_COLOR_BUFFER_BIT = 0x00004000;
 constexpr GLenum GL_NEAREST = 0x2600;
 constexpr GLenum GL_FRAMEBUFFER_COMPLETE = 0x8CD5;
 constexpr GLenum GL_RGBA = 0x1908;
+constexpr GLenum GL_RGBA8 = 0x8058;
 constexpr GLenum GL_UNSIGNED_BYTE = 0x1401;
 constexpr GLenum GL_BACK = 0x0405;
-
-using PFN_wglGetCurrentContext = HGLRC(__stdcall*)();
-using PFN_wglDXSetResourceShareHandleNV = BOOL(__stdcall*)(void*, HANDLE);
-using PFN_wglDXOpenDeviceNV   = HANDLE(__stdcall*)(void*);
-using PFN_wglDXCloseDeviceNV  = BOOL(__stdcall*)(HANDLE);
-using PFN_wglDXRegisterObjectNV   = HANDLE(__stdcall*)(HANDLE, void*, GLuint, GLenum, GLenum);
-using PFN_wglDXUnregisterObjectNV = BOOL(__stdcall*)(HANDLE, HANDLE);
-using PFN_wglDXLockObjectsNV   = BOOL(__stdcall*)(HANDLE, GLint, HANDLE*);
-using PFN_wglDXUnlockObjectsNV = BOOL(__stdcall*)(HANDLE, GLint, HANDLE*);
-constexpr GLenum WGL_ACCESS_WRITE_DISCARD_NV = 0x00000001;
+// GL_EXT_memory_object_win32's handle-type enum for a plain shared NT handle
+// (matches D3D11_RESOURCE_MISC_SHARED_NTHANDLE, same value osu's reference
+// project's producer/gl_hook.cpp uses).
+constexpr GLenum GL_HANDLE_TYPE_OPAQUE_WIN32_EXT = 0x9587;
 
 using PFN_glGenTextures = void(__stdcall*)(GLsizei, GLuint*);
 using PFN_glDeleteTextures = void(__stdcall*)(GLsizei, const GLuint*);
+using PFN_glBindTexture = void(__stdcall*)(GLenum, GLuint);
+using PFN_glReadBuffer = void(__stdcall*)(GLenum);
+using PFN_glReadPixels = void(__stdcall*)(GLint, GLint, GLsizei, GLsizei, GLenum, GLenum, void*);
+using PFN_glFinish = void(__stdcall*)();
+
 using PFN_glGenFramebuffers = void(__stdcall*)(GLsizei, GLuint*);
 using PFN_glDeleteFramebuffers = void(__stdcall*)(GLsizei, const GLuint*);
 using PFN_glBindFramebuffer = void(__stdcall*)(GLenum, GLuint);
 using PFN_glFramebufferTexture2D = void(__stdcall*)(GLenum, GLenum, GLenum, GLuint, GLint);
 using PFN_glCheckFramebufferStatus = GLenum(__stdcall*)(GLenum);
 using PFN_glBlitFramebuffer = void(__stdcall*)(GLint, GLint, GLint, GLint, GLint, GLint, GLint, GLint, GLbitfield, GLenum);
-using PFN_glReadBuffer = void(__stdcall*)(GLenum);
-using PFN_glReadPixels = void(__stdcall*)(GLint, GLint, GLsizei, GLsizei, GLenum, GLenum, void*);
+
+// GL_EXT_memory_object / GL_EXT_memory_object_win32 -- cross-vendor (AMD,
+// Intel, NVIDIA all implement this extension family). Chosen over
+// WGL_NV_DX_interop2 specifically because it needs NO per-frame "lock"
+// step: glImportMemoryWin32HandleEXT creates a GL texture that ALIASES the
+// D3D11 texture's memory ONCE, at ring-setup time; every subsequent frame
+// is just an ordinary GL blit into that texture, with zero GL-D3D command-
+// stream synchronization call in the hot path. See gl_dx_interop_
+// capture.hpp's header comment for why WGL_NV_DX_interop2's Lock/Unlock
+// (a real CPU-blocking sync point, called every export) was capping real
+// game fps well below what osu! should achieve.
+using PFN_glCreateMemoryObjectsEXT = void(__stdcall*)(GLsizei, GLuint*);
+using PFN_glDeleteMemoryObjectsEXT = void(__stdcall*)(GLsizei, const GLuint*);
+using PFN_glImportMemoryWin32HandleEXT = void(__stdcall*)(GLuint, GLuint64, GLenum, void*);
+using PFN_glTexStorageMem2DEXT = void(__stdcall*)(GLenum, GLsizei, GLenum, GLsizei, GLsizei, GLuint, GLuint64);
 
 struct GlProcs {
-    PFN_wglGetCurrentContext wglGetCurrentContext = nullptr;
-    PFN_wglDXOpenDeviceNV wglDXOpenDeviceNV = nullptr;
-    PFN_wglDXCloseDeviceNV wglDXCloseDeviceNV = nullptr;
-    PFN_wglDXRegisterObjectNV wglDXRegisterObjectNV = nullptr;
-    PFN_wglDXUnregisterObjectNV wglDXUnregisterObjectNV = nullptr;
-    PFN_wglDXLockObjectsNV wglDXLockObjectsNV = nullptr;
-    PFN_wglDXUnlockObjectsNV wglDXUnlockObjectsNV = nullptr;
     PFN_glGenTextures glGenTextures = nullptr;
     PFN_glDeleteTextures glDeleteTextures = nullptr;
+    PFN_glBindTexture glBindTexture = nullptr;
+    PFN_glReadBuffer glReadBuffer = nullptr;
+    PFN_glReadPixels glReadPixels = nullptr;
+    PFN_glFinish glFinish = nullptr;
+
     PFN_glGenFramebuffers glGenFramebuffers = nullptr;
     PFN_glDeleteFramebuffers glDeleteFramebuffers = nullptr;
     PFN_glBindFramebuffer glBindFramebuffer = nullptr;
     PFN_glFramebufferTexture2D glFramebufferTexture2D = nullptr;
     PFN_glCheckFramebufferStatus glCheckFramebufferStatus = nullptr;
     PFN_glBlitFramebuffer glBlitFramebuffer = nullptr;
-    PFN_glReadBuffer glReadBuffer = nullptr;
-    PFN_glReadPixels glReadPixels = nullptr;
+
+    PFN_glCreateMemoryObjectsEXT glCreateMemoryObjectsEXT = nullptr;
+    PFN_glDeleteMemoryObjectsEXT glDeleteMemoryObjectsEXT = nullptr;
+    PFN_glImportMemoryWin32HandleEXT glImportMemoryWin32HandleEXT = nullptr;
+    PFN_glTexStorageMem2DEXT glTexStorageMem2DEXT = nullptr;
+
     bool interopLoaded = false;
     bool fboLoaded = false;
 };
@@ -85,11 +101,12 @@ GlProcs g_gl;
 
 void loadGlProcs() {
     using gmix::proxy::resolveGlProc;
-    g_gl.wglGetCurrentContext = reinterpret_cast<PFN_wglGetCurrentContext>(resolveGlProc("wglGetCurrentContext"));
     g_gl.glGenTextures    = reinterpret_cast<PFN_glGenTextures>(resolveGlProc("glGenTextures"));
     g_gl.glDeleteTextures = reinterpret_cast<PFN_glDeleteTextures>(resolveGlProc("glDeleteTextures"));
+    g_gl.glBindTexture    = reinterpret_cast<PFN_glBindTexture>(resolveGlProc("glBindTexture"));
     g_gl.glReadBuffer     = reinterpret_cast<PFN_glReadBuffer>(resolveGlProc("glReadBuffer"));
     g_gl.glReadPixels     = reinterpret_cast<PFN_glReadPixels>(resolveGlProc("glReadPixels"));
+    g_gl.glFinish         = reinterpret_cast<PFN_glFinish>(resolveGlProc("glFinish"));
 
     g_gl.glGenFramebuffers      = reinterpret_cast<PFN_glGenFramebuffers>(resolveGlProc("glGenFramebuffers"));
     g_gl.glDeleteFramebuffers   = reinterpret_cast<PFN_glDeleteFramebuffers>(resolveGlProc("glDeleteFramebuffers"));
@@ -100,27 +117,47 @@ void loadGlProcs() {
     g_gl.fboLoaded = g_gl.glGenFramebuffers && g_gl.glDeleteFramebuffers && g_gl.glBindFramebuffer &&
                      g_gl.glFramebufferTexture2D && g_gl.glCheckFramebufferStatus && g_gl.glBlitFramebuffer;
 
-    g_gl.wglDXOpenDeviceNV = reinterpret_cast<PFN_wglDXOpenDeviceNV>(resolveGlProc("wglDXOpenDeviceNV"));
-    g_gl.wglDXCloseDeviceNV = reinterpret_cast<PFN_wglDXCloseDeviceNV>(resolveGlProc("wglDXCloseDeviceNV"));
-    g_gl.wglDXRegisterObjectNV = reinterpret_cast<PFN_wglDXRegisterObjectNV>(resolveGlProc("wglDXRegisterObjectNV"));
-    g_gl.wglDXUnregisterObjectNV = reinterpret_cast<PFN_wglDXUnregisterObjectNV>(resolveGlProc("wglDXUnregisterObjectNV"));
-    g_gl.wglDXLockObjectsNV = reinterpret_cast<PFN_wglDXLockObjectsNV>(resolveGlProc("wglDXLockObjectsNV"));
-    g_gl.wglDXUnlockObjectsNV = reinterpret_cast<PFN_wglDXUnlockObjectsNV>(resolveGlProc("wglDXUnlockObjectsNV"));
-    g_gl.interopLoaded = g_gl.wglDXOpenDeviceNV && g_gl.wglDXCloseDeviceNV && g_gl.wglDXRegisterObjectNV &&
-                         g_gl.wglDXUnregisterObjectNV && g_gl.wglDXLockObjectsNV && g_gl.wglDXUnlockObjectsNV &&
+    g_gl.glCreateMemoryObjectsEXT     = reinterpret_cast<PFN_glCreateMemoryObjectsEXT>(resolveGlProc("glCreateMemoryObjectsEXT"));
+    g_gl.glDeleteMemoryObjectsEXT     = reinterpret_cast<PFN_glDeleteMemoryObjectsEXT>(resolveGlProc("glDeleteMemoryObjectsEXT"));
+    g_gl.glImportMemoryWin32HandleEXT = reinterpret_cast<PFN_glImportMemoryWin32HandleEXT>(resolveGlProc("glImportMemoryWin32HandleEXT"));
+    g_gl.glTexStorageMem2DEXT         = reinterpret_cast<PFN_glTexStorageMem2DEXT>(resolveGlProc("glTexStorageMem2DEXT"));
+    g_gl.interopLoaded = g_gl.glCreateMemoryObjectsEXT && g_gl.glDeleteMemoryObjectsEXT &&
+                         g_gl.glImportMemoryWin32HandleEXT && g_gl.glTexStorageMem2DEXT &&
                          g_gl.fboLoaded;
 }
 
-uint64_t nowNs() {
-    LARGE_INTEGER freq, ctr;
-    QueryPerformanceFrequency(&freq);
-    QueryPerformanceCounter(&ctr);
-    return static_cast<uint64_t>(static_cast<double>(ctr.QuadPart) * 1e9 / static_cast<double>(freq.QuadPart));
-}
+// Throttle floor. Earlier revisions kept this at 4ms specifically to bound
+// how often sendFrame()'s blocking WriteFile could stall the game -- that
+// concern was justified when EVERY export also paid a WGL_NV_DX_interop2
+// Lock/Unlock cost (a real CPU-blocking GPU sync). Now that the interop
+// path has NO per-frame lock step (see the header comment), this matches
+// the reference project's design of capturing every single present with no
+// throttle at all. Kept at a very small floor (not zero) purely to bound
+// worst-case WriteFile-under-backpressure cost if the consumer ever falls
+// behind; raise/lower based on what the diag logging shows.
+constexpr auto kExportInterval = std::chrono::microseconds(500);
 
-// Throttle floor, same reasoning as the Linux layer's kExportInterval: sits
-// well above any real present rate so it never aliases against it.
-constexpr auto kExportInterval = std::chrono::microseconds(200);
+// Keyed-mutex ping-pong keys: key 0 = available for the producer to acquire
+// and write; key 1 = handed to the consumer (see ImportedFrame::
+// kHandBackKey on the consumer side, which releases back to key 0 once done
+// reading). Called as a PLAIN D3D11 API call around the GL blit -- there is
+// no GL-side view of this mutex (GL_EXT_win32_keyed_mutex doesn't resolve
+// on this AMD driver), so correctness requires an explicit glFinish()
+// before ReleaseSync: a first attempt used glFlush() here instead (merely
+// submits, doesn't wait for completion) and it was NOT safe -- confirmed by
+// testing, the consumer's receiver/blend fps collapsed to ~3-4fps with
+// wildly stale frames (blend->now latency spiking to 100-280ms), almost
+// certainly the keyed mutex being released before the GPU had actually
+// finished the blit, racing the consumer's read. glFinish() waits for GL's
+// own command queue to drain (not a cross-API device handshake the way
+// WGL_NV_DX_interop2's Lock/Unlock is), so it should still be far cheaper
+// while actually being correct.
+constexpr uint64_t kKeyAvailable = 0;
+constexpr uint64_t kKeyToConsumer = 1;
+// Kept short: this still blocks the GAME's render thread if a ring slot's
+// mutex is still held by a slow consumer. Failing fast and skipping that
+// one frame's export is far better than stalling gameplay.
+constexpr DWORD kAcquireTimeoutMs = 4;
 
 } // namespace
 
@@ -132,7 +169,10 @@ GlDxInteropCapture& GlDxInteropCapture::instance() {
 GlDxInteropCapture::~GlDxInteropCapture() { shutdown(); }
 
 bool GlDxInteropCapture::ensureInit(HDC /*hdc*/) {
+    gmix::proxy::debugLog("ensureInit: starting");
     loadGlProcs();
+    gmix::proxy::debugLog("ensureInit: loadGlProcs done, interopLoaded=%d fboLoaded=%d",
+                          (int)g_gl.interopLoaded, (int)g_gl.fboLoaded);
 
     D3D_FEATURE_LEVEL levels[] = { D3D_FEATURE_LEVEL_11_0 };
     D3D_FEATURE_LEVEL got{};
@@ -141,28 +181,27 @@ bool GlDxInteropCapture::ensureInit(HDC /*hdc*/) {
     if (FAILED(hr)) {
         std::fprintf(stderr, "gmix: capture: D3D11CreateDevice failed (hr=0x%08lx) -- "
                               "capture disabled\n", static_cast<unsigned long>(hr));
+        gmix::proxy::debugLog("ensureInit: D3D11CreateDevice FAILED hr=0x%08lx", (unsigned long)hr);
         return false;
     }
+    gmix::proxy::debugLog("ensureInit: D3D11CreateDevice OK, device=%p", (void*)d3dDevice_);
 
     interopAvailable_ = g_gl.interopLoaded;
     if (interopAvailable_) {
-        interopDeviceHandle_ = g_gl.wglDXOpenDeviceNV(d3dDevice_);
-        if (!interopDeviceHandle_) {
-            std::fprintf(stderr, "gmix: capture: wglDXOpenDeviceNV failed -- "
-                                  "falling back to CPU-readback capture (slower, not zero-copy; "
-                                  "see WIN32/README.md)\n");
-            interopAvailable_ = false;
-        }
+        gmix::proxy::debugLog("ensureInit: GL_EXT_memory_object_win32 available -- "
+                              "using zero-copy interop path (no per-frame lock step)");
     } else {
-        std::fprintf(stderr, "gmix: capture: WGL_NV_DX_interop2 unavailable on this driver -- "
+        std::fprintf(stderr, "gmix: capture: GL_EXT_memory_object_win32 unavailable on this driver -- "
                               "falling back to CPU-readback capture (slower, not zero-copy; "
                               "see WIN32/README.md)\n");
+        gmix::proxy::debugLog("ensureInit: GL_EXT_memory_object_win32 unavailable -- using CPU-readback path");
     }
 
     producerPid_ = gmix::proxy::currentProducerPid();
 
     connectorRunning_ = true;
     connectorThread_ = std::thread([this]() { connectorLoop(); });
+    gmix::proxy::debugLog("ensureInit: done, connector thread started");
     return true;
 }
 
@@ -176,7 +215,9 @@ void GlDxInteropCapture::connectorLoop() {
         }
         if (needConnect) {
             auto s = std::make_unique<gmix::ipc::FrameSender>();
-            if (s->connect(pipeName)) {
+            bool connected = s->connect(pipeName);
+            gmix::proxy::debugLog("connectorLoop: connect attempt -> %s", connected ? "OK" : "failed");
+            if (connected) {
                 std::lock_guard<std::mutex> lk(senderMu_);
                 sender_ = std::move(s);
                 handshakeSent_ = false;
@@ -220,11 +261,11 @@ bool GlDxInteropCapture::ensureRing(uint32_t w, uint32_t h) {
 
         // Create an UNNAMED shared handle -- see frame_protocol.hpp's
         // PROTOCOL HISTORY comment for why NOT OpenSharedResourceByName
-        // (broken on some drivers). Unlike the discarded named-handle
-        // approach, this handle is KEPT OPEN for the slot's lifetime: it's
-        // re-DuplicateHandle'd into whichever consumer process is currently
-        // connected (see connectorLoop()/captureViaInterop()), so it must
-        // stay valid as long as the slot does.
+        // (broken on some drivers). Kept open for the slot's lifetime:
+        // reused both for the GL_EXT_memory_object_win32 import below (this
+        // process, same handle) AND re-DuplicateHandle'd into whichever
+        // consumer process is currently connected (see connectorLoop()/
+        // captureViaInterop()/captureViaReadback()).
         IDXGIResource1* dxgiRes1 = nullptr;
         if (rs.tex->QueryInterface(__uuidof(IDXGIResource1), reinterpret_cast<void**>(&dxgiRes1)) == S_OK) {
             HANDLE h = nullptr;
@@ -251,26 +292,31 @@ bool GlDxInteropCapture::ensureRing(uint32_t w, uint32_t h) {
         }
 
         if (interopAvailable_) {
+            g_gl.glCreateMemoryObjectsEXT(1, &rs.glMemObj);
+            // D3D11 has no exact "memory requirements" query the way Vulkan
+            // does; a tightly-packed RGBA8 size is a reasonable hint --
+            // real allocations for a single, non-suballocated import like
+            // this are described by the handle itself, so implementations
+            // generally treat this as advisory rather than authoritative.
+            GLuint64 memSize = static_cast<GLuint64>(w) * h * 4;
+            g_gl.glImportMemoryWin32HandleEXT(rs.glMemObj, memSize, GL_HANDLE_TYPE_OPAQUE_WIN32_EXT,
+                                              rs.localSharedHandle);
+
             g_gl.glGenTextures(1, &rs.glTexture);
-            rs.interopObject = g_gl.wglDXRegisterObjectNV(interopDeviceHandle_, rs.tex, rs.glTexture,
-                                                          GL_TEXTURE_2D, WGL_ACCESS_WRITE_DISCARD_NV);
-            if (!rs.interopObject) {
-                std::fprintf(stderr, "gmix: capture: wglDXRegisterObjectNV failed (slot %d) -- "
-                                      "falling back to CPU-readback capture\n", i);
+            g_gl.glBindTexture(GL_TEXTURE_2D, rs.glTexture);
+            g_gl.glTexStorageMem2DEXT(GL_TEXTURE_2D, 1, GL_RGBA8, static_cast<GLsizei>(w),
+                                      static_cast<GLsizei>(h), rs.glMemObj, 0);
+            g_gl.glBindTexture(GL_TEXTURE_2D, 0);
+
+            g_gl.glGenFramebuffers(1, &rs.glFbo);
+            g_gl.glBindFramebuffer(GL_FRAMEBUFFER, rs.glFbo);
+            g_gl.glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, rs.glTexture, 0);
+            GLenum status = g_gl.glCheckFramebufferStatus(GL_FRAMEBUFFER);
+            g_gl.glBindFramebuffer(GL_FRAMEBUFFER, 0);
+            if (status != GL_FRAMEBUFFER_COMPLETE) {
+                std::fprintf(stderr, "gmix: capture: FBO incomplete (slot %d, status=0x%04x) -- "
+                                      "falling back to CPU-readback capture\n", i, status);
                 interopAvailable_ = false;
-            } else {
-                HANDLE interopHandle = rs.interopObject;
-                g_gl.wglDXLockObjectsNV(interopDeviceHandle_, 1, &interopHandle);
-                g_gl.glGenFramebuffers(1, &rs.glFbo);
-                g_gl.glBindFramebuffer(GL_FRAMEBUFFER, rs.glFbo);
-                g_gl.glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, rs.glTexture, 0);
-                GLenum status = g_gl.glCheckFramebufferStatus(GL_FRAMEBUFFER);
-                g_gl.glBindFramebuffer(GL_FRAMEBUFFER, 0);
-                g_gl.wglDXUnlockObjectsNV(interopDeviceHandle_, 1, &interopHandle);
-                if (status != GL_FRAMEBUFFER_COMPLETE) {
-                    std::fprintf(stderr, "gmix: capture: FBO incomplete (slot %d, status=0x%04x)\n", i, status);
-                    interopAvailable_ = false;
-                }
             }
         }
     }
@@ -281,13 +327,9 @@ bool GlDxInteropCapture::ensureRing(uint32_t w, uint32_t h) {
 
 void GlDxInteropCapture::destroyRing() {
     for (auto& rs : ring_) {
-        if (rs.interopObject) {
-            HANDLE h = rs.interopObject;
-            if (g_gl.wglDXUnregisterObjectNV) g_gl.wglDXUnregisterObjectNV(interopDeviceHandle_, h);
-            rs.interopObject = nullptr;
-        }
         if (rs.glFbo && g_gl.glDeleteFramebuffers) { g_gl.glDeleteFramebuffers(1, &rs.glFbo); rs.glFbo = 0; }
         if (rs.glTexture && g_gl.glDeleteTextures) { g_gl.glDeleteTextures(1, &rs.glTexture); rs.glTexture = 0; }
+        if (rs.glMemObj && g_gl.glDeleteMemoryObjectsEXT) { g_gl.glDeleteMemoryObjectsEXT(1, &rs.glMemObj); rs.glMemObj = 0; }
         if (rs.mutex) { rs.mutex->Release(); rs.mutex = nullptr; }
         if (rs.localSharedHandle) { CloseHandle(static_cast<HANDLE>(rs.localSharedHandle)); rs.localSharedHandle = nullptr; }
         rs.handleSentThisConnection = false;
@@ -300,18 +342,16 @@ bool GlDxInteropCapture::captureViaInterop(HDC /*hdc*/, uint32_t w, uint32_t h) 
     int slot = ringNext_;
     ringNext_ = (ringNext_ + 1) % kExportRing;
     auto& rs = ring_[slot];
-    if (!rs.tex || !rs.interopObject) return false;
+    if (!rs.tex || !rs.glMemObj) return false;
 
-    // Producer's half of the keyed-mutex ping-pong: acquire key 0 (available
-    // once the consumer has released this slot back -- see
-    // ImportedFrame::kHandBackKey), write, release with key 1 (the value the
-    // consumer's FrameHeader.acquireKey will name).
-    constexpr DWORD kAcquireTimeoutMs = 50;
-    if (rs.mutex->AcquireSync(0, kAcquireTimeoutMs) != S_OK) return false;
+    uint64_t t0 = ipc::nowNs();
 
-    HANDLE interopHandle = rs.interopObject;
-    if (!g_gl.wglDXLockObjectsNV(interopDeviceHandle_, 1, &interopHandle)) {
-        rs.mutex->ReleaseSync(0);
+    // Plain D3D11 API call, NOT wrapped in any GL-side lock (see this file's
+    // header comment for why: WGL_NV_DX_interop2's Lock/Unlock was the real
+    // per-frame cost capping fps well below what osu! should reach).
+    ++diagAcquireAttemptCount_;
+    if (rs.mutex->AcquireSync(kKeyAvailable, kAcquireTimeoutMs) != S_OK) {
+        ++diagAcquireFailCount_;
         return false;
     }
 
@@ -324,9 +364,16 @@ bool GlDxInteropCapture::captureViaInterop(HDC /*hdc*/, uint32_t w, uint32_t h) 
                            0, static_cast<GLint>(h), static_cast<GLint>(w), 0,
                            GL_COLOR_BUFFER_BIT, GL_NEAREST);
     g_gl.glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    // Wait for the blit to actually COMPLETE before releasing the mutex --
+    // see the constants block above for why glFlush() alone was unsafe here.
+    g_gl.glFinish();
 
-    g_gl.wglDXUnlockObjectsNV(interopDeviceHandle_, 1, &interopHandle);
-    rs.mutex->ReleaseSync(1);
+    rs.mutex->ReleaseSync(kKeyToConsumer);
+
+    uint64_t t1 = ipc::nowNs();
+    uint64_t lockNs = t1 - t0;
+    diagLockSumNs_ += lockNs;
+    if (lockNs > diagLockMaxNs_) diagLockMaxNs_ = lockNs;
 
     ipc::FrameHeader hdr{};
     hdr.magic = ipc::kMagic;
@@ -334,9 +381,9 @@ bool GlDxInteropCapture::captureViaInterop(HDC /*hdc*/, uint32_t w, uint32_t h) 
     hdr.height = h;
     hdr.dxgiFormat = static_cast<uint32_t>(DXGI_FORMAT_R8G8B8A8_UNORM);
     hdr.exportSlot = static_cast<uint32_t>(slot);
-    hdr.acquireKey = 1;
+    hdr.acquireKey = kKeyToConsumer;
     hdr.frameIndex = ++frameIndex_;
-    hdr.timestampNs = nowNs();
+    hdr.timestampNs = ipc::nowNs();
     hdr.rowPitch = 0;
     hdr.gpuTimestampNs = 0;
 
@@ -357,6 +404,12 @@ bool GlDxInteropCapture::captureViaInterop(HDC /*hdc*/, uint32_t w, uint32_t h) 
     }
     if (ok) ok = sender_->sendFrame(hdr);
     if (!ok) sender_.reset();
+
+    uint64_t sendNs = ipc::nowNs() - t1;
+    diagSendSumNs_ += sendNs;
+    if (sendNs > diagSendMaxNs_) diagSendMaxNs_ = sendNs;
+    ++diagExportCount_;
+
     return ok;
 }
 
@@ -366,14 +419,15 @@ bool GlDxInteropCapture::captureViaReadback(HDC /*hdc*/, uint32_t w, uint32_t h)
     auto& rs = ring_[slot];
     if (!rs.tex) return false;
 
-    constexpr DWORD kAcquireTimeoutMs = 50;
-    if (rs.mutex->AcquireSync(0, kAcquireTimeoutMs) != S_OK) return false;
+    // No GL interop involved in this fallback path -- straight D3D11
+    // IDXGIKeyedMutex, matching the consumer's expectations exactly.
+    if (rs.mutex->AcquireSync(kKeyAvailable, kAcquireTimeoutMs) != S_OK) return false;
 
     // Slow path: read the backbuffer to host memory, flipping rows (GL is
     // bottom-up, D3D top-down -- same reasoning as the interop path's Y
     // flip, done here on the CPU instead of via glBlitFramebuffer), then
     // upload into the shared D3D11 texture. Not zero-copy; see
-    // WIN32/README.md for when this path is used (non-NVIDIA GPUs).
+    // WIN32/README.md for when this path is used.
     std::vector<uint8_t> pixels(static_cast<size_t>(w) * h * 4);
     g_gl.glReadBuffer(GL_BACK);
     g_gl.glReadPixels(0, 0, static_cast<GLsizei>(w), static_cast<GLsizei>(h), GL_RGBA, GL_UNSIGNED_BYTE, pixels.data());
@@ -385,7 +439,7 @@ bool GlDxInteropCapture::captureViaReadback(HDC /*hdc*/, uint32_t w, uint32_t h)
     }
     d3dContext_->UpdateSubresource(rs.tex, 0, nullptr, flipped.data(), static_cast<UINT>(rowBytes), 0);
 
-    rs.mutex->ReleaseSync(1);
+    rs.mutex->ReleaseSync(kKeyToConsumer);
 
     ipc::FrameHeader hdr{};
     hdr.magic = ipc::kMagic;
@@ -393,9 +447,9 @@ bool GlDxInteropCapture::captureViaReadback(HDC /*hdc*/, uint32_t w, uint32_t h)
     hdr.height = h;
     hdr.dxgiFormat = static_cast<uint32_t>(DXGI_FORMAT_R8G8B8A8_UNORM);
     hdr.exportSlot = static_cast<uint32_t>(slot);
-    hdr.acquireKey = 1;
+    hdr.acquireKey = kKeyToConsumer;
     hdr.frameIndex = ++frameIndex_;
-    hdr.timestampNs = nowNs();
+    hdr.timestampNs = ipc::nowNs();
     hdr.rowPitch = rowBytes;
     hdr.gpuTimestampNs = 0;
 
@@ -419,25 +473,108 @@ void GlDxInteropCapture::onSwapBuffers(HDC hdc) {
     std::call_once(initOnce_, [&]() { initOk_ = ensureInit(hdc); });
     if (!initOk_) return;
 
+    // Diag: count EVERY present, before anything else runs -- this is the
+    // game's actual render rate, independent of (and always >=) the
+    // throttled export rate below. If this is far below what osu! should be
+    // achieving unthrottled, the cost is being paid somewhere in/before this
+    // function itself (e.g. the inline-hook trampoline), not in the
+    // throttled capture path.
+    ++presentCount_;
+
+    // Throttled (~once/sec) status line -- onSwapBuffers runs every present,
+    // so anything unconditional here would flood the log. Reports exactly
+    // the state needed to diagnose "capture never activates": is a consumer
+    // connected, what size is being captured, etc. -- plus (per request) the
+    // game's actual present fps and the producer's throttled export fps,
+    // both computed as deltas over this same ~1s window so they're directly
+    // comparable to each other and to the consumer-side receiver/blend/draw
+    // fps numbers gmix_source.cpp logs.
+    static std::chrono::steady_clock::time_point lastStatusLog{};
+    static uint64_t lastStatusFrameIndex = 0;
+    static uint64_t lastStatusPresentCount = 0;
+    auto nowForLog = std::chrono::steady_clock::now();
+    auto sinceLastLog = nowForLog - lastStatusLog;
+    bool doStatusLog = sinceLastLog > std::chrono::seconds(1);
+    double producerFps = 0.0;
+    double gameFps = 0.0;
+    // Per-export timing breakdown (see captureViaInterop's diagLock*/diagSend*
+    // accumulation) -- averaged/maxed over THIS window's exports, then reset,
+    // so it reflects only what happened since the last log line.
+    double avgLockMs = 0.0, maxLockMs = 0.0, avgSendMs = 0.0, maxSendMs = 0.0;
+    double acquireFailPct = 0.0;
+    uint64_t acquireFails = 0, acquireAttempts = 0;
+    if (doStatusLog) {
+        double elapsedS = std::chrono::duration<double>(sinceLastLog).count();
+        if (lastStatusLog.time_since_epoch().count() != 0 && elapsedS > 0.0) {
+            producerFps = static_cast<double>(frameIndex_ - lastStatusFrameIndex) / elapsedS;
+            gameFps = static_cast<double>(presentCount_ - lastStatusPresentCount) / elapsedS;
+        }
+        lastStatusFrameIndex = frameIndex_;
+        lastStatusPresentCount = presentCount_;
+        lastStatusLog = nowForLog;
+
+        if (diagExportCount_ > 0) {
+            avgLockMs = (diagLockSumNs_ / static_cast<double>(diagExportCount_)) / 1e6;
+            avgSendMs = (diagSendSumNs_ / static_cast<double>(diagExportCount_)) / 1e6;
+        }
+        maxLockMs = diagLockMaxNs_ / 1e6;
+        maxSendMs = diagSendMaxNs_ / 1e6;
+        diagLockSumNs_ = diagLockMaxNs_ = diagSendSumNs_ = diagSendMaxNs_ = 0;
+        diagExportCount_ = 0;
+
+        acquireFails = diagAcquireFailCount_;
+        acquireAttempts = diagAcquireAttemptCount_;
+        if (acquireAttempts > 0) {
+            acquireFailPct = 100.0 * static_cast<double>(acquireFails) / static_cast<double>(acquireAttempts);
+        }
+        diagAcquireFailCount_ = diagAcquireAttemptCount_ = 0;
+    }
+
     auto now = std::chrono::steady_clock::now();
-    if (lastExportAttempt_.time_since_epoch().count() != 0 && now - lastExportAttempt_ < kExportInterval) return;
+    if (lastExportAttempt_.time_since_epoch().count() != 0 && now - lastExportAttempt_ < kExportInterval) {
+        if (doStatusLog) gmix::proxy::debugLog("onSwapBuffers: throttled, game fps=%.1f producer fps=%.1f",
+                                               gameFps, producerFps);
+        return;
+    }
     lastExportAttempt_ = now;
 
+    bool senderConnected = false;
     {
         std::lock_guard<std::mutex> lk(senderMu_);
-        if (!sender_ || !sender_->isConnected()) return;
+        senderConnected = sender_ && sender_->isConnected();
+    }
+    if (!senderConnected) {
+        if (doStatusLog) gmix::proxy::debugLog("onSwapBuffers: no consumer connected yet, game fps=%.1f", gameFps);
+        return;
     }
 
     HWND hwnd = WindowFromDC(hdc);
-    if (!hwnd) return;
+    if (!hwnd) {
+        if (doStatusLog) gmix::proxy::debugLog("onSwapBuffers: WindowFromDC(hdc=%p) returned null", (void*)hdc);
+        return;
+    }
     RECT rc{};
     GetClientRect(hwnd, &rc);
     uint32_t w = static_cast<uint32_t>(rc.right - rc.left);
     uint32_t h = static_cast<uint32_t>(rc.bottom - rc.top);
-    if (w == 0 || h == 0) return;
+    if (w == 0 || h == 0) {
+        if (doStatusLog) gmix::proxy::debugLog("onSwapBuffers: zero-size client rect (%ux%u)", w, h);
+        return;
+    }
 
-    if (!ensureRing(w, h)) return;
+    if (!ensureRing(w, h)) {
+        if (doStatusLog) gmix::proxy::debugLog("onSwapBuffers: ensureRing(%u,%u) FAILED", w, h);
+        return;
+    }
 
+    if (doStatusLog) {
+        gmix::proxy::debugLog("onSwapBuffers: capturing %ux%u via %s, game fps=%.1f producer fps=%.1f | "
+                              "lock avg=%.3fms max=%.3fms, send avg=%.3fms max=%.3fms | "
+                              "acquire fails=%llu/%llu (%.1f%%)", w, h,
+                             interopAvailable_ ? "interop" : "readback", gameFps, producerFps,
+                             avgLockMs, maxLockMs, avgSendMs, maxSendMs,
+                             (unsigned long long)acquireFails, (unsigned long long)acquireAttempts, acquireFailPct);
+    }
     if (interopAvailable_) captureViaInterop(hdc, w, h);
     else                   captureViaReadback(hdc, w, h);
 }
@@ -450,10 +587,6 @@ void GlDxInteropCapture::shutdown() {
         sender_.reset();
     }
     destroyRing();
-    if (interopDeviceHandle_ && g_gl.wglDXCloseDeviceNV) {
-        g_gl.wglDXCloseDeviceNV(interopDeviceHandle_);
-        interopDeviceHandle_ = nullptr;
-    }
     if (d3dContext_) { d3dContext_->Release(); d3dContext_ = nullptr; }
     if (d3dDevice_)  { d3dDevice_->Release();  d3dDevice_ = nullptr; }
 }

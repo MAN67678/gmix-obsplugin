@@ -1,28 +1,26 @@
 // ─────────────────────────────────────────────────────────────────────────────
-// GMix proxy opengl32.dll — shared bits between opengl32_proxy.cpp (the
-// DllMain / export surface) and gl_dx_interop_capture.cpp (the actual
-// capture logic), so the capture code never has to know how the real driver
-// DLL was located.
+// GMix capture DLL (Windows) — shared bits between the DllMain/hook-install
+// entry point and gl_dx_interop_capture.cpp (the actual capture logic).
 // ─────────────────────────────────────────────────────────────────────────────
 #pragma once
 
 namespace gmix::proxy {
 
-// Resolves a GL/WGL function pointer against the REAL driver, never our own
-// proxy. Tries the real wglGetProcAddress first (required for anything past
-// GL1.1/core WGL -- FBOs, WGL_NV_DX_interop2, etc.), then falls back to a
-// plain GetProcAddress on the real opengl32.dll module for core exports
-// wglGetProcAddress isn't obligated to return (per the WGL spec, it only
-// covers extension entry points once a context is current).
+// Resolves a GL/WGL function pointer against the real driver's ALREADY-
+// LOADED opengl32.dll (found via GetModuleHandleW -- this DLL is injected at
+// runtime, not shadowing anything, so there is only ever one real
+// opengl32.dll in the target process). Tries wglGetProcAddress first
+// (required for anything past GL1.1/core WGL -- FBOs, GL_EXT_memory_object_
+// win32, etc.), then falls back to a plain GetProcAddress on that module for
+// core exports wglGetProcAddress isn't obligated to return.
 void* resolveGlProc(const char* name);
 
-// Real wglSwapBuffers, resolved once at load time -- what our own exported
-// wglSwapBuffers calls through to after the capture hook runs.
-using PFN_wglSwapBuffers = int(__stdcall*)(void* hdc);
-PFN_wglSwapBuffers realSwapBuffers();
-
-// The current process's id, cached once -- used to name this producer's
-// shared ring textures (see ipc/frame_protocol.hpp's sharedTextureName()).
+// The current process's id, cached once.
 unsigned long currentProducerPid();
+
+// Appends one timestamped line to %TEMP%\gmix_proxy_debug.log. This DLL runs
+// inside an arbitrary GUI process (no console), so this is the only way to
+// see what it's doing.
+void debugLog(const char* fmt, ...);
 
 } // namespace gmix::proxy
