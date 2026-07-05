@@ -59,15 +59,23 @@ README can promise on your behalf.)
 ## How it fits together
 
 ```
-osu! (Vulkan) -> GMix capture layer (VkLayer_GMIX) -> IPC -> obs-gmix-source
-   plugin (headless Vulkan blend, async compute) -> dma-buf export/import
-   -> OBS renders it directly ("GMix Motion Blur" source)
+osu! (Vulkan) -> GMix capture layer (VkLayer_GMIX) -> IPC (dma-buf handoff,
+   zero-copy) -> obs-gmix-source plugin (headless Vulkan blend, async
+   compute, velocity-aware motion blur) -> dma-buf export/import
+   -> OBS renders it directly ("GMix Motion Blur" source, paced by OBS's
+   own render loop -- gmix has no output clock of its own)
 ```
 
 There is no standalone "gmix window" or virtual camera anymore -- GMix runs
 *inside* OBS. The `gmix` CLI binary that remains is just a small setup/debug
 utility (installs the capture layer, lists GPUs, a debug IPC client) — it
 has no capture loop or output sink of its own.
+
+For the full stage-by-stage version of this diagram (with actual filenames
+at each step), plus a complete map of every file/socket/directory GMix
+touches at runtime and who reads/writes it — the reference to reach for if
+a setup is misbehaving and you need to know which piece to look at — see
+[`etc/PIPELINE.md`](etc/PIPELINE.md).
 
 ## System requirements
 
@@ -162,35 +170,43 @@ Finding the Flatpak OBS's `OBS_INCLUDE_DIR`:
 ## Blur settings
 
 The plugin has exactly one blend mode: velocity-aware ("optical awareness")
-motion blur -- estimates a per-pixel motion direction each frame (a small
-windowed Lucas-Kanade optical flow, more stable at low velocities than a
-single-pixel estimate) and smears real captured pixels along it, oversampling
-along that direction (dense overlapping taps) and averaging them so the
-taps' footprints tile into one continuous, energy-conserving streak (closer
-to a real camera-shutter motion blur) instead of a row of separate ghost
-copies or an artificially brightened one. (Earlier versions offered several
-Flat/Linear/Cinematic/Heavy weighted-average presets alongside this; removed
-2026-07-03 to simplify down to the one mode actually in use -- see
-`etc/DEV_NOTES.md` if you need that history.)
+motion blur -- estimates a per-pixel motion vector for **each real captured
+frame individually** (a windowed Lucas-Kanade optical flow between every
+consecutive pair of real frames, not just one global estimate) and smears
+that frame's pixels along its own local motion, oversampling along that
+direction (dense overlapping taps) and averaging them so the taps' footprints
+tile into one continuous, energy-conserving streak (closer to a real
+camera-shutter motion blur) instead of a row of separate ghost copies or an
+artificially brightened one. Per-frame estimates are smoothed against their
+neighbors and gated by a corner-detection check (only trust the estimate
+where the local image actually constrains a 2D direction, e.g. the cursor
+sprite — not a bare edge/line, which is the classic optical-flow "aperture
+problem" and was a real source of artifacts before this check existed) — see
+`etc/DEV_NOTES.md` for the full history of why the shader looks the way it
+does. (Earlier versions offered several Flat/Linear/Cinematic/Heavy
+weighted-average presets alongside this; removed 2026-07-03 to simplify down
+to the one mode actually in use.)
 
 Set from the "GMix Motion Blur" source's Properties dialog in OBS, saved
 with your scene collection:
 
-- **Blur density** (4-32) — taps per real frame along the motion direction;
-  higher packs the streak denser (and smoother — this is the oversampling
-  rate, and also what keeps small/fast content like the cursor from visibly
-  fading into the average). Live-tested at density=32: no frame drops,
-  overall performance impact ~3-5% or less.
+- **Blur density** (4-64) — the CEILING on taps per real frame along that
+  frame's own motion direction; higher allows a denser streak for genuinely
+  fast motion. The shader caps the taps it actually spends per pixel to that
+  pixel's real local displacement (near-static content costs ~1 tap
+  regardless of this slider), so raising the ceiling only costs GPU time
+  where there's real fast motion to resolve, not across the whole frame —
+  live-tested at density=64 with no framerate regression.
 - **Blur brightness** (0.1-10, default **1.3**) — exposure boost applied
   ONLY where real motion was detected (gated by the estimated per-pixel
   motion magnitude), so it brightens/dims the trail without touching
   static, non-moving parts of the scene. 1.0 is neutral (pure average, no
-  boost) but tested visibly under-bright live; 1.5 tested best for in-game
-  motion but too bright on menu screens (mostly static content, but still
-  enough moving UI to trigger the boost) — no single value suits both, so
-  1.3 is the default and the slider is there to tune per what you're
-  capturing. The max of 10 is left in deliberately as a "how absurd can it
-  get" option, not a serious setting.
+  boost) and, with the per-frame motion estimation above actually filling
+  in the trail properly, is now a perfectly usable default rather than
+  visibly under-bright — tune it up if you want a hotter/more visible trail.
+  The max of 10 is left in deliberately as a "how absurd can it get" option
+  (confirmed live: it blows out the trail hard enough to hurt your OWN
+  in-game visibility/accuracy, not a serious setting for real use).
 
 Both sliders apply **live** to whatever's currently running — no need to
 remove/re-add a source to see a change take effect.

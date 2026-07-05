@@ -19,9 +19,12 @@ namespace gmix {
 
 struct BlendConfig {
     // "Blur density" in the OBS properties UI: taps per real frame along the
-    // estimated motion direction. 4..32 -- higher packs the directional
-    // streak denser at proportionally higher GPU cost. Matches
-    // BlendEngine::ResampleParams::subSamples.
+    // estimated motion direction. 4..64 -- higher packs the directional
+    // streak denser, but the shader (resample_blur.comp) only ever spends
+    // taps proportional to actual per-pixel motion (capped at
+    // min(blurDensity, ceil(motionPx)+1)), so raising the ceiling only costs
+    // more where there's genuinely fast motion to resolve, not on the
+    // static majority of the frame. Matches BlendEngine::ResampleParams::subSamples.
     uint32_t blurDensity     = 4;
     // "Blur brightness" in the OBS properties UI: a motion-gated exposure
     // boost on the trail (resample_blur.comp's `shutterStrength` -- see that

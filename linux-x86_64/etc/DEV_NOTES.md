@@ -15,6 +15,104 @@ fail when it had simply never been installed. Always re-copy (and restart
 OBS, since it's not running) after rebuilding, before drawing any conclusion
 from in-OBS behavior.
 
+## ADDED (2026-07-05): per-frame-pair Lucas-Kanade + Shi-Tomasi trust check — the live-stream test's fixes
+
+Branch `optical-flow-lucas-kanade` had already been used in a real live
+stream (see the end of this file's `optical-flow-lucas-kanade` entries
+below for that setup). The stream worked but surfaced real quality/perf
+issues at the settings the user actually wanted to run (Blur density
+maxed, Blur brightness pushed up to compensate for a trail that faded too
+fast) — this entry is the chain of fixes from investigating those, all in
+`shaders/resample_blur.comp` unless noted, all shader-only (no `.so`
+rebuild/reinstall needed, only `build/shaders/resample_blur.spv`).
+
+1. **In-game stutter at maxed density.** The tap loop always ran the full
+   `subSamples` (up to 32) per real frame per pixel, even for pixels with
+   zero motion — a static pixel's taps all round to the same integer texel,
+   so most of that work was pure duplication. Fix: cap actual taps spent
+   per pixel to `(vlen < 1.0) ? 1 : min(subSamples, ceil(vlen)+1)` — exact
+   for static content (duplicate taps are literally redundant reads),
+   close for moving content (still spans the same range, just without the
+   redundant duplicates). Confirmed live: stutter fixed.
+2. **Raised the "Blur density" UI ceiling 32 → 64** (`gmix_source.cpp` +
+   `BlendConfig.hpp`) — safe to raise now that (1) means the ceiling only
+   costs GPU time where there's real fast motion, not across the whole
+   frame. This alone didn't close the gap to the reference video the user
+   was comparing against, though — see next.
+3. **Discrete-blob trail, root cause.** Even at density=64 the trail showed
+   visibly separated blobs instead of one continuous streak on part of a
+   fast jump. Root cause: the shader estimated ONE motion vector from the
+   newest real-frame pair (indices 0,1) and reused it to fill every OTHER
+   real frame's gap — assuming constant velocity across the whole ~16-17
+   frame shutter window. Real cursor motion in an osu! "jump" accelerates
+   then decelerates; if the newest pair happens to capture the slow part
+   (near landing), that small vector under-fills the gap left by the
+   faster, earlier part of the swing. Fix: estimate velocity PER
+   CONSECUTIVE REAL-FRAME PAIR `(i, i+1)` instead of once globally, so each
+   real frame fills its own actual gap. Kept cheap by computing the spatial
+   gradient (Ix, Iy) once from the newest frame and reusing it as the
+   shared LHS for every pair's normal equations — only the temporal term is
+   recomputed per pair. Also added a cheap whole-window luma-range gate
+   (no-window, n reads) so pixels that never change across ANY real frame
+   skip the expensive per-pair analysis entirely (most of a typical
+   frame — background, HUD). Confirmed live: trail continuity fixed, dense
+   enough that brightness could come back down toward neutral.
+4. **New artifact: misaligned-blob "weird cursor."** Each per-pair estimate
+   from (3) is independent, with no consistency check against its
+   neighbors — where the local signal is weak, direction/magnitude jitters
+   frame-to-frame (noise), scattering that frame range's taps into
+   misaligned clumps. Real motion is physically continuous; noise isn't.
+   Fix: a 3-tap boxcar temporal smoothing pass over neighboring `pairV[i]`
+   entries (`pairVSmooth[]`), boundary-aware. Live test found this
+   insufficient for a brief (couple-frame) pause/redirect mid-swing — still
+   read as near-zero after only 3-tap smoothing and snapped to a bare sharp
+   tap, standing out as a bright "ghost cursor" since it wasn't diluted the
+   way blended taps are. Widened to 5-tap (`i-2..i+2`); a genuinely
+   sustained stop still correctly comes out near-zero since its wider
+   neighborhood is near-zero too.
+5. **Regression: dark edge fringing on EVERYTHING static, including
+   non-gameplay content (osu!'s song-select menu).** The per-pair solve's
+   only safety check was `abs(det) > 1e-6` — rejects a window flat in BOTH
+   directions, but NOT the classic aperture-problem case of a thin
+   edge/text stroke (strong gradient along the edge, ~zero across it),
+   which is everywhere in any UI and passes that bare check trivially.
+   Solving there is numerically unstable: tiny capture noise/dithering in
+   the temporal term gets divided by a near-zero minor axis and amplified
+   into a large, spurious velocity. The ORIGINAL single-global-vector code
+   (pre-2026-07-05) had this exact same weak check and was equally
+   susceptible — it just produced one noisy estimate per pixel per
+   dispatch, easy to miss as an occasional flicker. Averaging ~16
+   independent noisy per-pair estimates together (item 3) plus smoothing
+   them (item 4) turned that into a *consistent* bogus direction instead of
+   cancelling as random noise, which is what made it a session-breaking
+   global regression instead of a rare flicker. Fix: replaced the bare
+   `det` check with a proper Shi-Tomasi "good feature to track" criterion —
+   the structure tensor's smaller eigenvalue
+   (`minEig = 0.5*(trace - sqrt(trace^2 - 4*det))`) must clear a floor
+   (`5e-3`, a first guess, not further tuned) before ANY pair's velocity
+   solve is trusted for that pixel; below it, every pair is forced to
+   `vec2(0)` and the inner 9-tap temporal-term loop is skipped entirely too
+   (a free efficiency win alongside the correctness fix). Requires the
+   window to constrain motion in BOTH directions (a real corner/textured
+   blob like the cursor sprite), not just one (an edge/line — now correctly
+   falls back to a flat, sharp, no-blur tap).
+
+**Confirmed live after all five fixes**: user's verdict was "now is rival
+danser quality" — continuous trail, no edge fringing (checked beyond just
+gameplay), brightness slider meaningful again across its full range
+including the intentionally-absurd 10.0 (which blows out the trail hard
+enough to hurt the user's OWN in-game visibility, not a GPU/framerate
+issue). No outstanding known defects in the Advanced blend path as of this
+entry.
+
+**If picking this up again and something looks wrong in the trail**: this
+is now a tightly coupled chain (tap cap ↔ smoothing width ↔ eigenvalue
+floor) — re-read this whole entry before changing any one piece in
+isolation, since each fix exists to correct a symptom the previous one
+exposed. The two numeric constants most likely to need live retuning if a
+future test surfaces something new: the Shi-Tomasi floor (`5e-3`) and the
+smoothing window width (currently 5-tap).
+
 ## CHANGED (2026-07-03, sixteenth): plugin stripped down to Advanced-only, fixed Latency mode, no more preset/latency config files
 
 After fifteen rounds of live testing/fixing the Advanced preset and the

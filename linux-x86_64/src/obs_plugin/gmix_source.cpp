@@ -920,7 +920,7 @@ void applyBlendConfigFromSettings(obs_data_t* settings) {
     if (!gEngine) return;
     gmix::BlendConfig cfg;
     cfg.blurDensity = static_cast<uint32_t>(
-        std::clamp<long long>(obs_data_get_int(settings, kSettingBlurDensity), 4, 32));
+        std::clamp<long long>(obs_data_get_int(settings, kSettingBlurDensity), 4, 64));
     cfg.shutterStrength = static_cast<float>(
         std::clamp(obs_data_get_double(settings, kSettingBrightness), 0.1, 10.0));
     std::lock_guard<std::mutex> lk2(gEngine->blendConfigMu);
@@ -969,7 +969,7 @@ obs_properties_t* gmixGetProperties(void*) {
     obs_property_set_modified_callback2(gpuIndex, gmixGpuIndexModified, nullptr);
 
     obs_property_t* density = obs_properties_add_int_slider(props, kSettingBlurDensity,
-                                  "Blur density (oversampling taps/frame)", 4, 32, 1);
+                                  "Blur density (oversampling taps/frame)", 4, 64, 1);
     obs_property_set_modified_callback2(density, gmixDensityModified, nullptr);
     obs_property_t* brightness = obs_properties_add_float_slider(props, kSettingBrightness,
                                     "Blur brightness (trail exposure)", 0.1, 10.0, 0.1);
