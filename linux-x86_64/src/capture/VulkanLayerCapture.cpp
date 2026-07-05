@@ -4,10 +4,7 @@
 #include <unordered_set>
 #include <fstream>
 #include <chrono>
-#include <iomanip>
 #include <filesystem>
-#include <ctime>
-#include <sstream>
 #include <unistd.h>
 #include "LayerIpc.hpp"
 #include "../ipc/frame_sender.hpp"
@@ -202,40 +199,20 @@ bool VulkanLayerCapture::onQueuePresent(VkQueue queue, VkPresentInfoKHR* pPresen
     if (!active_) return false;
     if (trackedQueues_.find(queue) == trackedQueues_.end()) return false;
     ++presentCount_;
-    std::fprintf(stderr, "VkLayer_GMIX: target process '%s' present #%llu on queue %p\n",
-                 targetProcess_.c_str(), static_cast<unsigned long long>(presentCount_),
-                 static_cast<void*>(queue));
 
-    // Append a human-readable present record to ~/.cache/gmix/presents.log for
-    // quick testing and verification.
-    try {
-        const char* home = std::getenv("HOME");
-        if (home) {
-            std::filesystem::path cacheDir = std::filesystem::path(home) / ".cache" / "gmix";
-            std::error_code ec;
-            std::filesystem::create_directories(cacheDir, ec);
-            std::filesystem::path logPath = cacheDir / "presents.log";
-            std::ofstream out(logPath, std::ios::app);
-            if (out) {
-                auto now = std::chrono::system_clock::now();
-                std::time_t t = std::chrono::system_clock::to_time_t(now);
-                out << std::put_time(std::localtime(&t), "%Y-%m-%d %H:%M:%S")
-                    << " present#" << presentCount_ << " queue=" << queue;
-                if (pPresentInfo) {
-                    out << " swapchains=" << pPresentInfo->swapchainCount << " indices=[";
-                    for (uint32_t i = 0; i < pPresentInfo->swapchainCount; ++i) {
-                        if (i) out << ",";
-                        out << pPresentInfo->pImageIndices[i];
-                    }
-                    out << "]";
-                }
-                out << "\n";
-                out.close();
-            }
-        }
-    } catch (...) {
-        // Don't let logging failures break the layer.
-    }
+    // This used to unconditionally fprintf(stderr, ...) AND open/append/close
+    // ~/.cache/gmix/presents.log on EVERY present -- i.e. hundreds to 1000+
+    // times a second, entirely synchronous, inside the game's own present
+    // thread (this function runs as part of the hooked vkQueuePresentKHR,
+    // before the real present proceeds). That's real, blocking disk I/O and
+    // syscall overhead stalling the game on every frame, independent of any
+    // GPU/compute cost -- confirmed as a live cause of osu! stutter, and the
+    // debug log file itself had silently grown to 5+ GB from being left on
+    // permanently since it was added for one-off "quick testing and
+    // verification". Removed entirely; the one diagnostic worth keeping
+    // (the consumer's blend pipeline actually falling behind and dropping
+    // frames) is logged instead, rate-limited, from where that actually
+    // happens -- see the drop branch in gmix_source.cpp's receiverThreadFn().
 
     maybeExportFrame(queue, pPresentInfo);
     return true;

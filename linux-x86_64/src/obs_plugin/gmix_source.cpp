@@ -224,6 +224,8 @@ void receiverThreadFn(gmix::ipc::FrameReceiver& receiver, gmix::VulkanContext& v
                       gmix::SemaphorePool& semPool,
                       RateTracker& producerRate, RateTracker& consumerRate) {
     gmix::ipc::RecvFrame rf{};
+    uint64_t droppedSinceLog = 0;
+    auto lastDropLog = std::chrono::steady_clock::now() - std::chrono::seconds(10);
     while (receiver.recvFrame(rf)) {
         // Ticked here, before the drop-check below: this is every frame the
         // capture layer actually sent, i.e. the producer/game's real export
@@ -232,6 +234,26 @@ void receiverThreadFn(gmix::ipc::FrameReceiver& receiver, gmix::VulkanContext& v
         if (receiver.hasPendingFrame()) {
             if (rf.memFd >= 0) ::close(rf.memFd);
             if (rf.semFd >= 0) ::close(rf.semFd);
+            // This is the one drop path worth logging (see
+            // VulkanLayerCapture::onQueuePresent()'s comment for the
+            // per-present logging this replaced): the blend pipeline is
+            // genuinely falling behind the capture rate and discarding
+            // backlogged frames. Rate-limited to once per ~2s (with a
+            // running count since the last log) so a sustained overload
+            // doesn't itself become a logging-hot-path problem the way the
+            // removed per-present logging was.
+            ++droppedSinceLog;
+            auto now = std::chrono::steady_clock::now();
+            if (now - lastDropLog >= std::chrono::seconds(2)) {
+                blog(LOG_WARNING,
+                     "gmix: blend buffer overload -- dropped %llu backlogged frame(s) in the "
+                     "last ~2s (producer=%.1ffps consumer=%.1ffps); the blend pipeline can't "
+                     "keep up with the capture rate",
+                     static_cast<unsigned long long>(droppedSinceLog),
+                     producerRate.fps(), consumerRate.fps());
+                droppedSinceLog = 0;
+                lastDropLog = now;
+            }
             continue;
         }
         auto img = pool.acquire(vk, rf.header.exportSlot, rf.memFd,
