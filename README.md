@@ -6,4 +6,8 @@ kernel module). See platform subfolders for build/setup instructions:
 
 - [`linux-x86_64/`](linux-x86_64/README.md) — Linux (Vulkan capture layer +
   OBS plugin via dma-buf). Working end-to-end.
-- [`WIN32/`](WIN32/README.md) — Windows port. Not started yet.
+- [`WIN32/`](WIN32/README.md) — Windows port. **Not coming soon** — blocked
+  on the developer's own hardware/driver setup (no Windows machine with a
+  suitable GPU/driver combo to build and test the Vulkan capture + zero-copy
+  path against), not a decision against Windows itself. GMix is
+  Linux-exclusive for now.

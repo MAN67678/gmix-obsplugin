@@ -108,8 +108,13 @@ a setup is misbehaving and you need to know which piece to look at — see
   bundled `libobs` exposes `gs_texture_create_from_dmabuf` — OBS 27+ —
   should work).
 
-**Windows:** not yet ported — spec will be listed in `../WIN32/README.md`
-once that happens.
+**Windows:** not coming soon. A `../WIN32/` folder exists as a placeholder
+for a future port, but there's no active work on it and no timeline — the
+blocker is the developer's own hardware/driver setup (no Windows machine
+with the right GPU/driver combo to build and test the Vulkan capture +
+zero-copy dma-buf path against), not a design decision against Windows
+itself. For now, GMix is Linux-exclusive; that'll be revisited if/when the
+hardware situation changes.
 
 ## Dependencies
 
