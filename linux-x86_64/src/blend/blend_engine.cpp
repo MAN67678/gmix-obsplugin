@@ -15,19 +15,13 @@ namespace gmix {
 
 namespace {
 
-// Push-constant block mirrored from shaders/blend.comp. Only 12 bytes —
-// weights moved to a UBO (32 floats overflow the 128-byte PC minimum).
+// Push-constant block mirrored from shaders/resample_blur.comp.
 struct alignas(4) PushConstants {
     uint32_t frameCount;
     uint32_t frameW;
     uint32_t frameH;
-    // Resample-path (resample_blur.comp) fields. blend.comp's own PC block
-    // only declares the first three, but a shorter shader-side PC struct is
-    // fine within the same pipeline layout's push-constant range -- these are
-    // simply never read on the plain path.
     uint32_t subSamples;
     float    shutterStrength;
-    float    falloff;
     float    texelSizeX;
     float    texelSizeY;
 };
@@ -58,9 +52,7 @@ uint32_t findMemoryType(VkPhysicalDevice phys, uint32_t typeBits,
 
 } // namespace
 
-BlendEngine::BlendEngine(VulkanContext& vk) : vk_(vk) {
-    for (auto& fd : dmaBufFd_) fd = -1;
-}
+BlendEngine::BlendEngine(VulkanContext& vk) : vk_(vk) {}
 
 BlendEngine::~BlendEngine() {
     destroyAll();
@@ -74,11 +66,10 @@ BlendEngine::~BlendEngine() {
 void BlendEngine::destroyAll() {
     VkDevice dev = vk_.device();
     if (dev == VK_NULL_HANDLE) return;
-    if (weightsMapped_) { vkUnmapMemory(dev, weightsMem_); weightsMapped_ = nullptr; }
     if (blendTimeline_) { vkDestroySemaphore(dev, blendTimeline_, nullptr); blendTimeline_ = VK_NULL_HANDLE; }
     blendValue_ = inFlightValue_ = frontValue_ = 0;
     if (dstSampler_)    { vkDestroySampler(dev, dstSampler_, nullptr); dstSampler_ = VK_NULL_HANDLE; }
-    for (uint32_t i = 0; i < kDstBuffers; ++i) {
+    for (uint32_t i = 0; i < dstImage_.size(); ++i) {
         if (dstView_[i])  { vkDestroyImageView(dev, dstView_[i], nullptr); dstView_[i] = VK_NULL_HANDLE; }
         if (dstImage_[i]) { vkDestroyImage(dev, dstImage_[i], nullptr); dstImage_[i] = VK_NULL_HANDLE; }
         if (dstMem_[i])   { vkFreeMemory(dev, dstMem_[i], nullptr); dstMem_[i] = VK_NULL_HANDLE; }
@@ -87,8 +78,6 @@ void BlendEngine::destroyAll() {
         dmaBufOffset_[i] = 0;
     }
     dmaBufCapable_ = false;
-    if (weightsBuf_)    { vkDestroyBuffer(dev, weightsBuf_, nullptr); weightsBuf_ = VK_NULL_HANDLE; }
-    if (weightsMem_)    { vkFreeMemory(dev, weightsMem_, nullptr); weightsMem_ = VK_NULL_HANDLE; }
     // cmd_ is freed implicitly with its pool.
     cmd_ = VK_NULL_HANDLE;
     blendInFlight_ = false;
@@ -100,22 +89,27 @@ void BlendEngine::destroyAll() {
 void BlendEngine::destroyTransient() {
     VkDevice dev = vk_.device();
     if (dev == VK_NULL_HANDLE) return;
-    if (pipeline_)         vkDestroyPipeline(dev, pipeline_, nullptr);
-    if (resamplePipeline_) vkDestroyPipeline(dev, resamplePipeline_, nullptr);
+    if (pipeline_)   vkDestroyPipeline(dev, pipeline_, nullptr);
     if (pipeLayout_) vkDestroyPipelineLayout(dev, pipeLayout_, nullptr);
     if (dsLayout_)   vkDestroyDescriptorSetLayout(dev, dsLayout_, nullptr);
     if (descPool_)   vkDestroyDescriptorPool(dev, descPool_, nullptr);
     pipeline_   = VK_NULL_HANDLE;
-    resamplePipeline_ = VK_NULL_HANDLE;
     pipeLayout_ = VK_NULL_HANDLE;
     dsLayout_   = VK_NULL_HANDLE;
     descPool_   = VK_NULL_HANDLE;
     descSet_    = VK_NULL_HANDLE;
 }
 
-bool BlendEngine::init(uint32_t w, uint32_t h) {
+bool BlendEngine::init(uint32_t w, uint32_t h, uint32_t dstBufferCount) {
     if (initialized_) destroyAll();
     width_ = w; height_ = h;
+    // Clamp defensively (an out-of-range OBS setting shouldn't be able to
+    // undersize the round-robin or blow past a sane VRAM ceiling); fixed for
+    // this engine's lifetime once the first init() picks it, matching
+    // gpuIndex's precedent -- see the header comment on init()/dstBufferCount().
+    numDstBuffers_ = dstBufferCount < kMinDstBuffers ? kMinDstBuffers
+                    : dstBufferCount > kMaxDstBuffers ? kMaxDstBuffers
+                    : dstBufferCount;
 
     VkDevice dev = vk_.device();
 
@@ -225,10 +219,23 @@ bool BlendEngine::createDstImage() {
         ici.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
     }
 
-    // Two dst buffers (front/back) for the pipelined present path; each is an
-    // independent storage-image render target the blend writes and the
-    // presenter blits from.
-    for (uint32_t i = 0; i < kDstBuffers; ++i) {
+    // Resize to numDstBuffers_ (the "Latency mode" setting) BEFORE the loop
+    // below populates them -- dmaBufFd_ specifically must default to -1 per
+    // slot, not the vector's normal zero-value default (0 looks like a valid
+    // fd), so it's filled explicitly rather than left at std::vector<int>'s
+    // default-constructed 0.
+    dstImage_.assign(numDstBuffers_, VK_NULL_HANDLE);
+    dstMem_.assign(numDstBuffers_, VK_NULL_HANDLE);
+    dstView_.assign(numDstBuffers_, VK_NULL_HANDLE);
+    dmaBufFd_.assign(numDstBuffers_, -1);
+    dmaBufStride_.assign(numDstBuffers_, 0);
+    dmaBufOffset_.assign(numDstBuffers_, 0);
+
+    // `numDstBuffers_` dst buffers (front/back/... per the chosen latency
+    // mode) for the pipelined present path; each is an independent
+    // storage-image render target the blend writes and the presenter blits
+    // from.
+    for (uint32_t i = 0; i < numDstBuffers_; ++i) {
         if (vkCreateImage(dev, &ici, nullptr, &dstImage_[i]) != VK_SUCCESS) {
             std::fprintf(stderr, "gmix: blend: dst image create failed\n");
             return false;
@@ -314,9 +321,11 @@ bool BlendEngine::createDescriptorSet() {
     // only write srcCount slots per dispatch; unused bindings stay valid
     // (VK_NULL_HANDLE images are never read because the shader loop is bounded
     // by frameCount in push constants). Avoids the descriptor-indexing feature.
-    // Binding 1: dstImage (storage image).
-    // Binding 2: weights UBO.
-    VkDescriptorSetLayoutBinding b[3]{};
+    // Binding 1: dstImage (storage image). (Binding 2, a weights SSBO, was
+    // removed 2026-07-03 along with the plain weighted-average blend path --
+    // resample_blur.comp's only remaining "weighting" is the motion-gated
+    // brightness boost, driven by push constants, not a buffer.)
+    VkDescriptorSetLayoutBinding b[2]{};
     b[0].binding = 0;
     b[0].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
     b[0].descriptorCount = kMaxBlendFrames;
@@ -325,30 +334,24 @@ bool BlendEngine::createDescriptorSet() {
     b[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
     b[1].descriptorCount = 1;
     b[1].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
-    b[2].binding = 2;
-    b[2].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-    b[2].descriptorCount = 1;
-    b[2].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
 
     VkDescriptorSetLayoutCreateInfo lci{};
     lci.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-    lci.bindingCount = 3;
+    lci.bindingCount = 2;
     lci.pBindings = b;
     if (vkCreateDescriptorSetLayout(dev, &lci, nullptr, &dsLayout_) != VK_SUCCESS) {
         std::fprintf(stderr, "gmix: blend: dsLayout failed\n");
         return false;
     }
 
-    VkDescriptorPoolSize ps[2]{};
+    VkDescriptorPoolSize ps[1]{};
     ps[0].type = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
     ps[0].descriptorCount = kMaxBlendFrames + 1;
-    ps[1].type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-    ps[1].descriptorCount = 1;
 
     VkDescriptorPoolCreateInfo ppi{};
     ppi.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
     ppi.maxSets = 1;
-    ppi.poolSizeCount = 2;
+    ppi.poolSizeCount = 1;
     ppi.pPoolSizes = ps;
     if (vkCreateDescriptorPool(dev, &ppi, nullptr, &descPool_) != VK_SUCCESS) {
         std::fprintf(stderr, "gmix: blend: descPool failed\n");
@@ -364,55 +367,6 @@ bool BlendEngine::createDescriptorSet() {
         std::fprintf(stderr, "gmix: blend: descSet alloc failed\n");
         return false;
     }
-
-    // ── Weights buffer: persistently mapped, host-visible + coherent ────────
-    VkBufferCreateInfo bci{};
-    bci.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
-    bci.size = sizeof(float) * kMaxBlendFrames;
-    bci.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
-    bci.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
-    if (vkCreateBuffer(dev, &bci, nullptr, &weightsBuf_) != VK_SUCCESS) {
-        std::fprintf(stderr, "gmix: blend: weights buf failed\n");
-        return false;
-    }
-    VkMemoryRequirements mr{};
-    vkGetBufferMemoryRequirements(dev, weightsBuf_, &mr);
-    uint32_t memType = findMemoryType(vk_.physicalDevice(), mr.memoryTypeBits,
-                                      VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
-                                      VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
-    if (memType == ~0u) {
-        std::fprintf(stderr, "gmix: blend: no host-visible mem type\n");
-        return false;
-    }
-    VkMemoryAllocateInfo mai{};
-    mai.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
-    mai.allocationSize = mr.size;
-    mai.memoryTypeIndex = memType;
-    if (vkAllocateMemory(dev, &mai, nullptr, &weightsMem_) != VK_SUCCESS) {
-        std::fprintf(stderr, "gmix: blend: weights mem failed\n");
-        return false;
-    }
-    vkBindBufferMemory(dev, weightsBuf_, weightsMem_, 0);
-    if (vkMapMemory(dev, weightsMem_, 0, VK_WHOLE_SIZE, 0,
-                    reinterpret_cast<void**>(&weightsMapped_)) != VK_SUCCESS) {
-        std::fprintf(stderr, "gmix: blend: weights map failed\n");
-        return false;
-    }
-    std::memset(weightsMapped_, 0, sizeof(float) * kMaxBlendFrames);
-
-    // Bind the weights SSBO to the descriptor set once (persistent).
-    VkDescriptorBufferInfo wbi{};
-    wbi.buffer = weightsBuf_;
-    wbi.offset = 0;
-    wbi.range  = sizeof(float) * kMaxBlendFrames;
-    VkWriteDescriptorSet wWrite{};
-    wWrite.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-    wWrite.dstSet = descSet_;
-    wWrite.dstBinding = 2;
-    wWrite.descriptorCount = 1;
-    wWrite.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-    wWrite.pBufferInfo = &wbi;
-    vkUpdateDescriptorSets(dev, 1, &wWrite, 0, nullptr);
 
     return true;
 }
@@ -471,57 +425,42 @@ bool BlendEngine::createPipeline() {
     };
 
     // GMIX_SHADER_DIR is the build/shaders directory, set via a compile def.
-    pipeline_ = buildPipeline(GMIX_SHADER_DIR "/blend.spv");
-    if (pipeline_ == VK_NULL_HANDLE) return false;   // plain path is required
-
-    // Velocity-aware path (the 'Advanced' preset) is OPTIONAL: if its SPIR-V
-    // is missing/invalid, dispatchAsync() with resample.enabled just falls
-    // back to the plain pipeline rather than failing init().
-    resamplePipeline_ = buildPipeline(GMIX_SHADER_DIR "/resample_blur.spv");
-    if (resamplePipeline_ == VK_NULL_HANDLE) {
-        std::fprintf(stderr, "gmix: blend: resample_blur unavailable, 'Advanced' "
-                             "preset will fall back to the plain blend\n");
-    }
+    // resample_blur.comp is the ONLY blend pipeline now (required, not an
+    // optional fallback-capable alternative to a plain-average default --
+    // that plain path/blend.comp was removed 2026-07-03 along with the
+    // preset selector).
+    pipeline_ = buildPipeline(GMIX_SHADER_DIR "/resample_blur.spv");
+    if (pipeline_ == VK_NULL_HANDLE) return false;
     return true;
 }
 
-VkImageView BlendEngine::dispatch(VkImageView* srcViews, const float* weights,
-                                  uint32_t srcCount) {
+VkImageView BlendEngine::dispatch(VkImageView* srcViews, uint32_t srcCount,
+                                  ResampleParams resample) {
     // Synchronous wrapper (tests / readback): kick the async blend into buffer
     // 0 and block until it finishes.
-    if (!dispatchAsync(srcViews, weights, srcCount, 0))
+    if (!dispatchAsync(srcViews, srcCount, 0, nullptr, nullptr, 0, resample))
         return VK_NULL_HANDLE;
     waitBlendDone();
     return dstView_[0];
 }
 
-bool BlendEngine::dispatchAsync(VkImageView* srcViews, const float* weights,
-                                uint32_t srcCount, uint32_t dstIdx,
+bool BlendEngine::dispatchAsync(VkImageView* srcViews, uint32_t srcCount, uint32_t dstIdx,
                                 const VkSemaphore* waitSems, const uint64_t* waitVals,
                                 uint32_t waitCount, ResampleParams resample) {
     if (!initialized_) return false;
     if (srcCount == 0 || srcCount > (uint32_t)kMaxBlendFrames) return false;
-    if (dstIdx >= kDstBuffers) return false;
+    if (dstIdx >= numDstBuffers_) return false;
     // Caller contract: the previous blend must have completed (single fence +
     // single command buffer), so we never reset state still in GPU use.
 
-    // Use the velocity-aware pipeline only when requested AND available;
-    // otherwise fall back to the plain weighted blend.
-    const bool useResample = resample.enabled && resamplePipeline_ != VK_NULL_HANDLE;
-    VkPipeline activePipeline = useResample ? resamplePipeline_ : pipeline_;
-
     VkDevice dev = vk_.device();
-
-    // ── Push weights into the mapped UBO ────────────────────────────────────
-    std::memcpy(weightsMapped_, weights, sizeof(float) * srcCount);
 
     // ── Update descriptor set with the current srcViews + dst ───────────────
     // We declare MAX_FRAMES slots at binding 0 but only use srcCount of them
     // per dispatch. The shader loop is bounded by frameCount, so unused slots
     // are never read — but the validation layer can't prove that statically,
     // so we fill every unused slot with the first valid view to keep the
-    // descriptors technically "valid". Reading them would just re-add frame 0
-    // weighted by 0 (weights[i]=0 for i>=srcCount), contributing nothing.
+    // descriptors technically "valid".
     std::vector<VkDescriptorImageInfo> srcInfos(kMaxBlendFrames);
     for (uint32_t i = 0; i < kMaxBlendFrames; ++i) {
         srcInfos[i].sampler = VK_NULL_HANDLE;
@@ -568,7 +507,7 @@ bool BlendEngine::dispatchAsync(VkImageView* srcViews, const float* weights,
                          VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0,
                          0, nullptr, 0, nullptr, 1, &dstBar);
 
-    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, activePipeline);
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline_);
     vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipeLayout_,
                             0, 1, &descSet_, 0, nullptr);
 
@@ -578,7 +517,6 @@ bool BlendEngine::dispatchAsync(VkImageView* srcViews, const float* weights,
     pc.frameH = height_;
     pc.subSamples = resample.subSamples;
     pc.shutterStrength = resample.shutterStrength;
-    pc.falloff = resample.falloff;
     pc.texelSizeX = width_  ? 1.0f / static_cast<float>(width_)  : 0.0f;
     pc.texelSizeY = height_ ? 1.0f / static_cast<float>(height_) : 0.0f;
     vkCmdPushConstants(cmd, pipeLayout_, VK_SHADER_STAGE_COMPUTE_BIT,

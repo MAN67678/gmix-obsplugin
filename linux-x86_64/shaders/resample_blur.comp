@@ -15,15 +15,48 @@
 // frame, read at an offset position along the estimated motion vector. No
 // synthetic/interpolated frames are generated.
 //
-// Motion vector is estimated per-pixel via the gradient brightness-constancy
-// constraint (∇I·v + Iₜ = 0  →  v = -Iₜ ∇I / |∇I|²) from the newest frame
-// pair -- a cheap optical-flow proxy. Where there is no gradient or no
-// temporal change (static scene), v collapses to ~0 and the output reduces to
-// the latest frame (sharp, no trail).
+// Motion vector is estimated via Lucas-Kanade optical flow: the brightness-
+// constancy constraint (Ix*vx + Iy*vy + It = 0) is aggregated (least-squares)
+// over a small local window around each pixel. A SINGLE-POINT version of this
+// constraint (one pixel, no window) only recovers the flow component ALONG
+// the local gradient direction -- the classic aperture problem -- and is
+// dominated by per-pixel noise rather than real motion signal whenever the
+// temporal difference Iₜ is small, which is exactly the low-velocity case:
+// the noisier the estimate, the more erratic the trail direction, even
+// though visually nothing is really moving. Aggregating the constraint over
+// a window averages that noise out and gives a stable full 2D vector
+// wherever the window has enough local texture/structure to constrain it (a
+// real corner/edge, not a flat area). Where the window is too flat/uniform
+// to constrain a direction (the 2x2 normal-equations matrix is
+// near-singular) or there's no temporal change at all, v collapses to ~0 and
+// that frame's contribution reduces to a single sharp tap.
 //
-// `subSamples` ("blur density" in the OBS properties UI, 4..32) is the tap
-// count per real frame along the motion direction -- higher packs the
-// directional streak denser at proportionally higher GPU cost.
+// The velocity is estimated PER CONSECUTIVE REAL-FRAME PAIR (i, i+1), not
+// once from the newest pair and reused everywhere. An earlier version did
+// the latter, which assumes constant velocity across the whole shutter
+// window -- real motion (e.g. an osu! "jump": accelerate, then decelerate
+// into the next circle) isn't constant, so the newest pair's (often slower,
+// near the landing) velocity under-fills the gap left by the faster, earlier
+// part of the swing, producing a row of visibly separated blobs instead of
+// one continuous streak. Estimating each pair separately lets every real
+// frame fill ITS OWN actual gap regardless of how velocity varies across the
+// window. The spatial gradient (Ix, Iy) is computed once from the newest
+// frame and reused for every pair's normal equations (local structure
+// doesn't meaningfully change within one ~1/60s window) -- only the temporal
+// term genuinely differs per pair, so this only costs one extra small-window
+// pass per additional real frame, not a full recompute.
+//
+// A cheap gate gets skipped straight past all of the above for pixels whose
+// luma never changes across ANY of the real frames in the window (most of a
+// typical frame: background, HUD, static UI) -- a per-pair analysis on a
+// provably static pixel can only converge to "no motion" anyway, so there's
+// no point spending the window reads to prove it.
+//
+// `subSamples` ("blur density" in the OBS properties UI, 4..64) is the tap
+// count per real frame along that frame's own motion direction -- higher
+// packs the directional streak denser, capped per-frame to the actual local
+// pixel displacement (see effSS below) so cost tracks real motion, not just
+// the slider.
 // ─────────────────────────────────────────────────────────────────────────────
 
 #define MAX_FRAMES 64   // must match kMaxBlendFrames in src/gmix.hpp
@@ -33,21 +66,18 @@ layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
 layout(set = 0, binding = 0, rgba8) readonly  uniform image2D srcImages[MAX_FRAMES];
 layout(set = 0, binding = 1, rgba8) writeonly uniform image2D dstImage;
 
-// Binding 2 (weights SSBO) is part of the shared descriptor layout but unused
-// on this path -- recency weighting is computed in-shader from `falloff`.
-layout(scalar, set = 0, binding = 2) readonly buffer Weights {
-    float w[MAX_FRAMES];
-} weights;
-
-// Must match the C++ PushConstants layout (frameCount, frameW, frameH, then
-// the resample-only fields).
+// This is now the ONLY blend path (the plain weighted-average blend.comp
+// pipeline and its weights SSBO were removed once Advanced became the
+// plugin's only mode -- see DEV_NOTES 2026-07-03). Per-frame weighting is
+// flat (every real frame in the window counts equally); the only remaining
+// "weighting" is the motion-gated brightness boost below, driven directly by
+// push constants, not a buffer.
 layout(push_constant) uniform PC {
     uint  frameCount;
     uint  frameW;
     uint  frameH;
     uint  subSamples;       // taps per frame along the motion direction ("blur density")
-    float shutterStrength;  // how strongly bright pixels dominate the trail
-    float falloff;          // recency falloff exponent (higher = shorter trail)
+    float shutterStrength;  // trail exposure boost, gated by detected motion
     float texelSizeX;       // 1.0 / frameW (unused in integer-tap v1, reserved)
     float texelSizeY;
 } pc;
@@ -74,64 +104,181 @@ void main()
     uint n = pc.frameCount;
     if (n == 0u) { imageStore(dstImage, P, vec4(0,0,0,1)); return; }
 
-    // ── Per-pixel motion estimate from the newest frame pair ────────────────
-    vec2 v = vec2(0.0);
-    if (n >= 2u) {
-        float Ix = lumaAt(0u, P + ivec2(1,0), sz) - lumaAt(0u, P - ivec2(1,0), sz);
-        float Iy = lumaAt(0u, P + ivec2(0,1), sz) - lumaAt(0u, P - ivec2(0,1), sz);
-        float It = lumaAt(0u, P, sz) - lumaAt(1u, P, sz);
-        vec2  grad = vec2(Ix, Iy);
-        float gg = dot(grad, grad) + 1e-3;
-        v = -It * grad / gg;                       // pixels / frame
-        // Clamp so a degenerate estimate can't fling taps across the screen.
-        float maxLen = float(max(sz.x, sz.y)) / 8.0;
-        float len = length(v);
-        if (len > maxLen) v *= maxLen / len;
-    }
-
-    float vlen = length(v);
-    vec2  dir  = (vlen > 1e-4) ? (v / vlen) : vec2(0.0);
-
-    // ── Accumulate: each real frame smeared backward along motion ───────────
-    // Frame i (0 = newest) already contains the object ~i steps back along its
-    // path; sub-samples within each frame fill the gap to the next position,
-    // producing a continuous streak rather than discrete ghosts. Newer frames
-    // get higher recency weight -> the trail is brightest at the current
-    // position and fades backward (directional, not symmetric).
-    //
-    // CRITICAL: weight bright pixels EXPONENTIALLY, not linearly. A trail
-    // pixel (an old cursor position) gets a bright cursor from only ONE frame
-    // but the dark background from all the others; a plain normalized average
-    // dilutes that single bright sample to a few percent -> invisible. An
-    // exponential brightness term (exp(luma * shutterStrength)) makes any
-    // frame's bright cursor DOMINATE its output pixel, so every position the
-    // cursor occupied lights up -> a visible glowing arc on the dark bg
-    // (the danser look). On a static scene every frame has equal luma at each
-    // pixel, so the weighting is uniform and the result stays sharp.
     uint ss = max(pc.subSamples, 1u);
-    vec4  acc  = vec4(0.0);
-    float wsum = 0.0;
 
+    // ── Cheap gate: did this pixel change AT ALL across the whole window? ──
+    // A single no-window read per real frame (n reads, no 3x3 taps) is much
+    // cheaper than the full per-pair analysis below -- if luma never moves
+    // across any of the n real frames, no pair estimate could find motion
+    // either, so skip straight to a flat single-tap-per-frame accumulation.
+    float lumaMin = 1e9, lumaMax = -1e9;
     for (uint i = 0u; i < n; ++i) {
-        float recency = 1.0 - float(i) / float(n);     // 1 (newest) .. ~0 (oldest)
-        float fw = pow(max(recency, 0.0), pc.falloff);
+        float l = lumaAt(i, P, sz);
+        lumaMin = min(lumaMin, l);
+        lumaMax = max(lumaMax, l);
+    }
+    bool maybeMoving = (n >= 2u) && (lumaMax - lumaMin > 0.02);
 
-        for (uint s = 0u; s < ss; ++s) {
-            // Smear this frame's data backward along the motion direction by
-            // up to ~vlen px (the inter-frame displacement), filling the gap.
-            float t = float(s) / float(ss);
-            vec2  off = dir * (vlen * t);
-            ivec2 sp  = P - ivec2(round(off));
-            vec4  c   = loadClamped(i, sp, sz);
+    vec4  acc        = vec4(0.0);
+    float count      = 0.0;
+    float reportVlen = 0.0;   // drives the brightness-boost gate below
 
-            // Exponential brightness dominance (see note above).
-            float bw = fw * exp(luma(c.rgb) * pc.shutterStrength);
-            acc  += c * bw;
-            wsum += bw;
+    if (!maybeMoving) {
+        for (uint i = 0u; i < n; ++i) {
+            acc   += loadClamped(i, P, sz);
+            count += 1.0;
+        }
+    } else {
+        // ── Spatial gradient from the newest frame, shared by every pair ──
+        const int R = 1;   // 3x3 window; cheap relative to the tap loop below
+        float Ix9[9];
+        float Iy9[9];
+        float sumIxIx = 0.0, sumIyIy = 0.0, sumIxIy = 0.0;
+        int k = 0;
+        for (int dy = -R; dy <= R; ++dy) {
+            for (int dx = -R; dx <= R; ++dx) {
+                ivec2 Q = P + ivec2(dx, dy);
+                float Ix = lumaAt(0u, Q + ivec2(1,0), sz) - lumaAt(0u, Q - ivec2(1,0), sz);
+                float Iy = lumaAt(0u, Q + ivec2(0,1), sz) - lumaAt(0u, Q - ivec2(0,1), sz);
+                Ix9[k] = Ix; Iy9[k] = Iy;
+                sumIxIx += Ix * Ix;
+                sumIyIy += Iy * Iy;
+                sumIxIy += Ix * Iy;
+                k++;
+            }
+        }
+        // Trustworthiness of the shared spatial gradient: a bare determinant
+        // check (`det ~ 0`) only rejects a window that's perfectly flat in
+        // BOTH directions -- it does NOT reject the classic aperture-problem
+        // case of a thin edge/text stroke (strong gradient along one
+        // direction, ~zero across it), which is common everywhere in a UI
+        // and still passes a bare det>1e-6 check easily. Solving there is
+        // numerically unstable: tiny capture noise/dithering in the temporal
+        // term gets divided by a near-zero minor axis and amplified into a
+        // large, spurious velocity -- invisible as a one-shot flicker in the
+        // old single-global-vector version, but reinforced into a
+        // consistent, visible dark smear now that many real-frame pairs +
+        // temporal smoothing agree on the same bogus direction (this is what
+        // showed up live as dark fringing on every static edge, even in
+        // menus with no gameplay motion at all).
+        //
+        // Fix: a proper Shi-Tomasi "good feature to track" check -- require
+        // the SMALLER eigenvalue of the structure tensor
+        // [sumIxIx sumIxIy; sumIxIy sumIyIy] to clear a floor, i.e. the
+        // window must constrain motion well in BOTH directions (a real
+        // corner/textured blob like the cursor sprite), not just one (an
+        // edge/line, which is unstable and should fall back to v=0).
+        float trace  = sumIxIx + sumIyIy;
+        float det    = sumIxIx * sumIyIy - sumIxIy * sumIxIy;
+        float minEig = 0.5 * (trace - sqrt(max(trace * trace - 4.0 * det, 0.0)));
+        // Threshold is a starting point (Ix/Iy are luma differences in
+        // [-1,1], so real corner-like structure typically sits well above
+        // this) -- tighten further if edge fringing persists live, loosen if
+        // real cursor motion stops being detected.
+        bool  trustworthy = minEig > 5e-3;
+        float maxLen = float(max(sz.x, sz.y)) / 8.0;   // clamp: no wild flung taps
+
+        // ── Per-consecutive-pair velocity: pairV[i] = flow from frame i to
+        // frame i+1, using ITS OWN temporal term against the shared spatial
+        // gradient above. Skipped entirely (v=0, no extra taps spent) where
+        // the gradient isn't trustworthy per the check above. ──
+        vec2 pairV[MAX_FRAMES];
+        for (uint i = 0u; i + 1u < n; ++i) {
+            vec2 vi = vec2(0.0);
+            if (trustworthy) {
+                float sumIxIt = 0.0, sumIyIt = 0.0;
+                k = 0;
+                for (int dy = -R; dy <= R; ++dy) {
+                    for (int dx = -R; dx <= R; ++dx) {
+                        ivec2 Q  = P + ivec2(dx, dy);
+                        float It = lumaAt(i, Q, sz) - lumaAt(i + 1u, Q, sz);
+                        sumIxIt += Ix9[k] * It;
+                        sumIyIt += Iy9[k] * It;
+                        k++;
+                    }
+                }
+                vi.x = (-sumIxIt * sumIyIy + sumIyIt * sumIxIy) / det;
+                vi.y = (-sumIyIt * sumIxIx + sumIxIt * sumIxIy) / det;
+                float len = length(vi);
+                if (len > maxLen) vi *= maxLen / len;
+            }
+            pairV[i] = vi;
+        }
+
+        // ── Temporal smoothing across neighboring pairs ─────────────────
+        // Each pairV[i] above is estimated INDEPENDENTLY from just that one
+        // frame pair -- wherever the local signal is weak (near a stop, or
+        // low-texture background), that independent estimate is noisy and
+        // jitters in direction/magnitude from one real frame to the next.
+        // Real motion is physically continuous across the shutter window;
+        // noise isn't. Without this, a noisy run of pairV entries scatters
+        // that frame range's cursor-sprite taps into visibly misaligned
+        // clumps instead of one smooth line (reported live as a "weird
+        // looking cursor" blob).
+        //
+        // Window is 5-tap (i-2..i+2), not 3: a real brief pause/redirect
+        // mid-swing (a couple of real frames near v=0, e.g. a slider-release
+        // hitch) still read as genuinely near-zero after a 3-tap smooth and
+        // fell back to a single sharp, undiluted tap -- which stands out as
+        // a bright "ghost cursor" blob against the surrounding dim blended
+        // trail (reported live, a second/different artifact from the jitter
+        // case above). Reaching two frames out on each side blends a short
+        // pause with the real, nonzero motion just before/after it instead
+        // of snapping to sharp, while a genuinely SUSTAINED stop (many
+        // consecutive near-zero frames, i.e. actually not moving) still
+        // correctly comes out near-zero since its wider neighborhood is
+        // near-zero too.
+        vec2 pairVSmooth[MAX_FRAMES];
+        for (uint i = 0u; i + 1u < n; ++i) {
+            vec2  sum  = pairV[i];
+            float wsum = 1.0;
+            for (uint d = 1u; d <= 2u; ++d) {
+                if (i >= d)          { sum += pairV[i - d]; wsum += 1.0; }
+                if (i + 1u + d < n)  { sum += pairV[i + d]; wsum += 1.0; }
+            }
+            pairVSmooth[i] = sum / wsum;
+        }
+        // The oldest real frame has no "next" pair to estimate against --
+        // reuse the last known (smoothed) pair velocity as its best
+        // available estimate.
+        vec2 lastPairV = (n >= 2u) ? pairVSmooth[n - 2u] : vec2(0.0);
+
+        // ── Accumulate: each real frame smeared along ITS OWN local
+        // velocity (see file header for why plain averaging, not MAX). ──
+        for (uint i = 0u; i < n; ++i) {
+            vec2  vi     = (i + 1u < n) ? pairVSmooth[i] : lastPairV;
+            float vleni  = length(vi);
+            vec2  diri   = (vleni > 1e-4) ? (vi / vleni) : vec2(0.0);
+            // Same redundant-tap cap as before, now per-frame: extra taps
+            // beyond the frame's own actual displacement just re-sample an
+            // already-sampled integer texel.
+            uint  effSS  = (vleni < 1.0) ? 1u : min(ss, uint(ceil(vleni)) + 1u);
+            reportVlen   = max(reportVlen, vleni);
+            for (uint s = 0u; s < effSS; ++s) {
+                float t   = float(s) / float(effSS);
+                vec2  off = diri * (vleni * t);
+                ivec2 sp  = P - ivec2(round(off));
+                acc   += loadClamped(i, sp, sz);
+                count += 1.0;
+            }
         }
     }
 
-    vec4 outc = (wsum > 0.0) ? (acc / wsum) : loadClamped(0u, P, sz);
+    // "Blur brightness" boosts the trail's exposure, but ONLY where there's
+    // real motion -- gated by the largest per-frame velocity seen above.
+    // Multiplying every pixel unconditionally (an earlier version) blew out
+    // the ENTIRE static scene at high settings, since a motionless pixel's
+    // average equals its raw value regardless of shutterStrength, so the
+    // slider was really just a whole-image exposure control in disguise --
+    // not what "trail brightness" should mean. `boost` ramps from 1.0 (no
+    // motion -> shutterStrength has zero effect) up to `shutterStrength`
+    // itself once per-frame motion passes ~1px -- smooth, not a hard cutoff,
+    // to avoid a visible edge where the trail "turns on".
+    float motionAmt = clamp(reportVlen / 1.0, 0.0, 1.0);
+    float boost     = mix(1.0, max(pc.shutterStrength, 0.0), motionAmt);
+
+    vec4 outc = (count > 0.0) ? (acc / count) : loadClamped(0u, P, sz);
+    outc.rgb *= boost;
     outc.a = 1.0;
     imageStore(dstImage, P, outc);
 }

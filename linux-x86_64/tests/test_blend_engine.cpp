@@ -167,14 +167,29 @@ struct SrcImage {
 
 } // namespace
 
+// BlendEngine now has exactly one blend path (resample_blur.comp -- the
+// former plain weighted-average path/blend.comp and its explicit per-source
+// weights were removed 2026-07-03, see DEV_NOTES.md). All accumulation is
+// flat/uniform across whatever real frames + oversampling taps land on a
+// given output pixel; the shader estimates its own per-pixel motion vector
+// (Lucas-Kanade) instead of taking caller-supplied weights at all.
+//
+// With SOLID-COLOR, textureless source images (no spatial gradient
+// anywhere), the shader's motion estimate is always v=0 (the aperture
+// problem: Ix=Iy=0 everywhere -> the 2x2 normal-equations matrix is
+// singular -> falls back to "no motion detected") REGARDLESS of how
+// different the colors are frame-to-frame -- motion detection fundamentally
+// needs spatial texture/edges to work at all. So every tap samples the same
+// pixel position in every frame, and the result is a plain, uniformly-
+// weighted average of the N source colors -- this is what the two GPU
+// correctness tests below exercise.
 TEST_CASE(blend_engine_matches_cpu_reference) {
     VulkanContext vk;
     if (!vk.init(-1)) { CHECK(!"vulkan init failed"); return; }
 
     // BlendEngine dst is R8G8B8A8_UNORM (matches the shader's rgba8 decl).
-    // We feed four solid-color R8G8B8A8 source frames, dispatch with equal
-    // weights (0.25 each), read back the dst, and compare against the CPU
-    // reference: per-channel weighted average, rounded to nearest uint8.
+    // Four solid-color R8G8B8A8 source frames, no motion (see file header),
+    // so the result should be a plain uniform (1/4 each) average.
     BlendEngine blend(vk);
     if (!blend.init(kW, kH)) { CHECK(!"blend init failed"); return; }
 
@@ -196,20 +211,17 @@ TEST_CASE(blend_engine_matches_cpu_reference) {
         views[i] = srcs[i].view;
     }
 
-    // Equal weights → average. tmix semantics: 0.25 each.
-    float weights[4] = { 0.25f, 0.25f, 0.25f, 0.25f };
-
-    VkImageView out = blend.dispatch(views.data(), weights, 4);
+    VkImageView out = blend.dispatch(views.data(), 4);
     CHECK(out != VK_NULL_HANDLE);
 
     // Read back the dst pixels.
     std::vector<uint8_t> dst(static_cast<size_t>(kW) * kH * 4);
     if (!blend.readbackDst(dst.data())) { CHECK(!"readback failed"); return; }
 
-    // CPU reference: per-channel weighted average of the 4 source colors.
-    // The shader operates in linear [0,1] then writes back; RGBA8_UNORM
-    // round-trips through float, so the reference is the float average
-    // rounded to nearest.
+    // CPU reference: per-channel UNIFORM (1/4 each) average of the 4 source
+    // colors. The shader operates in linear [0,1] then writes back;
+    // RGBA8_UNORM round-trips through float, so the reference is the float
+    // average rounded to nearest.
     auto toF = [](uint8_t v) { return v / 255.0f; };
     auto toU8 = [](float v) {
         int x = static_cast<int>(std::round(v * 255.0f));
@@ -217,10 +229,10 @@ TEST_CASE(blend_engine_matches_cpu_reference) {
     };
     float refR = 0, refG = 0, refB = 0, refA = 0;
     for (int i = 0; i < 4; ++i) {
-        refR += weights[i] * toF(cols[i].r);
-        refG += weights[i] * toF(cols[i].g);
-        refB += weights[i] * toF(cols[i].b);
-        refA += weights[i] * toF(cols[i].a);
+        refR += 0.25f * toF(cols[i].r);
+        refG += 0.25f * toF(cols[i].g);
+        refB += 0.25f * toF(cols[i].b);
+        refA += 0.25f * toF(cols[i].a);
     }
     uint8_t expR = toU8(refR), expG = toU8(refG), expB = toU8(refB), expA = toU8(refA);
 
@@ -238,64 +250,44 @@ TEST_CASE(blend_engine_matches_cpu_reference) {
                 dst[0], dst[1], dst[2], dst[3], expR, expG, expB, expA, mismatches, kW * kH);
 }
 
-// Weighted (unequal) accumulate: heavier weight on red, lighter on green.
-TEST_CASE(blend_engine_weighted_accumulate) {
+// Regression test for the "twelfth" DEV_NOTES fix: the "Blur brightness"
+// (shutterStrength) boost must be GATED by detected motion, not applied to
+// every pixel unconditionally -- an earlier version blew out the ENTIRE
+// static scene at high brightness settings (confirmed live: a value of 10.0
+// turned the whole OBS preview white, not just the moving cursor's trail).
+// With solid-color, textureless source images the shader never detects any
+// motion (see the file header comment), so this dispatches with an
+// intentionally extreme shutterStrength (10.0, the UI slider's actual max)
+// and asserts the output is UNCHANGED from the plain average -- proving the
+// boost had zero effect on this (motionless, by construction) content.
+TEST_CASE(blend_engine_brightness_boost_gated_by_motion) {
     VulkanContext vk;
     if (!vk.init(-1)) { CHECK(!"vulkan init failed"); return; }
 
     BlendEngine blend(vk);
     if (!blend.init(kW, kH)) { CHECK(!"blend init failed"); return; }
 
-    struct Col { uint8_t r, g, b, a; };
-    const Col cols[3] = {
-        {255,   0,   0, 255},   // red — heavy
-        {  0, 255,   0, 255},   // green — mid
-        {  0,   0,   0, 255},   // black — light
-    };
-    std::vector<SrcImage> srcs(3);
-    std::vector<VkImageView> views(3);
-    for (int i = 0; i < 3; ++i) {
-        if (!srcs[i].create(vk.device(), vk.physicalDevice(), kW, kH,
-                            cols[i].r, cols[i].g, cols[i].b, cols[i].a)) {
-            CHECK(!"src image create failed"); return;
-        }
-        views[i] = srcs[i].view;
+    SrcImage src;
+    if (!src.create(vk.device(), vk.physicalDevice(), kW, kH, 40, 80, 120, 255)) {
+        CHECK(!"src image create failed"); return;
     }
-    // Pre-normalized: 0.5 red + 0.3 green + 0.2 black.
-    float weights[3] = { 0.5f, 0.3f, 0.2f };
+    VkImageView view = src.view;
 
-    if (blend.dispatch(views.data(), weights, 3) == VK_NULL_HANDLE) {
+    gmix::ResampleParams resample{};
+    resample.shutterStrength = 10.0f;   // UI slider's max -- would blow out
+                                        // a static scene if not motion-gated
+    if (blend.dispatch(&view, 1, resample) == VK_NULL_HANDLE) {
         CHECK(!"dispatch failed"); return;
     }
 
     std::vector<uint8_t> dst(static_cast<size_t>(kW) * kH * 4);
     if (!blend.readbackDst(dst.data())) { CHECK(!"readback failed"); return; }
 
-    auto toF = [](uint8_t v) { return v / 255.0f; };
-    auto toU8 = [](float v) {
-        int x = static_cast<int>(std::round(v * 255.0f));
-        return static_cast<uint8_t>(std::clamp(x, 0, 255));
-    };
-    float r = 0, g = 0, b = 0, a = 0;
-    for (int i = 0; i < 3; ++i) {
-        r += weights[i] * toF(cols[i].r);
-        g += weights[i] * toF(cols[i].g);
-        b += weights[i] * toF(cols[i].b);
-        a += weights[i] * toF(cols[i].a);
-    }
-    uint8_t expR = toU8(r), expG = toU8(g), expB = toU8(b), expA = toU8(a);
-
-    int mismatches = 0;
-    for (uint32_t p = 0; p < kW * kH; ++p) {
-        uint8_t* px = &dst[p * 4];
-        if (std::abs((int)px[0] - expR) > 1 || std::abs((int)px[1] - expG) > 1 ||
-            std::abs((int)px[2] - expB) > 1 || std::abs((int)px[3] - expA) > 1) {
-            ++mismatches;
-        }
-    }
-    CHECK(mismatches == 0);
-    std::printf("[   info   ] weighted dst RGBA = (%d, %d, %d, %d)  ref = (%d, %d, %d, %d)  mismatches = %d\n",
-                dst[0], dst[1], dst[2], dst[3], expR, expG, expB, expA, mismatches);
+    // Must equal the untouched source color, not 10x-boosted (would clip to
+    // 255 on every channel if the boost leaked onto static content).
+    CHECK(dst[0] == 40 && dst[1] == 80 && dst[2] == 120 && dst[3] == 255);
+    std::printf("[   info   ] boosted-but-static dst RGBA = (%d, %d, %d, %d) (expected 40,80,120,255)\n",
+                dst[0], dst[1], dst[2], dst[3]);
 }
 
 // A headless VulkanContext (no Wayland-surface instance extensions, no
@@ -315,14 +307,49 @@ TEST_CASE(headless_context_drives_blend_engine) {
         CHECK(!"src image create failed"); return;
     }
     VkImageView view = src.view;
-    float weight = 1.0f;
-    if (blend.dispatch(&view, &weight, 1) == VK_NULL_HANDLE) {
+    if (blend.dispatch(&view, 1) == VK_NULL_HANDLE) {
         CHECK(!"dispatch failed (headless)"); return;
     }
 
     std::vector<uint8_t> dst(kW * kH * 4);
     if (!blend.readbackDst(dst.data())) { CHECK(!"readback failed (headless)"); return; }
     CHECK(dst[0] == 10 && dst[1] == 20 && dst[2] == 30 && dst[3] == 255);
+}
+
+// "Latency mode" -- dstBufferCount is now a runtime init() argument (was a
+// compile-time kDstBuffers=3 constant) so the OBS plugin can offer
+// Fast/Medium/Slow/Very slow (2/3/4/5 buffers). Confirm a non-default count
+// actually takes effect: the reported count, every dstImage()/dstView() up
+// to that count is a real handle, and dispatchAsync() into the LAST valid
+// index (not just index 0) works.
+TEST_CASE(blend_engine_runtime_dst_buffer_count) {
+    VulkanContext vk;
+    if (!vk.init(-1, /*headless=*/true)) { CHECK(!"vulkan init failed"); return; }
+
+    BlendEngine blend(vk);
+    constexpr uint32_t kCount = 5;   // "Very slow"
+    if (!blend.init(kW, kH, kCount)) { CHECK(!"blend init failed"); return; }
+    CHECK_EQ(blend.dstBufferCount(), kCount);
+    for (uint32_t i = 0; i < kCount; ++i) {
+        CHECK(blend.dstImage(i) != VK_NULL_HANDLE);
+        CHECK(blend.dstView(i)  != VK_NULL_HANDLE);
+    }
+
+    SrcImage src;
+    if (!src.create(vk.device(), vk.physicalDevice(), kW, kH, 40, 50, 60, 255)) {
+        CHECK(!"src image create failed"); return;
+    }
+    VkImageView view = src.view;
+    // Dispatch into the LAST slot (kCount-1), matching gmix_source.cpp's
+    // round-robin, not just the always-tested index 0.
+    if (!blend.dispatchAsync(&view, 1, kCount - 1)) {
+        CHECK(!"dispatchAsync into last slot failed"); return;
+    }
+    blend.waitBlendDone();
+    CHECK(blend.dstReadyValue() > 0);
+
+    // An out-of-range index must be rejected, not silently clamp/UB.
+    CHECK(!blend.dispatchAsync(&view, 1, kCount));
 }
 
 int main() {

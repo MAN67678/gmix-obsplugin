@@ -15,6 +15,939 @@ fail when it had simply never been installed. Always re-copy (and restart
 OBS, since it's not running) after rebuilding, before drawing any conclusion
 from in-OBS behavior.
 
+## ADDED (2026-07-05): per-frame-pair Lucas-Kanade + Shi-Tomasi trust check — the live-stream test's fixes
+
+Branch `optical-flow-lucas-kanade` had already been used in a real live
+stream (see the end of this file's `optical-flow-lucas-kanade` entries
+below for that setup). The stream worked but surfaced real quality/perf
+issues at the settings the user actually wanted to run (Blur density
+maxed, Blur brightness pushed up to compensate for a trail that faded too
+fast) — this entry is the chain of fixes from investigating those, all in
+`shaders/resample_blur.comp` unless noted, all shader-only (no `.so`
+rebuild/reinstall needed, only `build/shaders/resample_blur.spv`).
+
+1. **In-game stutter at maxed density.** The tap loop always ran the full
+   `subSamples` (up to 32) per real frame per pixel, even for pixels with
+   zero motion — a static pixel's taps all round to the same integer texel,
+   so most of that work was pure duplication. Fix: cap actual taps spent
+   per pixel to `(vlen < 1.0) ? 1 : min(subSamples, ceil(vlen)+1)` — exact
+   for static content (duplicate taps are literally redundant reads),
+   close for moving content (still spans the same range, just without the
+   redundant duplicates). Confirmed live: stutter fixed.
+2. **Raised the "Blur density" UI ceiling 32 → 64** (`gmix_source.cpp` +
+   `BlendConfig.hpp`) — safe to raise now that (1) means the ceiling only
+   costs GPU time where there's real fast motion, not across the whole
+   frame. This alone didn't close the gap to the reference video the user
+   was comparing against, though — see next.
+3. **Discrete-blob trail, root cause.** Even at density=64 the trail showed
+   visibly separated blobs instead of one continuous streak on part of a
+   fast jump. Root cause: the shader estimated ONE motion vector from the
+   newest real-frame pair (indices 0,1) and reused it to fill every OTHER
+   real frame's gap — assuming constant velocity across the whole ~16-17
+   frame shutter window. Real cursor motion in an osu! "jump" accelerates
+   then decelerates; if the newest pair happens to capture the slow part
+   (near landing), that small vector under-fills the gap left by the
+   faster, earlier part of the swing. Fix: estimate velocity PER
+   CONSECUTIVE REAL-FRAME PAIR `(i, i+1)` instead of once globally, so each
+   real frame fills its own actual gap. Kept cheap by computing the spatial
+   gradient (Ix, Iy) once from the newest frame and reusing it as the
+   shared LHS for every pair's normal equations — only the temporal term is
+   recomputed per pair. Also added a cheap whole-window luma-range gate
+   (no-window, n reads) so pixels that never change across ANY real frame
+   skip the expensive per-pair analysis entirely (most of a typical
+   frame — background, HUD). Confirmed live: trail continuity fixed, dense
+   enough that brightness could come back down toward neutral.
+4. **New artifact: misaligned-blob "weird cursor."** Each per-pair estimate
+   from (3) is independent, with no consistency check against its
+   neighbors — where the local signal is weak, direction/magnitude jitters
+   frame-to-frame (noise), scattering that frame range's taps into
+   misaligned clumps. Real motion is physically continuous; noise isn't.
+   Fix: a 3-tap boxcar temporal smoothing pass over neighboring `pairV[i]`
+   entries (`pairVSmooth[]`), boundary-aware. Live test found this
+   insufficient for a brief (couple-frame) pause/redirect mid-swing — still
+   read as near-zero after only 3-tap smoothing and snapped to a bare sharp
+   tap, standing out as a bright "ghost cursor" since it wasn't diluted the
+   way blended taps are. Widened to 5-tap (`i-2..i+2`); a genuinely
+   sustained stop still correctly comes out near-zero since its wider
+   neighborhood is near-zero too.
+5. **Regression: dark edge fringing on EVERYTHING static, including
+   non-gameplay content (osu!'s song-select menu).** The per-pair solve's
+   only safety check was `abs(det) > 1e-6` — rejects a window flat in BOTH
+   directions, but NOT the classic aperture-problem case of a thin
+   edge/text stroke (strong gradient along the edge, ~zero across it),
+   which is everywhere in any UI and passes that bare check trivially.
+   Solving there is numerically unstable: tiny capture noise/dithering in
+   the temporal term gets divided by a near-zero minor axis and amplified
+   into a large, spurious velocity. The ORIGINAL single-global-vector code
+   (pre-2026-07-05) had this exact same weak check and was equally
+   susceptible — it just produced one noisy estimate per pixel per
+   dispatch, easy to miss as an occasional flicker. Averaging ~16
+   independent noisy per-pair estimates together (item 3) plus smoothing
+   them (item 4) turned that into a *consistent* bogus direction instead of
+   cancelling as random noise, which is what made it a session-breaking
+   global regression instead of a rare flicker. Fix: replaced the bare
+   `det` check with a proper Shi-Tomasi "good feature to track" criterion —
+   the structure tensor's smaller eigenvalue
+   (`minEig = 0.5*(trace - sqrt(trace^2 - 4*det))`) must clear a floor
+   (`5e-3`, a first guess, not further tuned) before ANY pair's velocity
+   solve is trusted for that pixel; below it, every pair is forced to
+   `vec2(0)` and the inner 9-tap temporal-term loop is skipped entirely too
+   (a free efficiency win alongside the correctness fix). Requires the
+   window to constrain motion in BOTH directions (a real corner/textured
+   blob like the cursor sprite), not just one (an edge/line — now correctly
+   falls back to a flat, sharp, no-blur tap).
+
+**Confirmed live after all five fixes**: user's verdict was "now is rival
+danser quality" — continuous trail, no edge fringing (checked beyond just
+gameplay), brightness slider meaningful again across its full range
+including the intentionally-absurd 10.0 (which blows out the trail hard
+enough to hurt the user's OWN in-game visibility, not a GPU/framerate
+issue). No outstanding known defects in the Advanced blend path as of this
+entry.
+
+**If picking this up again and something looks wrong in the trail**: this
+is now a tightly coupled chain (tap cap ↔ smoothing width ↔ eigenvalue
+floor) — re-read this whole entry before changing any one piece in
+isolation, since each fix exists to correct a symptom the previous one
+exposed. The two numeric constants most likely to need live retuning if a
+future test surfaces something new: the Shi-Tomasi floor (`5e-3`) and the
+smoothing window width (currently 5-tap).
+
+## CHANGED (2026-07-03, sixteenth): plugin stripped down to Advanced-only, fixed Latency mode, no more preset/latency config files
+
+After fifteen rounds of live testing/fixing the Advanced preset and the
+Latency-mode/preset persistence machinery, user directed a deliberate
+simplification: "we just going to make this very simple with search
+process name and gpu index and the slider" -- i.e. only what's ACTUALLY
+being configured live gets to stay a user-facing option; everything else
+that was built to support presets/Latency-mode choices nobody was using
+gets removed, not just hidden.
+
+**What was removed, and why each piece is now genuinely unreachable (not
+just defaulted):**
+
+- **Blend presets** (Flat/Linear/Cinematic/Heavy/Raw, `BlendConfig::Mode`,
+  the whole plain weighted-average blend path). Advanced was the only one
+  actually configured live (confirmed via the persisted config file:
+  `preset=advanced` every session this whole investigation). Removed:
+  - `shaders/blend.comp` (the plain-average shader) entirely.
+  - `src/blend/weight_generator.hpp/.cpp` + its test
+    (`tests/test_weight_generator.cpp`) -- confirmed, on direct question,
+    that this file was ALREADY dead code specifically for Advanced (its
+    `generateFromPreset()` is never called on that path; `weightsFor()`
+    returned a uniform filler for Advanced that the shader ignored anyway).
+  - `BlendConfig::Mode`, `rawWeights`, `weightsFor()`, `usesResamplePath()`,
+    `falloff` (the last already-dead field from the ninth entry).
+  - `BlendEngine`'s weights SSBO (binding 2) and the whole
+    optional-fallback-pipeline machinery (`resamplePipeline_` alongside a
+    required `pipeline_`) -- there's now exactly one pipeline, built from
+    `resample_blur.spv`, and it's REQUIRED (`init()` fails without it,
+    same as the old plain pipeline used to be).
+  - `dispatch()`/`dispatchAsync()`'s `weights` parameter -- gone from the
+    API entirely, not just unused.
+  - The "Blur preset" dropdown, `gmixPresetModified()`, its auto-fire flag,
+    `presetSettingToMode()`/`presetModeToString()`.
+  - `~/.config/gmix/blend_config` (the persisted preset/density/brightness
+    file) -- see below for what replaced it.
+
+- **Latency mode** (Fast/Medium/Slow/Very slow dropdown, i.e. user-facing
+  control over `dstBufferCount`). The live-confirmed running value was 5
+  ("Very slow") every session. `dstBufferCount` is now
+  `kFixedDstBufferCount = 5` (a plain constant in `gmix_source.cpp`), not a
+  per-source parsed/persisted value.
+  `BlendEngine::kMinDstBuffers/kMaxDstBuffers/dstBufferCount()` stay as
+  runtime API (harmless, `blend_engine_runtime_dst_buffer_count` still
+  exercises non-default counts) -- only the OBS-plugin-facing knob and its
+  `~/.config/gmix/engine_settings` dstBufferCount field are gone
+  (`engine_settings` now persists gpuIndex only). Removed:
+  `gmixLatencyModified()`, its auto-fire flag,
+  `latencyModeSettingToBufferCount()`/`bufferCountToLatencyModeSetting()`,
+  the "Latency mode" dropdown, `GmixSource::dstBufferCount` (the field, not
+  `GmixEngine`'s -- the latter stays, always set to the constant).
+
+**What replaced `~/.config/gmix/blend_config`:** nothing on disk. User's
+own observation, on being told density/brightness apply live: "so we also
+don't need config file because exposer can be change live and saved with
+the scene file." Correct -- that file's actual job was surviving an ENGINE
+REBUILD (destroyed when every source is removed, e.g. for a GPU-index
+change) with a DIFFERENT source's config than whichever one happens to
+recreate it first. That scenario is specific to running multiple
+differently-configured source instances at once, which the README already
+steers users away from (one shared "GMix Motion Blur" source, reused via
+**Add Existing Source**). Replaced with: `gmixCreate()` now pushes the
+CREATING source's own (`obs_data`/scene-collection-persisted)
+density/brightness into a freshly-created engine directly, via
+`applyBlendConfigFromSettings()`, at creation time (refCount == 1 branch) --
+no callback/auto-fire suppression needed there specifically, since
+`gmixCreate()` always represents a genuine attachment, never a synthetic
+properties-dialog fire. The existing refCount > 1 branch (sync FROM an
+already-running engine INTO a newly-attached source's displayed settings,
+from the "seventh" entry) is unchanged.
+
+GPU index KEEPS its persisted file (`engine_settings`, now gpuIndex-only)
+since it's genuinely different: an engine rebuild is the ONLY way to change
+it at all (no live-apply path exists, unlike density/brightness), so
+there's no source-creation-time push to fall back on -- the file is the
+only place the value can come from before any source has been created this
+session. Its modified-callback moved from the (now-deleted) Latency mode
+dropdown to a new `gmixGpuIndexModified()` on the `gpu_index` field
+directly (same auto-fire-suppression pattern, new home).
+
+**New regression test** (`blend_engine_brightness_boost_gated_by_motion` in
+`tests/test_blend_engine.cpp`): dispatches a single solid-color frame with
+`shutterStrength=10.0` (the UI slider's max) and asserts the output is
+byte-identical to the untouched input -- directly re-proving the
+"twelfth" entry's motion-gating fix (a static/textureless scene never
+triggers the boost, regardless of slider value) now that the two
+correctness tests were rewritten for the weights-free API. Replaces the old
+`blend_engine_weighted_accumulate` test, which tested unequal per-source
+weights -- a concept that no longer exists (every real frame is weighted
+flat now, unconditionally).
+
+**Verification:** `gmix_core` + `test_blend_engine` built and passed (4
+tests, 18 checks) BEFORE touching `gmix_source.cpp`, to isolate whether any
+break was in the core library vs. the OBS plugin glue. Then the full OBS
+plugin build (`-DGMIX_BUILD_OBS_PLUGIN=ON`) succeeded clean, `ctest` 2/2
+(down from 3 -- `weight_generator` test removed, its file deleted), fresh
+`~/.config/gmix` wiped and reinstalled to `.so` md5-verified, ready for the
+user's from-scratch fresh-clone re-test (delete everything, re-clone from
+`optical-flow-lucas-kanade` on GitHub, rebuild, retest the full add/OK/
+remove/re-add/switch-to-Advanced flow this session already validated once
+against the pre-strip-down code).
+
+## CHANGED (2026-07-03, fifteenth): Blur brightness default raised again, 1.2 -> 1.3, after testing in-game vs. menu content
+
+Direct follow-up to the fourteenth entry. User restarted OBS, tested 1.2
+live, then reported back with more granular findings across content types:
+1.5 gave "the best blur while in game," but was "too bright on menu" --
+menu screens are mostly static but still have enough moving UI (the boost
+is motion-gated, not scene-gated) to visibly overshoot at 1.5. No single
+default value is right for both in-game and menu content, so settled on
+1.3 as a middle-ground default, explicitly leaving the slider for the user
+to adjust per what they're actually capturing at the time (their own
+words: "let the user adjust it").
+
+Same two places changed as the fourteenth entry, same reasoning for why
+both need to move together: `gmix_source.cpp`'s `gmixGetDefaults()`
+(`kSettingBrightness`, what new sources actually use) and
+`BlendConfig.hpp`'s `shutterStrength` member initializer (engine fallback
+before any persisted `~/.config/gmix/blend_config` exists). Same caveat as
+before: doesn't retroactively change a value already saved in a scene
+collection or the persisted config file. Rebuilt, tests pass (3/3),
+installed (md5 verified, `.so` changed since this is C++ not shader).
+
+## CHANGED (2026-07-03, fourteenth): Blur brightness default raised 1.0 -> 1.2
+
+Direct follow-up to the thirteenth entry's live confirmation ("1.20 look
+okay, 1.30 would give more dense result... 2.0 brightness was way too
+bright... keep it max at 10... that would be funny"): 1.0 (pure
+energy-conserving average, no boost at all) tested visibly under-bright for
+the Advanced preset now that the boost is motion-gated (twelfth entry) --
+it only affects the trail, not the whole image, so getting a visible trail
+needs a bit more than "neutral." User confirmed 1.2 as a good baseline and
+explicitly wants the 0.1-10 slider range left alone (10 kept in on purpose
+as a deliberately-absurd option).
+
+Changed in two places to keep them in sync: `gmix_source.cpp`'s
+`gmixGetDefaults()` (`kSettingBrightness` default, what actual new sources
+use) and `BlendConfig.hpp`'s `shutterStrength` member initializer (the
+engine's fallback before any `~/.config/gmix/blend_config` file exists --
+matters on first-ever run only, since `acquireEngine()` reads the persisted
+file after that). `ResampleParams::shutterStrength` in `blend_engine.hpp`
+intentionally left at 1.0f -- it's a struct default only reached if a
+caller doesn't set the field explicitly, which the real pipeline
+(`gmix_source.cpp`'s `workerMain()`) always does.
+
+Only existing sources with a source-level `obs_data` that never explicitly
+set brightness (i.e. new sources going forward, or ones reset to defaults)
+pick up 1.2 -- doesn't retroactively change a value already saved to a
+scene collection or `~/.config/gmix/blend_config`. Rebuilt, tests pass
+(3/3), installed (md5 verified; this one DID change the .so, unlike the
+last several shader-only entries, since gmixGetDefaults() is C++ not
+GLSL).
+
+## CONFIRMED (2026-07-03, thirteenth): Advanced preset's accumulation/exposure rework (ninth-twelfth entries) tested good, and is cheaper than the old scheme
+
+User tested the twelfth entry's motion-gated brightness fix live: "looks
+better now. 1.20 look okay, 1.30 would give more dense result" (density
+here meaning visual trail density, from Blur brightness, not the Blur
+density slider), confirmed a Blur brightness of 2.0 also looked good via
+screenshot, and confirmed the slider's existing 0.1-10 range should stay as
+is (asked to keep the max at 10 "that would be funny" -- i.e. an
+intentionally-extreme option is fine to leave in, not a request to raise
+or lower it).
+
+Also reported a live PERFORMANCE re-measurement at density=32 (the
+slider's max): "no frame drop, impact less than 3% to 5% or even less."
+This matters because the README's only prior density-cost numbers (a
+~2.2ms -> ~8-11ms blend-time jump) were measured against an EARLIER
+accumulation scheme (the original exponential-dominance weighted average,
+before the ninth/tenth/eleventh/twelfth entries reworked it to a plain
+average + motion-gated boost) -- i.e. those old numbers were never
+re-validated against the shader as it exists now, and per this report the
+current version is meaningfully cheaper, not just visually corrected.
+Updated README's Blur density bullet to note both the old (superseded)
+measurement and the new live-tested one, so a future reader doesn't treat
+the stale 8-11ms figure as still describing the current shader.
+
+No code change this entry -- documentation only (README + this entry),
+closing out the ninth-through-thirteenth chain of Advanced-preset
+accumulation fixes for now. The chain in order: weighted-average-with-
+falloff (buggy) -> weighted-average-flat (still buggy, same dilution
+symptom) -> MAX/lighten (fixed dilution, broke energy conservation) ->
+plain average (fixed both) -> motion-gated brightness (fixed the
+brightness slider blowing out static content) -> user-confirmed good.
+
+## FIXED (2026-07-03, twelfth): "Blur brightness" was a whole-image exposure control in disguise, not a trail-only one
+
+User called the eleventh entry's fix "a bit too subtle" and, on being told
+to raise Blur brightness, sent a screenshot: at 10.0 the ENTIRE Properties
+preview was blown out white, not just the moving cursor's trail. "brightness
+just change overall brightness now. if i slide it down ir dark if i slide
+it up [blown out]."
+
+Root cause: `outc.rgb *= shutterStrength` applied unconditionally to EVERY
+output pixel, moving or not. For a genuinely static pixel, `acc/count`
+(the plain average from the eleventh entry) equals that pixel's raw value
+regardless of how many identical taps went into it -- so a static
+background pixel got multiplied by shutterStrength exactly the same as a
+real motion-blurred one. The slider was never actually a "trail" control;
+it was a global exposure control that happened to also touch the trail.
+
+**Fix:** gate the boost by `vlen` (the per-pixel motion magnitude already
+computed for the resampling/oversampling above it). `motionAmt =
+clamp(vlen / 1.0, 0, 1)`; `boost = mix(1.0, shutterStrength, motionAmt)`.
+A motionless pixel gets boost=1.0 always (shutterStrength has literally zero
+effect on it, at any slider value), a pixel with >=~1px of estimated
+inter-frame motion gets the full slider effect, and it ramps smoothly
+between the two rather than a hard on/off cutoff (avoids a visible edge
+where the trail "turns on"). Now raising Blur brightness should visibly
+brighten only the moving trail, leaving the rest of the scene's exposure
+alone.
+
+Same file/mechanism as the tenth/eleventh entries (`resample_blur.comp`
+only, no C++ changes, `.so` unaffected -- confirmed same md5 before/after,
+only `.spv` rebuilt). No new automated test (GPU shader math). Fourth
+consecutive fix to this shader's accumulation/exposure logic in one
+session -- see the "failure mode" note at the end of the eleventh entry,
+which still applies.
+
+## FIXED (2026-07-03, eleventh): Advanced preset's MAX/"lighten" blend brightened ALL moving content instead of blurring it -- switched to a plain energy-conserving average
+
+User tested the tenth entry's MAX/lighten fix live and sent screenshots:
+approach circles and slider bodies with velocity visibly gained a bright
+white halo/outline glow that the same content didn't have on the left
+(reference) side. Diagnosis, direct from the user: "everything with
+velocity not bright up instead of just blur, that's why i set default to
+1.0, didn't know it was a bug" -- they'd left Blur brightness at the
+documented-neutral 1.0 in good faith; the actual bug was that "neutral" was
+never really neutral under MAX.
+
+Root cause: MAX/"lighten" is not energy-conserving. A real motion blur
+(camera shutter integrating light over an exposure) can only spread
+brightness out and DIM it per pixel -- it can never exceed the brightest
+instant it's blending. MAX has the opposite property: once ANY tap along a
+path lights a pixel, that pixel stays at that brightness NO MATTER how many
+darker taps also land there -- there's no dimming mechanism at all. For a
+sparse single-pixel-ish cursor this reads as "preserved brightness"
+(desirable), but for anything wider (an approach circle's ring, a slider
+body's outline) it reads as unwanted brightening/glow, because MAX is
+selecting the brightest EDGE PIXEL across many overlapping shifted copies
+of a shape that's already bright at its edges by design -- exactly what the
+screenshots showed.
+
+**Fix:** replaced MAX with a plain, unweighted average (`acc/count`) --
+truly energy-conserving, matching how a real shutter integrates light: the
+result can never exceed the brightest single tap, only spread and dim it.
+This works for the cursor too now (not just wider content) because of the
+oversampling added earlier (dense sub-pixel taps along the motion vector)
+-- enough taps land on/near a moving object's own footprint that it isn't
+diluted into invisibility by a plain average the way a single tap among
+many mostly-background samples would have been in the pre-oversampling
+version of this shader. "Blur brightness" remains a direct post-multiply on
+the final averaged color (1.0 truly neutral now, matching what the user
+already expected it to mean).
+
+Same file/mechanism as the tenth entry (`resample_blur.comp` only, no C++
+changes, only the `.spv` needs a rebuild -- already-installed `.so` is
+unaffected). No new automated test (GPU shader math). This is the third
+consecutive fix to Advanced's accumulation scheme in one session (ninth:
+weighted-average-with-flat-weights still diluted; tenth: MAX fixed dilution
+but broke energy conservation; eleventh: plain average gets both right) --
+worth remembering if Advanced still doesn't look right next time: the
+FAILURE MODE to check for is either "discrete separated blobs instead of a
+continuous streak" (a dilution/weighted-average symptom) or "moving content
+brighter than it should be" (a non-energy-conserving/MAX-like symptom) --
+these two properties trade off against each other and a fix for one can
+reintroduce the other if not careful.
+
+## FIXED (2026-07-03, tenth): Advanced preset's WEIGHTED-AVERAGE accumulation was the real ghosting cause -- switched to MAX/"lighten" blend
+
+User tested the ninth entry's fix live and sent screenshots: the cursor
+trail was a row of distinct, evenly-spaced small circles, not a continuous
+streak -- asked directly "did you smooth it to motion blur with
+oversampling yet?"
+
+Root cause, finally isolated correctly: it was never the WEIGHT SHAPE
+(recency falloff in the eighth entry, still-flat-but-still-averaged in the
+ninth) -- it was weighted AVERAGING itself (`acc / wsum`) as the
+accumulation method. Any average dilutes a single bright tap's contribution
+by how many other (mostly dark-background) taps got summed alongside it.
+Between two real oversample tap positions, the divided result necessarily
+dips back toward background before rising again at the next tap -- a series
+of separate bumps along the path, exactly the "row of dots" in the
+screenshots, regardless of what per-tap weight scheme feeds the average.
+This is why both the eighth and ninth fixes "worked" in the sense of being
+correctly reasoned individually but didn't fix the actual symptom: neither
+touched the fact that it was still an average.
+
+**Fix:** replaced the weighted-average accumulation in
+`resample_blur.comp` with a MAX ("lighten"/screen blend): track the
+brightest (by luma) tap seen across every real frame x sub-sample position,
+output that. No division, no dilution -- once any tap along the motion path
+lights a pixel, that pixel stays lit at that brightness no matter how many
+darker background taps also land on it. This is what makes dense
+oversampling (the "Blur density" slider) actually smooth the streak now
+(overlapping tap footprints tile into one continuous strip) instead of just
+adding more samples to dilute the average against.
+
+Side effect: "Blur brightness" (`shutterStrength`) no longer has a
+tap-selection role to play (MAX doesn't dilute, so there's nothing left for
+an exponential dominance term to fix) -- repurposed as a direct post-multiply
+brightness scalar on the composited trail (1.0 neutral, higher blows out,
+lower dims), same slider/range, new meaning. Updated in README's Blur
+presets section. `ResampleParams::falloff`/`BlendConfig::falloff` remain
+unused dead fields (see ninth entry).
+
+No C++ changes needed this time -- purely a `resample_blur.comp` change, so
+only the shader recompiled (`build/shaders/resample_blur.spv`); the
+already-installed `.so` was unaffected (confirmed same md5 before/after)
+and picks up the new `.spv` automatically since `GMIX_SHADER_DIR` is an
+absolute build-dir path baked into the binary at compile time, not a
+separately-installed asset. No new automated test (GPU shader math, no
+Vulkan-backed harness for Advanced yet).
+
+## FIXED (2026-07-03, ninth): Advanced preset's per-frame recency falloff was itself the ghosting cause -- removed, now flat weighting like Flat preset
+
+User tested the eighth entry's fix (falloff scaled by n/kRefN) live and reported
+it "look pretty ghosting" still, with a direct, correct diagnosis: "advance
+should use same weight as flat preset."
+
+The eighth fix addressed the falloff term's N-scaling but left the falloff
+mechanism itself in place -- and the mechanism was the actual bug. Each real
+frame i in the window was weighted by `pow(1 - i/n, falloff)`, fading older
+frames toward zero. Combined with per-frame spatial resampling (frame i's
+data read at an offset along the motion vector), this produced several
+distinct, independently-fading copies of the moving object rather than one
+continuous streak -- textbook ghosting, structurally the same complaint as
+the original Cinematic bug ("clearly just ghosting") even after the N-scale
+fix, because the falloff *shape itself*, not just its width, was the
+problem.
+
+**Fix:** removed the recency falloff entirely from `resample_blur.comp`.
+Every real frame in the window is now weighted flat (equal), the same
+philosophy as the Flat preset's uniform 1/N average. The exponential
+brightness-dominance term (`exp(luma * shutterStrength)`, still driven by
+the "Blur brightness" slider) is unchanged and is now the ONLY weighting
+left -- it's what turns a bright pixel (e.g. a cursor) at any tap position
+into the dominant contributor for that output pixel, producing the
+directional glow. `ResampleParams::falloff` / `BlendConfig::falloff` are
+left in place (unused by the shader now) rather than doing an ABI-churning
+removal for a currently-single-purpose field; `gmix_source.cpp`'s
+`workerMain()` no longer sets `resample.falloff` at all (see the comment
+there).
+
+No new automated test -- same reasoning as the eighth entry (GPU shader
+math, no Vulkan-backed numerical harness for Advanced yet). Rebuilt (spv
+regenerated fresh under `build/shaders/`, confirmed via the binary's baked-
+in `GMIX_SHADER_DIR` path), tests pass (3/3), installed. Awaiting live
+confirmation this actually reads as smoother, not just theoretically
+correct.
+
+## FIXED (2026-07-03, eighth): Advanced (optical-flow) preset had the same N-dependent washout bug as the old Cinematic preset
+
+User asked directly whether Advanced could have "the same issue as cinematic
+preset before, the ghosting issue" — it did, same root cause class, found by
+inspection + derivation (not yet from a live report).
+
+`resample_blur.comp` weights each real frame's contribution by
+`recency = 1 - i/n` (i = frames back from newest, n = actual real frame
+count in the shutter window) raised to a fixed exponent `falloff` (constant
+1.0, not exposed in the UI). Exactly like the old Cinematic gaussian's fixed
+`mult`, a fixed exponent applied to a ratio NORMALIZED by n flattens in
+ABSOLUTE frame terms as n grows: frame-1-back's weight relative to the
+newest goes from 0.875 at n=8 to 0.984 at n=64 with falloff=1.0 held
+constant. At high real-capture-rate n, this means many real frames near the
+front of the window get near-equal weight instead of the newest one
+dominating -- diluting the directional streak into a flatter smear. Same
+symptom class as the Cinematic bug ("look less cinematic... clearly just
+ghosting"), just not yet reported live for Advanced since it's BETA and
+gets far less real-world mileage.
+
+**Fix:** scale `falloff` by `n / kRefN` (kRefN=16, same reference point
+used in the Cinematic fix) at the dispatch call site in `gmix_source.cpp`
+(`workerMain()`, right where `ResampleParams` is built), instead of passing
+the constant straight through. Host-side scalar computation, no shader
+change needed. No new automated test added -- this is GPU shader math that
+would need a Vulkan-backed numerical test like the Cinematic one had, and
+the fix mirrors an already-tested pattern; flagging here for whoever adds
+Advanced-specific shader tests later.
+
+## FIXED (2026-07-03, seventh follow-up): remove-and-re-add appeared to "still load default" — actually a stale Properties dialog, engine was correct
+
+User report: "set to whatever it is then remove it then add again and it
+shoe defualt again i repeat and it still load defualt again." Looked like
+the sixth/fifth-follow-up persistence fixes (`~/.config/gmix/engine_settings`,
+`~/.config/gmix/blend_config`) hadn't actually stuck this time.
+
+Checked the log line-by-line across the whole session (two full remove/
+re-add cycles, ~4 minutes): `preset=advanced` and 5 dst buffers were in
+effect immediately after each re-creation, and both persisted-config files
+were confirmed read (`gmix: using persisted engine settings...` / `gmix:
+using persisted blend config...`). The actual `GmixEngine` — and therefore
+the real blur behavior the user sees in a recording — was correct the whole
+time.
+
+The real bug was elsewhere: a freshly `+`-added `GmixSource` always starts
+from `gmixGetDefaults()` (Flat/Medium) in its own `obs_data_t`, since OBS
+calls `create()` before Properties can be opened/edited. When that new
+source's `create()` attaches to an ALREADY-RUNNING engine (i.e.
+`acquireEngine()`'s refcount ends up > 1, not a fresh engine), the engine
+itself is fine, but the new source's Properties dialog still shows its own
+stale default `obs_data` — Flat/Medium — instead of what's actually
+running. Indistinguishable from a real functional regression by eye.
+
+**Fix:** in `gmixCreate()`, after `acquireEngine()`, if
+`s->engine->refCount.load() > 1` (attached to an existing engine rather than
+having just created one), snapshot the engine's real `blendConfig` +
+`gpuIndex` + `dstBufferCount` and push them into this source's own
+`settings` via `obs_data_set_string/int/double` (preset, blur density,
+brightness, GPU index, and Latency mode via a new
+`bufferCountToLatencyModeSetting()` reverse mapping of
+`latencyModeSettingToBufferCount()`), then re-run `gmixUpdate(s, settings)`
+so the rest of `s`'s parsed fields match too. Now the Properties dialog for
+a newly attached source reflects the real running state immediately.
+
+No blend-engine logic changed — diagnostics/sync-on-attach only, so no new
+test added (matches the pattern of the persistence-only fixes above).
+
+## CHANGED (2026-07-03, sixth follow-up): latency budget now derives from Latency mode, applies to every preset
+
+The `blend_latency`/`draw_latency` budget warning was hardcoded to "4
+output frames, Advanced preset only" -- disconnected from the actual
+Latency mode setting, and blind to non-Advanced presets even though the
+SAME budget concept applies to them too (just less likely to matter, since
+their blend cost is far lower). Per user request, formalized the full
+pipeline and tied the budget to the mechanism that actually provides the
+tolerance:
+
+    [capture, ~16.6ms shutter window, BY DESIGN, not budgeted]
+      -> [blend: dispatch->retire, pure GPU/CPU cost]
+      -> [draw: retire->OBS shows it, bounded by OBS's cadence]
+      -> [obs]
+
+Budget = `(dstBufferCount - 1)` output-frame intervals, checked against
+`blend_latency + draw_latency` together (not each alone) -- Fast(2
+buffers)=1 frame, Medium(3)=2, Slow(4)=3, Very slow(5)=4, exactly the
+numbers the user specified. This is the SAME number `dstBufferCount`
+already encodes as "extra dispatch generations of grace before a buffer
+gets reused" (see `BlendEngine::dstBufferCount()`'s comment) -- Latency
+mode IS fundamentally "how much blend/draw timing variance are you willing
+to tolerate," so the diagnostic budget and the actual buffering mechanism
+now use the same number instead of two unrelated ones. Applies to every
+preset now, not gated to `mode == Advanced`; the warning message also
+suggests a slower Latency mode as a remedy alongside lowering blur density,
+since raising `dstBufferCount` is now the direct, correct lever for a
+bigger budget.
+
+Verified: builds and links clean, `ctest` 3/3 (18 checks, unaffected --
+diagnostics-only, no blend-engine behavior changed). Installed while OBS
+was NOT running. **Not yet verified live** -- next session should confirm
+the warning message reports the right budget number for whatever Latency
+mode is active (e.g. Fast should warn much more readily than Very slow at
+the same blend cost).
+
+## FIXED (2026-07-03, fifth follow-up): preset was STILL lost across a Latency-mode-forced engine rebuild
+
+The 4th follow-up's fix (below) genuinely worked for its own test: preset
+now applies live and survives a new source being ADDED alongside existing
+ones. But the user's actual workflow combines both features -- changing
+Latency mode ALSO requires removing every source (that part is inherent,
+unchanged) -- and confirmed live: after that remove-all/re-add cycle
+(needed to pick up the new Latency mode), preset came back as `flat`
+again, even though it had just been live-set to `advanced` moments before.
+
+**Root cause, genuinely different from the 4th follow-up's:** removing
+every source doesn't just risk a NEW source's defaults overwriting a
+shared value (already fixed) -- it destroys the `GmixEngine` object
+ENTIRELY. `blendConfig` only ever lived in that object's memory, with no
+persisted backing store, unlike `gpuIndex`/`dstBufferCount` (which read
+from `~/.config/gmix/engine_settings`). So the FRESH engine built on
+re-add necessarily starts from `blendConfig`'s hard default (Flat) --
+there was nowhere for the just-set Advanced to have been read back FROM.
+
+**Fix:** same persisted-file pattern as `engine_settings`, applied to
+blend config -- a new `~/.config/gmix/blend_config` file (`preset
+density brightness`, written by `writeBlendConfigFile()`/read by
+`readBlendConfigFile()`). `applyBlendConfigFromSettings()` now writes it
+right after every live `blendConfig` update; `acquireEngine()` reads it
+when constructing a FRESH engine (mirroring exactly how it already reads
+`engine_settings` for gpuIndex/dstBufferCount), seeding `e->blendConfig`
+before the default-Flat value would otherwise stick. Separate file from
+`engine_settings` rather than merging them -- blend config changes far
+more often (every slider tweak) than gpuIndex/Latency mode, and "applies
+live" vs. "needs a full engine rebuild" are different enough concerns to
+keep visibly separate on disk.
+
+Verified: builds and links clean, `ctest` 3/3 (18 checks, unaffected).
+Installed while OBS was RUNNING -- needs a restart to apply. **Not yet
+verified live** -- next session should confirm: set Advanced, change
+Latency mode (forcing a remove/re-add), and see BOTH survive the rebuild
+together -- `preset=advanced` in the very first status line after
+reconnecting, not `preset=flat` recovering only after a manual reselect.
+
+## FIXED (2026-07-03, fourth follow-up): adding a source silently reset the shared blur preset too
+
+Same bug CLASS as the Latency mode saga above, confirmed live one more
+time: user set Advanced, then added a (re-added) source, and it came back
+showing `preset=flat` in the status log for ~10 seconds until manually
+reselecting Advanced. Root cause: `gmixUpdate()`'s routine settings-
+application path used to unconditionally write `s->engine->blendConfig`
+EVERY time it ran -- including the automatic call OBS makes when a source
+is created (using THAT source's own default/saved settings, "Flat" for a
+fresh one) -- so simply adding a second source reset the shared preset for
+every scene, even with another already-existing source deliberately set to
+Advanced. Same shape as the Latency mode bug: N per-source copies of what's
+actually ONE shared value, and whichever source was most recently
+touched -- even just by being created -- silently wins.
+
+Asked the user how they wanted this handled (same auto-fire-suppression
+fix as Latency mode, accepting the same tradeoff of losing auto-restore-on-
+scene-reload; vs. leaving it and just documenting the gotcha). Chose the
+former, for consistency with Latency mode.
+
+**Fix:** removed the `s->engine->blendConfig = cfg;` write from
+`gmixUpdate()`'s routine path ENTIRELY. It now happens ONLY from genuine
+Properties-dialog interaction, via THREE new modified-callbacks --
+`gmixPresetModified()` (extended, previously only toggled slider
+visibility), `gmixDensityModified()`, `gmixBrightnessModified()` (both
+new, registered on the density/brightness sliders which had no modified-
+callback before) -- each gated by its OWN auto-fire-suppression flag
+(`gGmixNextPresetModifiedIsAutoFire` etc., same pattern as
+`gGmixNextLatencyModifiedIsAutoFire`, all armed together in
+`gmixGetProperties()`). The actual write is a new shared helper,
+`applyBlendConfigFromSettings()`, which reads straight from the global
+`gEngine` (guarded by `gEngineMu`) rather than needing a `GmixSource*`,
+since blendConfig is engine-wide regardless of which source's dialog
+triggered the change.
+
+Note the preset-visibility toggle (density/brightness sliders shown only
+for Advanced) stays UNCONDITIONAL in `gmixPresetModified()` -- only the
+blendConfig WRITE is gated by the auto-fire flag, since the visibility
+logic needs to run on the auto-fire too (that's what makes the dialog look
+right the instant it's opened).
+
+**Accepted tradeoff (explicitly chosen by the user):** a saved scene
+collection with a source set to Advanced no longer auto-restores that
+preset on OBS restart -- `blendConfig` now starts at its
+default-constructed value (Flat) until a genuine Properties interaction
+sets it, for the SAME reason Latency mode needs a manual re-pick after
+restart. Engine-wide settings that are stored redundantly per-source
+apparently cannot auto-apply safely with multiple sources in play; this
+project is choosing "predictable, requires one manual step" over
+"sometimes silently applies the wrong source's saved value."
+
+Note the two settings differ in WHEN they need reapplying, worth being
+precise about: Latency mode is baked into the engine at creation time, so
+it still needs the "change it, then remove every source and re-add" dance
+every time (unchanged by this fix -- that part is inherent, not a bug).
+Preset/density/brightness are NOT tied to engine creation at all -- they
+apply live via `blendConfigMu` any time `applyBlendConfigFromSettings()`
+runs -- so the fix here is a pure improvement: adding a NEW source no
+longer needs any compensating action, the shared preset just stays
+whatever it already was.
+
+Verified: builds and links clean, `ctest` 3/3 (18 checks, unaffected --
+no blend-engine behavior changed, purely an OBS-properties-plumbing fix).
+Installed while OBS was RUNNING -- safe on Linux, needs a restart to
+apply. **Not yet verified live** -- next session should confirm: after
+setting Advanced, adding a NEW "GMix Motion Blur" source no longer resets
+the shared preset back to Flat (no remove/re-add needed to check this,
+unlike Latency mode).
+
+## FIXED (2026-07-03, third follow-up): the persisted config's WRITE side was firing on more than just user clicks
+
+The persisted-config fix (below) got the READ side right -- the log
+confirmed `using persisted engine settings ... dstBufferCount=5` followed
+immediately by `engine created with ... dstBufferCount=5`, exactly as
+designed. But right after, EVERY TIME a source got re-added, a spurious
+`Latency mode changed -- saved ... dstBufferCount=3` line appeared within
+~20-50ms, silently clobbering the just-read value back down to that new
+source's own stale/default one. The user had to manually re-pick the
+dropdown after every single remove/re-add cycle to compensate (visible in
+the log as a repeating "removed -> engine created at old value -> user
+re-picks -> saved -> removed again..." cycle).
+
+**Root cause:** the design assumed `obs_property_set_modified_callback2`'s
+callback fires ONLY on genuine user interaction with the control. Confirmed
+wrong: OBS also fires it once automatically as part of building/validating
+a freshly-created `obs_properties_t` (e.g. right when a new source's
+properties are first initialized) -- independent of whether a human ever
+opens the Properties dialog. `gmixPresetModified()` relies on the exact
+same mechanism to keep the density/brightness sliders' visibility correct
+from the moment the dialog exists, which is presumably WHY OBS fires it
+eagerly -- but that same eagerness is exactly wrong for a callback whose
+job is "detect a deliberate settings change," not "keep UI state
+consistent."
+
+**Fix:** `gGmixNextLatencyModifiedIsAutoFire`, a plain bool (not a mutex-
+guarded one -- all OBS properties-dialog callbacks run on the single UI
+thread, confirmed safe). `gmixGetProperties()` sets it `true` right before
+returning the freshly-built `obs_properties_t` (arming the guard for the
+ONE synthetic fire OBS is about to make); `gmixLatencyModified()` checks it
+first and, if set, consumes it (resets to `false`) and returns WITHOUT
+writing -- so only the SECOND and later calls (genuine clicks within that
+same dialog session) actually persist anything.
+
+Verified: builds and links clean, `ctest` 3/3 (18 checks, unaffected).
+Installed while OBS was RUNNING (user actively recording) -- safe on
+Linux, needs a restart to apply. **Not yet verified live** -- next session
+should confirm a SINGLE dropdown pick + remove/re-add now reliably produces
+the chosen buffer count on the first try, without the user needing to
+re-pick after every cycle. Also worth double-checking `gmixPresetModified()`
+doesn't have an analogous problem -- it doesn't WRITE anything (just toggles
+slider visibility), so an extra auto-fire there is harmless, which is
+presumably why it was never noticed until Latency mode's write-based design
+exposed it.
+
+## FIXED (2026-07-03, second follow-up): remove-and-re-add couldn't actually apply a non-default Latency mode either
+
+The diagnostics from the FIRST follow-up (below) worked exactly as
+designed and confirmed the diagnosis live -- but then the user followed the
+"remove every source and re-add" instructions and Latency mode STILL came
+back at Medium(3), with the same "will NOT take effect" warnings when
+trying Slow again on the freshly re-added source. That instruction was
+incomplete: a brand-new "+"-added source always starts from
+`gmixGetDefaults()`, because OBS calls `create()` (and therefore
+`acquireEngine()`) before the user has any chance to touch Properties.
+Under PURE per-source settings storage, there was no path at all to a
+non-default value ever taking effect for a fresh engine -- "remove and
+re-add" just recreated the same dead end.
+
+**Fix:** added `~/.config/gmix/engine_settings` (same pattern as the
+existing `target_process` config the capture layer reads), a tiny
+persisted `gpuIndex dstBufferCount` pair.
+- `acquireEngine()` now reads this file FIRST when creating a fresh engine
+  (`readEngineSettingsConfig()`), overriding whatever the specific calling
+  source's own per-source values were, and falls back to the caller's
+  values only if the file doesn't exist yet (first-ever run).
+- The file is written ONLY from a genuine Latency-mode-dropdown interaction
+  in the Properties dialog -- a new `gmixLatencyModified()` modified-
+  callback (`obs_property_set_modified_callback2` on the latency list
+  property), mirroring `gmixPresetModified()`'s pattern. Deliberately NOT
+  written from `gmixUpdate()`'s routine settings-application path (which
+  also runs on ordinary source creation and scene-collection load): if it
+  wrote there, a brand-new default-configured second source would silently
+  clobber a deliberately-persisted non-default value the moment it's
+  created, defeating the whole mechanism. The modified callback is the
+  correct signal because OBS only fires it on actual UI interaction, never
+  during silent settings application.
+
+With this, the actual working sequence is: open Properties on ANY source
+(existing or new), change Latency mode (this alone persists it, silently,
+to the config file, with a `gmix: Latency mode changed -- saved...` log
+line), then remove every "GMix Motion Blur" source and re-add ONE -- the
+fresh engine now reads the persisted file instead of that new source's own
+defaults.
+
+Verified: builds and links clean, `ctest` 3/3 (18 checks, unaffected --
+diagnostics/persistence-only change, no new blend-engine behavior to
+assert). Installed while OBS was NOT running. Confirmed no stale
+`~/.config/gmix/engine_settings` existed before this change (checked
+`~/.config/gmix/` -- only `target_process` was present), so this session's
+tests start from a clean slate for it. **Not yet verified live** -- next
+session should actually walk the corrected sequence above and confirm
+`dst[0]`-`dst[3]` (4 buffers) get imported after setting Slow + remove/
+re-add, not just 3.
+
+## FIXED (2026-07-03 follow-up): Latency mode changes were silently ignored, with zero feedback
+
+User set Latency mode to Slow before recording; the log showed only
+`dst[0]`-`dst[2]` imported (3 buffers = Medium, the default) the whole
+session. Root cause: exactly the limitation already documented for
+`dstBufferCount`/`gpuIndex` ("fixed once the first source is created") --
+but with TWO "GMix Motion Blur" sources already existing (from a saved
+scene collection), whichever one OBS happens to construct FIRST on load
+wins, using THAT source's own saved setting. If the user edited Slow on one
+source but the other (still saved at Medium) got constructed first, the
+change silently never took effect -- no error, no log line, nothing.
+Same silent-no-op also happens just from editing Latency mode on an
+ALREADY-EXISTING source's Properties dialog after the engine is already
+running (the far more likely actual scenario here, since the user
+described "setting it before recording" on an existing source, not
+creating a new one).
+
+**Fix (diagnostics, not a behavior change -- the underlying "fixed at first
+creation" design is unchanged, this just makes it visible):**
+- `acquireEngine()`: logs `gmix: engine created with gpuIndex=%d
+  dstBufferCount=%u ...` on first creation (so the ACTUAL value in effect is
+  always in the log, not just inferred from counting `dst[N]` lines), and a
+  `LOG_WARNING` if a LATER source's requested gpuIndex/dstBufferCount
+  differs from what's already locked in.
+- `gmixUpdate()`: if `s->engine` already exists and the newly-parsed
+  `dstBufferCount` differs from `s->engine->dstBufferCount`, warns
+  immediately (this is the path that fires for "edited an existing source's
+  Properties dialog", which is what actually happened here) --
+  `gmix: Latency mode change to %u buffers will NOT take effect -- the
+  shared engine is already running at %u buffers ... Remove every GMix
+  Motion Blur source and re-add to apply the new value.`
+
+**Practical fix for the user's actual session:** to make Slow (or any
+Latency mode change) take effect, remove EVERY "GMix Motion Blur" source
+(both of them, from both scenes) and re-add -- the fresh engine created at
+that point reads whichever source's CURRENTLY-saved setting gets
+constructed first. Simply restarting OBS does NOT help, since the same two
+sources reload from the same saved scene collection with the same
+ordering ambiguity.
+
+**Not implemented, worth considering if this keeps biting:** a more robust
+design would source gpuIndex/dstBufferCount from ONE global location (e.g.
+a small `~/.config/gmix/engine_settings` file, written by `gmixUpdate()`
+the same way `writeTargetProcessConfig()` already does for the capture
+layer's target process) instead of N per-source `obs_data_t` copies that
+can disagree -- would make "last edited wins" deterministic regardless of
+OBS's source-construction order, though an already-running engine still
+couldn't pick up a value change without a full teardown/recreate (that part
+is inherent, not fixable by relocating where the setting lives).
+
+Verified: builds and links clean, `ctest` 3/3 (18 checks in
+`test_blend_engine`, unaffected -- this is a diagnostics-only change, no
+new test needed since there's no new runtime behavior to assert, just log
+output). Installed while OBS was RUNNING -- needs a restart to take effect.
+**Not yet verified live** -- next session should confirm the new engine-
+created log line appears, and that the warning fires when Latency mode is
+changed on an existing source with the engine already running.
+
+## ADDED (2026-07-03, branch `optical-flow-lucas-kanade`): "Latency mode" OBS setting (runtime dst buffer count)
+
+User observed latency drifting non-linearly over a session (up, plateau,
+back down -- possibly the game itself, possibly system-level, not fully
+root-caused) and asked for one more frame of budget when Advanced is
+active, "or make it an option, latency mode fast | medium (default) | slow
+| very slow." Implemented as the general option rather than an Advanced-only
+special case -- more consistent, and the actual mechanism (buffer count)
+isn't specific to Advanced anyway.
+
+**What it actually controls:** `BlendEngine::kDstBuffers` (previously a
+compile-time `static constexpr uint32_t = 3`) is now a RUNTIME value,
+`dstBufferCount()`, chosen via `init(w, h, dstBufferCount)`. More buffers
+= more round-robin slots before a dispatch target gets reused = more
+tolerance for the blend's own timing to vary (GPU contention with the game,
+thermal/scheduling drift) without a slow blend's write racing a still-in-
+progress OBS read of that same buffer -- see the extended comment on
+`dstBufferCount()` in `blend_engine.hpp`. Cost: one more capture-resolution
+RGBA8 image in VRAM per step, and a larger theoretical worst-case front-
+buffer staleness. Mapping: Fast=2 (tightest, the pre-triple-buffer-fix
+behavior), Medium=3 (default, unchanged from before), Slow=4, Very slow=5.
+
+**Scope of the refactor:** `BlendEngine`'s five `[kDstBuffers]`-sized fixed
+arrays (`dstImage_`, `dstMem_`, `dstView_`, `dmaBufFd_`, `dmaBufStride_`,
+`dmaBufOffset_`) became `std::vector`s, resized in `createDstImage()` to
+whatever `numDstBuffers_` `init()` was called with (clamped to
+`[kMinDstBuffers=2, kMaxDstBuffers=5]`). On the `gmix_source.cpp` side:
+`GmixEngine::tex` became a `std::vector<gs_texture_t*>` (sized once in
+`acquireEngine()`, before the worker thread starts); every local
+`gs_texture_t*[kDstBuffers]` array in `workerMain()`/`releaseEngine()`
+(`pendingTex`, `texSnapshot`, `oldTex`) became a `std::vector` sized to
+`s->dstBufferCount`; the `nextWriteIdx` round-robin modulo uses
+`s->dstBufferCount` instead of the old compile-time constant. Descriptor
+set/pool sizing needed NO changes -- the dst image is bound ONE AT A TIME
+per dispatch (`dstView_[dstIdx]`), not as a fixed-size array registered
+simultaneously like the source images are, so buffer count never touched
+GPU descriptor layout.
+
+**New OBS setting:** `kSettingLatencyMode` = `"latency_mode"`, a "Latency
+mode" dropdown in Properties (Fast/Medium/Slow/Very slow), NOT preset-
+specific -- applies engine-wide like GPU index, fixed once the first "GMix
+Motion Blur" source is created (same limitation GPU index already has:
+changing it later, or setting it differently on a second source, has no
+effect until every source is removed and re-added).
+
+Added `blend_engine_runtime_dst_buffer_count` to `tests/test_blend_engine.cpp`
+-- inits with 5 buffers, confirms `dstBufferCount()` reports it, every
+`dstImage()`/`dstView()` up to that count is a real handle (not just index 0,
+which every other test already covered), `dispatchAsync()` into the LAST
+valid slot works, and an out-of-range index is rejected rather than
+silently clamped/UB.
+
+Verified: builds and links clean, `ctest` now 4 test binaries' worth (3
+existing + 1 new case) all passing -- confirmed live at 5 buffers
+(`dst[0]` through `dst[4]` all exported dma-buf fds successfully in the
+test run). Installed while OBS was RUNNING -- safe on Linux, needs a
+restart to take effect. **Not yet verified live in OBS itself** -- next
+session should confirm the "Latency mode" dropdown appears, actually
+changes the number of `dst[N]` import lines logged on connect, and that
+Slow/Very slow measurably reduces whatever the observed latency-drift
+symptom was (the actual root cause of that drift is still not confirmed --
+this is a mitigation/tolerance increase, not a diagnosed fix).
+
+## ADDED (2026-07-03, branch `optical-flow-lucas-kanade`): Lucas-Kanade windowed optical flow for Advanced
+
+User asked for deep research (no code) on making low-velocity motion look
+smoother than a plain window/game capture. Full writeup wasn't preserved
+here verbatim, but the actionable conclusion: GMix is post-render-capture
+only (no depth buffer/motion vectors/camera control), which rules out most
+modern techniques (TAA-style camera jitter, G-buffer extrapolation). The
+best-fit, lowest-risk improvement within that constraint: the Advanced
+preset's single-point brightness-constancy motion estimate
+(`resample_blur.comp`) is noisiest exactly at low velocity, since the
+temporal difference `Iₜ` is tiny there and a one-pixel estimate is
+dominated by noise rather than signal (the classic aperture problem).
+
+**Implemented:** replaced the single-point estimate with Lucas-Kanade --
+aggregate the brightness-constancy constraint (least-squares normal
+equations) over a 3x3 local window instead of one point, solved via
+Cramer's rule; falls back to `v=0` (sharp, no trail) when the window is too
+flat/uniform to constrain a direction (near-singular 2x2 matrix), same
+fallback behavior as before, just reached more reliably. Shader-only
+change (`shaders/resample_blur.comp`); no C++/push-constant changes needed,
+window radius is a compile-time constant (`R=1`) not exposed as a setting.
+
+**Latency budget, per user direction:** be mindful that this is real extra
+GPU cost -- if Advanced's blend_latency exceeds half an output frame
+interval, that's fine/expected: Advanced gets a LOOSER end-to-end latency
+budget than the default presets on purpose (~3-4 output frames instead of
+the tight ~2-frame target established for Flat/Linear/Cinematic/Heavy).
+Implemented as: (1) the status log now prefixes with `preset=%s` so an
+elevated `blend_latency` is immediately attributable to Advanced instead of
+requiring after-the-fact correlation-hunting (which was needed earlier this
+session to confirm the Cinematic-preset cost); (2) a rate-limited (log-once-
+per-crossing) `LOG_WARNING` fires only if Advanced's `blend_latency +
+draw_latency` exceeds 4x the output frame interval -- i.e. even the relaxed
+budget, not the tight one. No new gating/throttling code was added:
+`BlendEngine`'s single-blend-in-flight + tick-gated dispatch design already
+lets a slow blend take as long as it needs (at the cost of `blend`/`drawn`
+fps dropping, not a stall or corruption), so the "budget" here is
+diagnostic/documentation, not a new enforcement mechanism -- deliberately,
+since a hand-rolled latency cap done wrong is exactly what caused the
+drawn-trailing-blend judder bug fixed earlier this session.
+
+Verified: shader compiles clean via glslangValidator (grew ~9.2KB->10.9KB,
+consistent with the added window loop), full build/link clean, `ctest` 3/3
+(80 checks). Installed while OBS was NOT running. **Not yet verified live**
+-- next session should confirm: (1) low-velocity motion in Advanced mode
+looks visibly smoother/more stable than before (less erratic trail
+direction), (2) `blend_latency` for Advanced stays reasonable in practice
+(watch the new `preset=` field in the status log), (3) the budget warning
+doesn't fire under normal use (if it does routinely, the 3x3 window or
+default blur density may need to come down).
+
+Work is on a dedicated branch (`optical-flow-lucas-kanade`, branched off
+`master` at the point where multi-scene/smoothness/presets/lock-order/
+Cinematic fixes were all tested-but-uncommitted) specifically so this
+experimental change can be developed/tested in isolation from that
+already-confirmed-working state.
+
 ## FIXED (2026-07-03): Cinematic preset washed out to a flat smear at real gameplay frame counts
 
 User reviewed recorded footage and reported Cinematic "look less cinematic
