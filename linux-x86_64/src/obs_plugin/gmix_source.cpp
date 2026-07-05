@@ -872,15 +872,13 @@ void gmixGetDefaults(obs_data_t* settings) {
     obs_data_set_default_string(settings, kSettingTarget, kDefaultTarget);
     obs_data_set_default_int(settings, kSettingGpuIndex, -1);
     obs_data_set_default_int(settings, kSettingBlurDensity, 4);
-    // 1.3, not 1.0 -- 1.0 (pure energy-conserving average, no boost) tested
-    // visibly under-bright for the Advanced-style motion trail. 1.2 was an
-    // earlier live-confirmed baseline, since raised to 1.3: 1.5 gave the
-    // best in-game blur but was too bright on menu screens (mostly static,
-    // bright UI -- the boost is motion-gated but menus still have plenty of
-    // moving elements), and there's no single value that's right for both,
-    // so 1.3 splits the difference as the default and the slider is there
-    // for the user to tune per-content.
-    obs_data_set_default_double(settings, kSettingBrightness, 1.3);
+    // 1.0 = pure energy-conserving average, no boost. Used to be raised to
+    // 1.3 to compensate for a shader that under-filled the trail (see
+    // BlendConfig.hpp's comment / etc/DEV_NOTES.md's 2026-07-05 entry) --
+    // now that per-frame-pair motion estimation fills it properly, 1.0
+    // looks correct on its own and is confirmed live as the real neutral
+    // default; the slider is still there to tune per-content.
+    obs_data_set_default_double(settings, kSettingBrightness, 1.0);
 }
 
 // CONFIRMED LIVE: OBS fires a property's modified-callback once automatically

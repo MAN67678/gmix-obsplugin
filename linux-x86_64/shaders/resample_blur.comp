@@ -168,14 +168,26 @@ void main()
         // window must constrain motion well in BOTH directions (a real
         // corner/textured blob like the cursor sprite), not just one (an
         // edge/line, which is unstable and should fall back to v=0).
-        float trace  = sumIxIx + sumIyIy;
-        float det    = sumIxIx * sumIyIy - sumIxIy * sumIxIy;
-        float minEig = 0.5 * (trace - sqrt(max(trace * trace - 4.0 * det, 0.0)));
-        // Threshold is a starting point (Ix/Iy are luma differences in
-        // [-1,1], so real corner-like structure typically sits well above
-        // this) -- tighten further if edge fringing persists live, loosen if
-        // real cursor motion stops being detected.
-        bool  trustworthy = minEig > 5e-3;
+        //
+        // The floor is RELATIVE to this pixel's own local gradient energy
+        // (trace), not an absolute magnitude -- an earlier version used a
+        // fixed absolute floor (5e-3), which broke on cursor skins with
+        // lower brightness/contrast than the one it was tuned against: a
+        // dimmer cursor's gradient never reaches the same fixed bar, so
+        // most of its motion path got rejected as untrustworthy and fell
+        // back to a bare sharp tap per frame -- a string of separate
+        // glowing dots instead of a blended streak, while a brighter-skin
+        // cursor blended fine with the exact same code. A ratio-based test
+        // (how CORNER-LIKE the local structure is, i.e. how close the two
+        // eigenvalues are to each other) is scale-invariant to brightness/
+        // color, so it should generalize across skins without retuning --
+        // `hasEnergy` still separately rejects genuinely flat/textureless
+        // regions (which would otherwise pass a pure ratio test via 0/0).
+        float trace     = sumIxIx + sumIyIy;
+        float det       = sumIxIx * sumIyIy - sumIxIy * sumIxIy;
+        float minEig    = 0.5 * (trace - sqrt(max(trace * trace - 4.0 * det, 0.0)));
+        bool  hasEnergy = trace > 1e-4;
+        bool  trustworthy = hasEnergy && (minEig > 0.15 * trace);
         float maxLen = float(max(sz.x, sz.y)) / 8.0;   // clamp: no wild flung taps
 
         // ── Per-consecutive-pair velocity: pairV[i] = flow from frame i to
