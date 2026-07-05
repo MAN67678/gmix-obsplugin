@@ -110,8 +110,119 @@ is now a tightly coupled chain (tap cap ↔ smoothing width ↔ eigenvalue
 floor) — re-read this whole entry before changing any one piece in
 isolation, since each fix exists to correct a symptom the previous one
 exposed. The two numeric constants most likely to need live retuning if a
-future test surfaces something new: the Shi-Tomasi floor (`5e-3`) and the
+future test surfaces something new: the Shi-Tomasi floor (was `5e-3`, see
+the next entry for why it's now a ratio, not an absolute) and the
 smoothing window width (currently 5-tap).
+
+## FIXED (2026-07-05, same-day follow-up): absolute Shi-Tomasi floor broke on a different cursor skin; brightness default was still compensating for the old under-filled trail
+
+Two more live-tested fixes after the five above, both on the same branch.
+
+**1. Cross-skin regression: a different cursor skin (lower-contrast/
+different color than the one the `5e-3` floor above was tuned against)
+produced a string of disconnected glowing dots instead of a smooth trail —
+worked fine on the original skin, broke on this one, "no idea why."** Root
+cause: `minEig > 5e-3` is an ABSOLUTE magnitude test. Different skins'
+cursors have very different brightness/contrast, so their local gradient
+(Ix, Iy — and therefore `minEig`) sits at a completely different absolute
+scale; a dimmer/lower-contrast cursor's gradient never reaches the same
+fixed bar the brighter one was tuned against, so most of ITS motion path
+got rejected as untrustworthy and fell back to a bare sharp tap per frame —
+the same "disconnected dots" symptom as the original discrete-blob bug,
+just from a different mechanism (per-skin contrast instead of per-pixel
+noise). Fix: replaced the absolute floor with a RATIO test, the standard
+Shi-Tomasi/Harris form — `hasEnergy = trace > 1e-4` (reject genuinely flat/
+textureless regions, still needed since a pure ratio is undefined at
+trace≈0) AND `minEig > 0.15 * trace` (reject edge-like/aperture-problem
+structure via how close the two eigenvalues are to each other, i.e. how
+"corner-like" the local structure is, RELATIVE to that pixel's own signal
+strength). This is brightness/color-scale-invariant, so it shouldn't need
+re-tuning per skin. Confirmed live: the problem skin now blends smoothly,
+AND the original skin/menus still show no meaningful edge fringing — a
+very faint residual speckle remained on one busy, highly-detailed static
+background image, diagnosed as a harder, more fundamental limit (a
+per-pixel-only heuristic can't perfectly distinguish "real corner, static,
+with capture/compression dithering noise" from "real corner, tiny real
+motion" on genuinely high-frequency content — would need a stricter
+multi-frame temporal-consistency requirement to chase further, trading off
+against under-filling brief real motions again). Not chased further this
+session; revisit only if it's reported as actually bothersome.
+
+**2. "Blur brightness" defaulted to 1.80 on a new source, not the coded
+default.** Two separate things were going on here, both resolved:
+- The 1.80 the user saw was NOT the coded default — it's documented,
+  intentional behavior: a new source attaching to an ALREADY-RUNNING shared
+  engine syncs its displayed Properties value FROM the live engine's
+  current config (`gmixCreate()`, see its comment), so the dialog doesn't
+  look stale relative to what's actually rendering. The engine had been
+  live-tuned to 1.8 earlier in the same OBS session, so any new source
+  inherited that, not the coded default. To actually see a changed
+  default, every "GMix Motion Blur" source must be removed (full engine
+  teardown) and OBS restarted before adding a fresh one.
+- BUT the coded default itself WAS stale: 1.3, chosen back when the shader
+  under-filled the trail and needed a boost to compensate (see the five-fix
+  entry above). With per-frame-pair motion estimation now filling the
+  trail properly, 1.0 (pure energy-conserving average, no boost) is
+  genuinely correct on its own. Changed the hard default to 1.0 in both
+  `BlendConfig.hpp`'s struct default and `gmixGetDefaults()`'s
+  `obs_data_set_default_double()` in `gmix_source.cpp`.
+
+Both fixes: shader change for (1) (no `.so` rebuild/reinstall needed, only
+`resample_blur.spv`); C++ change for (2) (`.so` rebuilt and reinstalled).
+`ctest` 2/2 green throughout.
+
+## FIXED (2026-07-05, same-day follow-up): capture layer was doing synchronous disk I/O on every present — a real, non-GPU cause of in-game stutter
+
+User asked directly, after the live-stream test reported stutter: "is gmix
+able to make osu stutter if not from gpu resource use alone." Yes —
+`VulkanLayerCapture::onQueuePresent()` (`src/capture/VulkanLayerCapture.cpp`)
+was unconditionally doing, on EVERY intercepted present call (hundreds to
+1000+ times/sec, inside osu!'s own present thread, before the real present
+proceeds):
+1. `std::fprintf(stderr, ...)` — a synchronous stderr write.
+2. Opening `~/.cache/gmix/presents.log` in append mode, writing a line,
+   and closing it — a full open/write/close syscall sequence, not batched
+   or buffered, every single present.
+
+Both were leftover from one-off "quick testing and verification" debugging
+early in the project and were never gated behind a flag or removed. The
+smoking gun that this had been running unconditionally, forever: the debug
+log file had silently grown to **5.2 GB**. This is real, blocking CPU-side
+I/O stalling the game's own frame loop, completely independent of any GPU/
+compute cost — likely a significant, previously-unaccounted-for chunk of
+the CPU-bottleneck numbers reported in README's "System requirements"
+(i5-3470: osu!'s own fps dropping ~1000→700 idle / ~600→500 typical with
+gmix active) from long before this fix existed.
+
+**Fix**: removed both entirely from the capture layer (also dropped the
+now-unused `<iomanip>`/`<ctime>`/`<sstream>` includes it needed). Replaced
+with the ONE diagnostic actually worth having, moved to where it's
+meaningful: `receiverThreadFn()` in `gmix_source.cpp` now logs (via OBS's
+`blog`, rate-limited to once per ~2s with a running drop count) `gmix:
+blend buffer overload -- dropped N backlogged frame(s)...` only when the
+consumer is genuinely falling behind the capture rate and dropping frames
+-- a real, rare, actionable signal instead of per-frame noise. User's own
+framing for what to log: "only logs when they are blending buffer
+overload."
+
+Also found while fixing this: the Vulkan layer actually INSTALLED at
+`~/.local/share/vulkan/implicit_layer.d/` was stale from long before this
+entire session (old manifest filename `gmix_capture.json`, old function-
+table entry-point symbol names, different `.so` md5 than any build from
+this session) -- rebuilding never refreshes it, since it's a real install
+step (`gmix --install-layer` copies files there), unlike the OBS plugin's
+`.so`-only-if-C++-changed / shader-picked-up-automatically split. Ran
+`./build/gmix --install-layer` to refresh it before the live retest --
+this is safe/expected for an agent to run directly (it's local
+infrastructure setup, not launching the actual game/capture-hooked
+process).
+
+**Confirmed live: smooth gameplay at ~1000fps, no perceptible stutter.**
+User deleted the orphaned 5.2GB `presents.log` afterward (nothing writes to
+it anymore on a current build). README's "System requirements" section was
+rewritten same-day to stop presenting the old, now-substantially-
+confounded CPU-bottleneck numbers as current fact — see the
+"CPU-bound" framing note there.
 
 ## CHANGED (2026-07-03, sixteenth): plugin stripped down to Advanced-only, fixed Latency mode, no more preset/latency config files
 

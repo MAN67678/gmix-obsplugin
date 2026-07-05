@@ -7,10 +7,13 @@ frames inside each 1/60 s into one output frame — real camera-shutter motion
 blur from real frame data — then hands the result to OBS **zero-copy** (GPU
 dma-buf export/import, no CPU readback, no virtual camera, no kernel module).
 
-status: working end-to-end (zero-copy render verified live against osu!lazer
-on RADV/Polaris10). Frame pacing is smooth; on CPU-bound systems, running
-gmix's blend thread alongside osu! costs some of osu!'s own framerate
-headroom (see System Requirements below) -- not yet optimized further.
+status: working end-to-end (zero-copy render verified live against
+osu!lazer on RADV/Polaris10), and live-tested against a real streaming
+session with the motion blur quality confirmed against a reference video.
+A real cause of in-game stutter was found and fixed 2026-07-05 (see
+"System requirements" below and `etc/DEV_NOTES.md`) -- confirmed live
+afterward as smooth at ~1000fps with no perceptible drop from gmix's own
+work.
 
 ## What GMix is (and isn't)
 
@@ -79,12 +82,22 @@ a setup is misbehaving and you need to know which piece to look at — see
 
 ## System requirements
 
-**Linux (tested baseline — confirmed usable, CPU-bound):**
-- CPU: Intel Core i5-3470 (4 cores @ 3.20 GHz) or better. This is the
-  measured bottleneck: gmix's blend thread competes with the game for CPU
-  time, and on this exact CPU osu!'s own framerate drops from ~1000fps
-  (idle) / ~600fps (typical) to ~700fps (idle) / ~500fps (typical) while
-  gmix is active. A faster/more-core CPU should recover most of that.
+**Linux (tested baseline — confirmed usable):**
+- CPU: Intel Core i5-3470 (4 cores @ 3.20 GHz) or better. An earlier
+  version of this section reported this as a hard CPU bottleneck (osu!'s
+  own framerate dropping from ~1000fps/~600fps idle/typical down to
+  ~700fps/~500fps with gmix active). **That measurement was confounded by
+  a real bug**, fixed 2026-07-05: the capture layer was unconditionally
+  doing synchronous disk I/O (a debug log write + an stderr print) on
+  *every single* intercepted present call — hundreds to 1000+ times a
+  second, blocking the game's own present thread independent of any real
+  GPU/compute cost (the debug log file itself had silently grown to 5.2 GB
+  from being left on since early development — see `etc/DEV_NOTES.md`).
+  With that fixed, live re-testing showed smooth gameplay at ~1000fps with
+  no perceptible drop. The CPU listed above is kept as a reasonable
+  minimum floor (gmix's blend thread is real, ongoing CPU work and hasn't
+  been rigorously re-benchmarked against this exact CPU since the fix),
+  not a "you will lose 30-50% fps" warning like the old text implied.
 - RAM: 8 GB
 - GPU: AMD/RADV or similar with `VK_EXT_external_memory_dma_buf` support,
   2016-era or newer (tested on an AMD Radeon RX 480 / Polaris10). Needs
@@ -259,3 +272,14 @@ scenes via **Add Existing Source**) rather than several independent
   That path (and its vendored out-of-tree kernel module) has been removed
   entirely — it was implicated in a kernel panic and is superseded by the
   native OBS plugin's zero-copy delivery.
+- The capture layer no longer does any per-present logging. It used to
+  (unconditionally, every intercepted present call) write to both stderr
+  and a `~/.cache/gmix/presents.log` debug file — real, synchronous disk
+  I/O inside the game's own present thread, and a genuine cause of in-game
+  stutter independent of GPU load (fixed 2026-07-05, see "System
+  requirements" above). If you're on an old build and see a multi-GB
+  `~/.cache/gmix/presents.log`, that's this bug; it's safe to delete and
+  won't come back on a current build. The one diagnostic that replaced it
+  is a rate-limited `gmix: blend buffer overload` warning in the OBS log,
+  logged only when the blend pipeline is actually dropping backlogged
+  frames (i.e. a real overload, not routine per-frame noise).
