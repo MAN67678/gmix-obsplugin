@@ -83,21 +83,11 @@ a setup is misbehaving and you need to know which piece to look at — see
 ## System requirements
 
 **Linux (tested baseline — confirmed usable):**
-- CPU: Intel Core i5-3470 (4 cores @ 3.20 GHz) or better. An earlier
-  version of this section reported this as a hard CPU bottleneck (osu!'s
-  own framerate dropping from ~1000fps/~600fps idle/typical down to
-  ~700fps/~500fps with gmix active). **That measurement was confounded by
-  a real bug**, fixed 2026-07-05: the capture layer was unconditionally
-  doing synchronous disk I/O (a debug log write + an stderr print) on
-  *every single* intercepted present call — hundreds to 1000+ times a
-  second, blocking the game's own present thread independent of any real
-  GPU/compute cost (the debug log file itself had silently grown to 5.2 GB
-  from being left on since early development — see `etc/DEV_NOTES.md`).
-  With that fixed, live re-testing showed smooth gameplay at ~1000fps with
-  no perceptible drop. The CPU listed above is kept as a reasonable
-  minimum floor (gmix's blend thread is real, ongoing CPU work and hasn't
-  been rigorously re-benchmarked against this exact CPU since the fix),
-  not a "you will lose 30-50% fps" warning like the old text implied.
+- CPU: Intel Core i5-3470 (4 cores @ 3.20 GHz) or better. Confirmed live at
+  ~1000fps, both idle and during typical gameplay, with no perceptible
+  stutter. gmix's blend thread is real, ongoing CPU work alongside the game
+  even so; a faster/
+  more-core CPU gives more headroom.
 - RAM: 8 GB
 - GPU: AMD/RADV or similar with `VK_EXT_external_memory_dma_buf` support,
   2016-era or newer (tested on an AMD Radeon RX 480 / Polaris10). Needs
@@ -110,11 +100,13 @@ a setup is misbehaving and you need to know which piece to look at — see
 
 **Windows:** not coming soon. A `../WIN32/` folder exists as a placeholder
 for a future port, but there's no active work on it and no timeline — the
-blocker is the developer's own hardware/driver setup (no Windows machine
-with the right GPU/driver combo to build and test the Vulkan capture +
-zero-copy dma-buf path against), not a design decision against Windows
-itself. For now, GMix is Linux-exclusive; that'll be revisited if/when the
-hardware situation changes.
+blocker is the developer's own hardware/driver setup: no Windows machine
+with a suitable GPU/driver combination to build and test a capture layer
+against any of Windows' relevant graphics APIs (osu! can run on Vulkan,
+D3D11, or OpenGL there, so a real port would need all three covered, not
+just one), not a design decision against Windows itself. For now, GMix is
+Linux-exclusive; that'll be revisited if/when the hardware situation
+changes.
 
 ## Dependencies
 
