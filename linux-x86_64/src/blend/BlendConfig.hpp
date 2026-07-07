@@ -29,17 +29,14 @@ struct BlendConfig {
     // "Blur brightness" in the OBS properties UI: a motion-gated exposure
     // boost on the trail (resample_blur.comp's `shutterStrength` -- see that
     // file for the current mechanism, reworked multiple times on
-    // 2026-07-03). 1.0 = pure energy-conserving average, no boost -- an
-    // earlier version of the shader visibly under-filled the trail (see
-    // etc/DEV_NOTES.md's 2026-07-05 entry), so a >1.0 default (1.3, then
-    // briefly tuned higher live) was used to compensate. Now that the
-    // per-frame-pair motion estimation actually fills the trail properly,
-    // 1.0 is genuinely neutral and looks correct on its own -- confirmed
-    // live 2026-07-05. Matches gmixGetDefaults()'s kSettingBrightness
-    // default in gmix_source.cpp, which is what real sources actually use --
-    // this struct default only matters before any saved obs_data/scene-
-    // collection value is applied.
-    float    shutterStrength = 1.0f;
+    // 2026-07-03). 1.0 = pure energy-conserving average, no boost;
+    // user-tested live as visibly under-bright for the Advanced trail. 1.3
+    // is the live-confirmed default (1.5 gave the best in-game blur but was
+    // too bright on menu screens, no single value suits both); matches
+    // gmixGetDefaults()'s kSettingBrightness default in gmix_source.cpp,
+    // which is what real sources actually use -- this struct default only
+    // matters before any saved obs_data/scene-collection value is applied.
+    float    shutterStrength = 1.3f;
 
     // Output window size.
     uint32_t outW = 1920;
