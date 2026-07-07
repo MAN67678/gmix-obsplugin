@@ -207,7 +207,7 @@ with your scene collection:
   regardless of this slider), so raising the ceiling only costs GPU time
   where there's real fast motion to resolve, not across the whole frame —
   live-tested at density=64 with no framerate regression.
-- **Blur brightness** (0.1-10, default **1.3**) — exposure boost applied
+- **Blur brightness** (0.1-10, default **1.0**) — exposure boost applied
   ONLY where real motion was detected (gated by the estimated per-pixel
   motion magnitude), so it brightens/dims the trail without touching
   static, non-moving parts of the scene. 1.0 is neutral (pure average, no
