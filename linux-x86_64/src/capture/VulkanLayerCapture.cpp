@@ -5,6 +5,8 @@
 #include <fstream>
 #include <chrono>
 #include <filesystem>
+#include <string>
+#include <dlfcn.h>
 #include <unistd.h>
 #include "LayerIpc.hpp"
 #include "../ipc/frame_sender.hpp"
@@ -14,6 +16,71 @@ namespace gmix {
 namespace capture {
 
 namespace {
+
+// ── True cursor position, read from the target's OWN already-loaded SDL3 ──────
+// The capture layer runs in-process, so libSDL3.so is already mapped into our
+// address space. SDL has itself processed the platform (Wayland/X11) pointer
+// events, so SDL_GetMouseState() returns the window-relative cursor position as
+// of this present with zero compositor-protocol work and identical behavior on
+// either backend. We normalize by the window's logical size (SDL_GetWindowSize
+// via the mouse-focus window) so the value is resolution/HiDPI-independent --
+// the pixel density cancels, and the consumer just multiplies by the captured
+// frame's pixel extent. Returns false (caller stores a <0 sentinel) if SDL
+// isn't resolvable, there's no focused window, or the window has zero size.
+bool readCursorNormalized(float& nx, float& ny) {
+    using PFN_GetMouseState = uint32_t (*)(float*, float*);
+    using PFN_GetMouseFocus = void*    (*)();
+    using PFN_GetWindowSize = int      (*)(void*, int*, int*);
+
+    struct SDL {
+        PFN_GetMouseState getMouseState = nullptr;
+        PFN_GetMouseFocus getMouseFocus = nullptr;
+        PFN_GetWindowSize getWindowSize = nullptr;
+        bool ok = false;
+    };
+    static const SDL sdl = []() -> SDL {
+        // osu-framework's .NET native loader dlopen()s libSDL3.so by ABSOLUTE
+        // PATH with local scope, so its symbols are in neither the global
+        // (RTLD_DEFAULT) scope nor matchable by bare soname. Find the exact
+        // resident path in our own memory map and re-dlopen THAT: already
+        // loaded, so it just bumps the refcount (no second copy, no re-init)
+        // and hands back a handle we can dlsym.
+        void* h = dlopen("libSDL3.so", RTLD_NOLOAD | RTLD_LAZY);
+        if (!h) {
+            std::ifstream maps("/proc/self/maps");
+            std::string line;
+            while (std::getline(maps, line)) {
+                std::string::size_type slash = line.find('/');
+                if (slash == std::string::npos) continue;
+                if (line.find("libSDL3.so") == std::string::npos) continue;
+                std::string path = line.substr(slash);
+                h = dlopen(path.c_str(), RTLD_NOLOAD | RTLD_LAZY);
+                if (!h) h = dlopen(path.c_str(), RTLD_LAZY);
+                break;
+            }
+        }
+        if (!h) return {};
+        SDL s;
+        s.getMouseState = reinterpret_cast<PFN_GetMouseState>(dlsym(h, "SDL_GetMouseState"));
+        s.getMouseFocus = reinterpret_cast<PFN_GetMouseFocus>(dlsym(h, "SDL_GetMouseFocus"));
+        s.getWindowSize = reinterpret_cast<PFN_GetWindowSize>(dlsym(h, "SDL_GetWindowSize"));
+        s.ok = s.getMouseState && s.getMouseFocus && s.getWindowSize;
+        return s;
+    }();
+    if (!sdl.ok) return false;
+
+    void* win = sdl.getMouseFocus();
+    if (!win) return false;              // pointer isn't over our window right now
+    int ww = 0, wh = 0;
+    sdl.getWindowSize(win, &ww, &wh);
+    if (ww <= 0 || wh <= 0) return false;
+
+    float mx = 0.f, my = 0.f;
+    sdl.getMouseState(&mx, &my);         // window-relative, logical points
+    nx = mx / static_cast<float>(ww);
+    ny = my / static_cast<float>(wh);
+    return true;
+}
 
 // The blend shader declares GLSL `rgba8` (= VK_FORMAT_R8G8B8A8_UNORM) for its
 // storage image bindings, so the export image is always allocated in that
@@ -732,7 +799,18 @@ void VulkanLayerCapture::maybeExportFrame(VkQueue queue, VkPresentInfoKHR* pPres
             std::chrono::duration_cast<std::chrono::nanoseconds>(now.time_since_epoch()).count());
         hdr.rowPitch = exportRowPitch_;
         hdr.gpuTimestampNs = gpuTsToSend;
-        ok = sender->sendFrame(hdr, memFd, semFd);
+        // True cursor position for THIS frame's present (see readCursorNormalized
+        // + the cursorX/Y field docs in frame_protocol.hpp). <0 sentinel when
+        // unavailable so the consumer can skip it when reconstructing the path.
+        float cnx = -1.f, cny = -1.f;
+        readCursorNormalized(cnx, cny);
+        hdr.cursorX = cnx;
+        hdr.cursorY = cny;
+        // Skipped (receiver backpressure) is NOT a connection failure --
+        // only Failed means the connection is actually dead. Treating
+        // Skipped as ok==true leaves the connection untouched below; the
+        // frame's own fds are already closed inside sendFrame() either way.
+        ok = sender->sendFrame(hdr, memFd, semFd) != ipc::FrameSender::SendResult::Failed;
     } else {
         ::close(memFd);
         ::close(semFd);

@@ -80,6 +80,10 @@ layout(push_constant) uniform PC {
     float shutterStrength;  // trail exposure boost, gated by detected motion
     float texelSizeX;       // 1.0 / frameW (unused in integer-tap v1, reserved)
     float texelSizeY;
+    uint  opticalFlow;      // 0 = plain average (no optical-flow smearing); the
+                            // "Cursor path" blur mode uses this so the true-path
+                            // streak (pass 2) is applied over a clean temporal
+                            // average rather than an already-optical-flow-blurred frame
 } pc;
 
 float luma(vec3 c) { return dot(c, vec3(0.299, 0.587, 0.114)); }
@@ -117,7 +121,7 @@ void main()
         lumaMin = min(lumaMin, l);
         lumaMax = max(lumaMax, l);
     }
-    bool maybeMoving = (n >= 2u) && (lumaMax - lumaMin > 0.02);
+    bool maybeMoving = (n >= 2u) && (lumaMax - lumaMin > 0.02) && (pc.opticalFlow != 0u);
 
     vec4  acc        = vec4(0.0);
     float count      = 0.0;

@@ -3,6 +3,7 @@
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <unistd.h>
+#include <cerrno>
 #include <cstring>
 #include <cstdio>
 
@@ -89,8 +90,8 @@ bool FrameSender::sendHandshake(uint32_t w, uint32_t h, uint32_t vkFormat) {
     return recvAll(fd_, &ack, 1) && ack == 0;
 }
 
-bool FrameSender::sendFrame(const FrameHeader& hdr, int memFd, int semFd) {
-    if (fd_ < 0) return false;
+FrameSender::SendResult FrameSender::sendFrame(const FrameHeader& hdr, int memFd, int semFd) {
+    if (fd_ < 0) return SendResult::Failed;
 
     // sendmsg with the header as data and the two fds as SCM_RIGHTS ancillary.
     char cmsgBuf[CMSG_SPACE(2 * sizeof(int))] = {};
@@ -112,12 +113,22 @@ bool FrameSender::sendFrame(const FrameHeader& hdr, int memFd, int semFd) {
     int fds[2] = { memFd, semFd };
     std::memcpy(CMSG_DATA(cmsg), fds, sizeof(fds));
 
-    ssize_t n = ::sendmsg(fd_, &msg, MSG_NOSIGNAL);
+    // MSG_DONTWAIT: this is called from the target app's own present
+    // thread -- it must never block waiting on the consumer's socket
+    // buffer, regardless of the connection's SO_SNDTIMEO (which still
+    // governs sendHandshake()'s blocking send/ack-read, a one-time
+    // per-connection cost, not this per-present hot path).
+    ssize_t n = ::sendmsg(fd_, &msg, MSG_NOSIGNAL | MSG_DONTWAIT);
+    int sendErrno = errno;
     // Close the fds regardless of outcome — the kernel dups them into the
     // receiver's fd table on successful sendmsg, so our copies are unneeded.
     if (memFd >= 0) ::close(memFd);
     if (semFd >= 0) ::close(semFd);
-    return n == static_cast<ssize_t>(sizeof(FrameHeader));
+    if (n == static_cast<ssize_t>(sizeof(FrameHeader))) return SendResult::Sent;
+    // EAGAIN/EWOULDBLOCK: the receiver's socket buffer is full right now
+    // (backpressure) -- drop just this one frame, connection stays up.
+    if (n < 0 && (sendErrno == EAGAIN || sendErrno == EWOULDBLOCK)) return SendResult::Skipped;
+    return SendResult::Failed;
 }
 
 void FrameSender::disconnect() {

@@ -74,11 +74,22 @@ struct FrameHeader {
                                // (the readback is non-blocking, off a completed ring
                                // slot), so only its DELTAS are meaningful -- which is
                                // exactly what the rate estimate consumes.
+    float    cursorX;          // Window-normalized cursor position [0,1] at this
+    float    cursorY;          // frame's present, read from the target's own SDL3
+                               // (SDL_GetMouseState / window size). Normalized (not
+                               // pixels) so it's resolution/HiDPI-independent: the
+                               // consumer multiplies by the blend-buffer extent to
+                               // get the cursor's pixel position IN that frame. The
+                               // sequence of these across a blend's source frames is
+                               // the cursor's true path through the shutter window.
+                               // <0 (e.g. -1) = unavailable this frame (no SDL / no
+                               // window focus); the consumer skips such samples.
 };
 
 // v3: FrameHeader gained exportSlot (consumer-side import pooling).
 // v4: FrameHeader gained gpuTimestampNs (GPU-domain capture-rate timing).
-inline constexpr uint32_t kProtocolVersion = 4;
+// v5: FrameHeader gained cursorX/cursorY (per-frame true cursor path).
+inline constexpr uint32_t kProtocolVersion = 5;
 
 // Fixed rendezvous path for the frame data channel (distinct from LayerIpc's
 // per-pid notification socket). Fixed, not per-pid, so the producer can find

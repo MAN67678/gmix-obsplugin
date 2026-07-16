@@ -183,7 +183,7 @@ int runProducer(const std::string& path) {
     if (!s.sendHandshake(kW, kH, kFmt)) { std::fprintf(stderr,"P: hs\n"); return 1; }
     ipc::FrameHeader hdr{}; hdr.magic=kMagic; hdr.width=kW; hdr.height=kH;
     hdr.vkFormat=kFmt; hdr.semSignalValue=sigVal; hdr.frameIndex=1;
-    if (!s.sendFrame(hdr, memFd, semFd)) { std::fprintf(stderr,"P: send\n"); return 1; }
+    if (s.sendFrame(hdr, memFd, semFd) != ipc::FrameSender::SendResult::Sent) { std::fprintf(stderr,"P: send\n"); return 1; }
     s.disconnect();
     return 0;
 }

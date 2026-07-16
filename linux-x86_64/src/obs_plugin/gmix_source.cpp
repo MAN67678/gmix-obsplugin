@@ -47,6 +47,10 @@ constexpr const char* kSettingTarget      = "target_process";
 constexpr const char* kSettingGpuIndex    = "gpu_index";
 constexpr const char* kSettingBlurDensity = "blur_density";
 constexpr const char* kSettingBrightness  = "blur_brightness";
+constexpr const char* kSettingCursorBlurWidth    = "cursor_blur_width";
+constexpr const char* kSettingCursorBlurStrength = "cursor_blur_strength";
+constexpr const char* kSettingBlurMode           = "blur_mode";
+constexpr const char* kSettingStreakStyle        = "streak_style";
 constexpr const char* kDefaultTarget      = "osu!";
 
 // The plugin used to expose a "Blur preset" (Flat/Linear/Cinematic/Heavy/
@@ -186,6 +190,8 @@ bool readEngineSettingsConfig(int32_t& gpuIndex) {
 struct RingEntry {
     std::shared_ptr<gmix::ImportedFrame> frame;
     uint64_t timestampNs = 0;
+    float cursorX = -1.f;   // window-normalized [0,1] cursor at this frame's
+    float cursorY = -1.f;   // capture; <0 = unavailable (see FrameHeader docs)
 };
 
 struct FrameQueue {
@@ -200,7 +206,7 @@ struct FrameQueue {
     static constexpr size_t kCap = gmix::kMaxBlendFrames;
 
     void push(std::shared_ptr<gmix::ImportedFrame> f, uint32_t w, uint32_t h,
-              uint64_t cpuTs, uint64_t /*gpuTs*/) {
+              uint64_t cpuTs, uint64_t /*gpuTs*/, float cursorX, float cursorY) {
         std::lock_guard<std::mutex> lk(mu);
         if (w != trackedW || h != trackedH) {
             ring.clear();
@@ -208,7 +214,7 @@ struct FrameQueue {
             resizeW = w; resizeH = h;
             pendingResize = true;
         }
-        ring.push_back({std::move(f), cpuTs});
+        ring.push_back({std::move(f), cpuTs, cursorX, cursorY});
         while (ring.size() > kCap) ring.pop_front();
         ++arrivals;
     }
@@ -264,7 +270,8 @@ void receiverThreadFn(gmix::ipc::FrameReceiver& receiver, gmix::VulkanContext& v
         auto frame = std::make_shared<gmix::ImportedFrame>();
         if (!frame->init(vk, img, std::move(sem), rf.header.semSignalValue)) continue;
         q.push(std::move(frame), rf.header.width, rf.header.height,
-               rf.header.timestampNs, rf.header.gpuTimestampNs);
+               rf.header.timestampNs, rf.header.gpuTimestampNs,
+               rf.header.cursorX, rf.header.cursorY);
         consumerRate.tick();   // survived the drop -- actually available to the blend
     }
     q.disconnected = true;
@@ -325,57 +332,15 @@ struct GmixEngine {
     std::mutex        blendConfigMu;
     gmix::BlendConfig blendConfig;
 
-    // ── Diagnostics: FPS at each pipeline stage + per-stage latency ─────────
-    // The pipeline has three conceptually distinct latency segments:
-    //   osu! present -> [ shutter window, ~16.6ms BY DESIGN, not measured --
-    //                     the blend intentionally uses frames up to one
-    //                     output-frame-interval behind the newest present;
-    //                     see the FrameQueue/shutterNs comments above ]
-    //                 -> [ blendLatencyMs: dispatch -> retire. Pure GPU/CPU
-    //                     processing cost. Should be SMALL and CONSISTENT --
-    //                     this is the one to watch for a genuine pipeline
-    //                     problem, e.g. GPU contention with the game. ]
-    //                 -> [ drawLatencyMs: retire -> actually drawn by OBS.
-    //                     Bounded by OBS's own render cadence -- since
-    //                     dispatch is tick-gated (see the dstBufferCount/
-    //                     tickSeq comments) but a blend can still retire at ANY
-    //                     point relative to OBS's next video_render call,
-    //                     this legitimately averages roughly half an OBS
-    //                     frame interval and can be jittery near a full
-    //                     interval -- that's expected, not a bug. ]
-    // An earlier version measured "newest captured frame's timestamp to
-    // retire" as a single "latencyMs" -- that conflated the (inherent,
-    // fine) capture-to-dispatch PHASE offset between osu!'s and OBS's two
-    // independently-paced ~60Hz clocks with actual processing cost, which
-    // is why it read as low-but-jittery (2-19ms) instead of showing a
-    // stable blend cost -- see etc/DEV_NOTES.md. Replaced with the two
-    // segments above, which is what's actually actionable.
-    //
     // producerRate : ticked in receiverThreadFn on every frame the CAPTURE
     //                LAYER actually sent over the socket (before any drop) --
     //                the producer/game's real export rate.
     // consumerRate : ticked in receiverThreadFn only for frames that survive
     //                the backlog-drop and get pushed into the ring -- the
-    //                rate actually available to the blend.
-    // blendRate    : ticked in workerMain each time pollBlendDone() retires a
-    //                blend -- the achieved output-update rate.
-    // drawnRate    : ticked in gmixVideoRender only when the drawn frontIdx
-    //                actually CHANGED since the last draw (across however
-    //                many scenes the source is in) -- how often OBS is
-    //                actually shown a new frame, not just how often it calls
-    //                video_render (which would just echo OBS's own fps).
-    // frontReadyTimeNs : steady_clock ns at the moment a blend retired --
-    //                written by workerMain, read by gmixVideoRender (a
-    //                DIFFERENT thread, OBS's render thread) to compute
-    //                drawLatencyMs, hence atomic.
+    //                rate actually available to the blend. Both feed the
+    //                rate-limited overload warning below.
     RateTracker producerRate;
     RateTracker consumerRate;
-    RateTracker blendRate;
-    RateTracker drawnRate;
-    std::atomic<int>      lastDrawnFrontIdx{-1};
-    std::atomic<uint64_t> frontReadyTimeNs{0};
-    std::atomic<double>   blendLatencyMs{0.0};
-    std::atomic<double>   drawLatencyMs{0.0};
 
     ~GmixEngine() { delete blend; }
 };
@@ -397,16 +362,11 @@ GmixEngine* acquireEngine(int32_t gpuIndex) {
         // storage can't reliably express a process-wide setting. If the file
         // doesn't exist yet (nothing has ever been persisted), fall through
         // to this caller's own value, matching the original behavior.
-        bool usedPersisted = readEngineSettingsConfig(gpuIndex);
+        readEngineSettingsConfig(gpuIndex);
         auto* e = new GmixEngine();
         e->gpuIndex = gpuIndex;
         e->tex.assign(e->dstBufferCount, nullptr);
-        if (usedPersisted) {
-            blog(LOG_INFO, "gmix: using persisted engine settings from "
-                           "~/.config/gmix/engine_settings (gpuIndex=%d)", gpuIndex);
-        }
         if (!e->vk.init(gpuIndex, /*headless=*/true)) {
-            blog(LOG_ERROR, "gmix: headless Vulkan init failed -- source will produce no frames");
             delete e;
             return nullptr;
         }
@@ -420,22 +380,6 @@ GmixEngine* acquireEngine(int32_t gpuIndex) {
         }
         e->worker = std::thread(workerMain, e);
         gEngine = e;
-        blog(LOG_INFO,
-             "gmix: engine created with gpuIndex=%d (dstBufferCount fixed at %u) -- "
-             "gpuIndex is FIXED for every attached source until ALL \"GMix Motion Blur\" "
-             "sources are removed (changing it on an existing source, or adding a source "
-             "with a different value, has no effect on the already-running engine)",
-             gpuIndex, e->dstBufferCount);
-    } else if (gEngine->gpuIndex != gpuIndex) {
-        // This source's own saved GPU index differs from what's already
-        // locked in -- silently ignoring that previously gave no indication
-        // anything was even requested, let alone ignored. This warning is
-        // that visibility.
-        blog(LOG_WARNING,
-             "gmix: this source wants gpuIndex=%d, but the already-running engine is fixed "
-             "at gpuIndex=%d (set by whichever source was created first) -- IGNORED. Remove "
-             "every \"GMix Motion Blur\" source and re-add to apply the new value.",
-             gpuIndex, gEngine->gpuIndex);
     }
     ++gEngine->refCount;
     return gEngine;
@@ -480,10 +424,8 @@ void workerMain(GmixEngine* s) {
         gmix::ipc::FrameReceiver receiver;
         const std::string sockPath = gmix::ipc::defaultFrameSocketPath();
         if (!receiver.listen(sockPath)) {
-            blog(LOG_ERROR, "gmix: failed to listen on %s", sockPath.c_str());
             return;
         }
-        blog(LOG_INFO, "gmix: waiting for producer to connect on %s ...", sockPath.c_str());
 
         gmix::ipc::FrameHandshake hs{};
         if (!receiver.acceptProducer(hs)) {
@@ -491,18 +433,13 @@ void workerMain(GmixEngine* s) {
             if (s->stop.load()) return;
             continue;
         }
-        blog(LOG_INFO, "gmix: producer connected: %ux%u format=%u",
-             hs.frameW, hs.frameH, hs.vkFormat);
 
         if (!s->blendReady) {
             s->blend = new gmix::BlendEngine(s->vk);
             if (!s->blend->init(hs.frameW, hs.frameH, s->dstBufferCount)) {
-                blog(LOG_ERROR, "gmix: blend engine init failed");
                 return;
             }
             if (!s->blend->dmaBufCapable()) {
-                blog(LOG_ERROR, "gmix: blend dst images are not dma-buf exportable on this GPU -- "
-                                 "zero-copy delivery to OBS is unavailable");
                 return;
             }
             s->width = hs.frameW;
@@ -521,11 +458,6 @@ void workerMain(GmixEngine* s) {
 
         int frontIdx = -1;
         uint32_t inFlightIdx = 0;
-        // steady_clock ns at the moment the CURRENTLY in-flight dispatch was
-        // submitted -- read back when it retires to compute s->blendLatencyMs
-        // (pure processing cost, dispatch -> retire; see the pollBlendDone()
-        // block below).
-        uint64_t inFlightDispatchTimeNs = 0;
         uint64_t lastBlendArrivals = 0;
         // Round-robins the dispatch target across ALL s->dstBufferCount dst
         // images instead of a strict front/back ping-pong -- see
@@ -572,16 +504,11 @@ void workerMain(GmixEngine* s) {
         // non-visible inefficiency. Revisit only if it's shown to cause a
         // real problem (e.g. GPU contention during recording).
         uint64_t lastDispatchedTickSeq = s->tickSeq.load(std::memory_order_relaxed);
-        // Periodic FPS/latency summary -- see the RateTracker fields on
-        // GmixEngine for what each stage measures.
-        auto lastStatusLogTime = std::chrono::steady_clock::now();
-        constexpr auto kStatusLogInterval = std::chrono::seconds(2);
-        bool loggedLatencyBudgetWarning = false;   // see the Advanced-preset latency-budget check below
 
         // Imports each dst buffer's dma-buf ONCE (lazily, first time seen for
         // its current generation) into `arr` -- matches the project's
         // established "export/import once, reuse" pattern.
-        auto importDstBuffers = [&](gs_texture_t** arr, const char* tag) {
+        auto importDstBuffers = [&](gs_texture_t** arr) {
             for (uint32_t i = 0; i < s->dstBufferCount; ++i) {
                 if (arr[i]) continue;
                 int fd = s->blend->dmaBufFd(i);
@@ -600,12 +527,6 @@ void workerMain(GmixEngine* s) {
                     s->blend->width(), s->blend->height(), kDrmFormatAbgr8888, GS_RGBA,
                     1, fds, strides, offsets, modifiers);
                 obs_leave_graphics();
-                if (!arr[i]) {
-                    blog(LOG_ERROR, "gmix: gs_texture_create_from_dmabuf failed for dst[%u]%s", i, tag);
-                } else {
-                    blog(LOG_INFO, "gmix: dst[%u]%s imported as gs_texture_t (fd=%d stride=%u offset=%llu %ux%u)",
-                         i, tag, fd, stride, (unsigned long long)offset, s->blend->width(), s->blend->height());
-                }
             }
         };
 
@@ -626,7 +547,6 @@ void workerMain(GmixEngine* s) {
             if (queue.pendingResize.exchange(false)) {
                 s->blend->waitBlendDone();
                 if (!s->blend->init(queue.resizeW, queue.resizeH, s->dstBufferCount)) {
-                    blog(LOG_ERROR, "gmix: blend engine re-init failed");
                     s->stop = true;
                     break;
                 }
@@ -647,7 +567,7 @@ void workerMain(GmixEngine* s) {
             }
 
             if (awaitingSwap) {
-                importDstBuffers(pendingTex.data(), " (staged for resize swap)");
+                importDstBuffers(pendingTex.data());
             } else {
                 // NEVER hold texMu across obs_enter_graphics()/gs_texture_*
                 // (which importDstBuffers calls internally) -- gmixVideoRender()
@@ -668,7 +588,7 @@ void workerMain(GmixEngine* s) {
                     for (size_t i = 0; i < s->tex.size(); ++i)
                         texSnapshot[i] = s->tex[i];
                 }
-                importDstBuffers(texSnapshot.data(), "");
+                importDstBuffers(texSnapshot.data());
                 {
                     std::lock_guard<std::mutex> lk(s->texMu);
                     for (size_t i = 0; i < s->tex.size(); ++i) {
@@ -679,18 +599,6 @@ void workerMain(GmixEngine* s) {
 
             if (s->blend->pollBlendDone()) {
                 frontIdx = static_cast<int>(inFlightIdx);
-                s->blendRate.tick();
-                uint64_t nowNs = static_cast<uint64_t>(
-                    std::chrono::duration_cast<std::chrono::nanoseconds>(
-                        std::chrono::steady_clock::now().time_since_epoch()).count());
-                if (inFlightDispatchTimeNs != 0 && nowNs > inFlightDispatchTimeNs) {
-                    s->blendLatencyMs.store((nowNs - inFlightDispatchTimeNs) / 1e6,
-                                            std::memory_order_relaxed);
-                }
-                // Timestamp this retirement for gmixVideoRender() (a DIFFERENT
-                // thread) to compute drawLatencyMs against once it actually
-                // observes this new frontIdx.
-                s->frontReadyTimeNs.store(nowNs, std::memory_order_relaxed);
                 if (awaitingSwap) {
                     // Same lock-order-inversion fix as the import branch above:
                     // swap the pointers under a brief texMu lock (no graphics
@@ -711,14 +619,8 @@ void workerMain(GmixEngine* s) {
                     for (auto t : oldTex) { if (t) gs_texture_destroy(t); }
                     obs_leave_graphics();
                     awaitingSwap = false;
-                    blog(LOG_INFO, "gmix: resize complete, swapped in new %ux%u textures", s->width, s->height);
                 }
                 s->frontIdx.store(frontIdx, std::memory_order_release);
-                static bool loggedFirstFrame = false;
-                if (!loggedFirstFrame) {
-                    blog(LOG_INFO, "gmix: first blend retired, front=%d -- video_render should now draw", frontIdx);
-                    loggedFirstFrame = true;
-                }
             }
 
             // Cheap atomic check BEFORE paying for queue.snapshot() (a mutex
@@ -728,7 +630,6 @@ void workerMain(GmixEngine* s) {
             // atomic refcount ops per idle tick. Also rate-limited to OBS's
             // own frame interval (see above) -- new arrivals can exist far
             // more often than that.
-            auto nowTick = std::chrono::steady_clock::now();
             uint64_t curTickSeq = s->tickSeq.load(std::memory_order_relaxed);
             uint64_t arrivalsNow = queue.arrivals.load();
             if (!s->blend->blendInFlight() && arrivalsNow != lastBlendArrivals &&
@@ -775,74 +676,58 @@ void workerMain(GmixEngine* s) {
                         }
                         if (!merged) { waitSems.push_back(sem); waitVals.push_back(v); }
                     }
+
+                    // ── Reconstruct the cursor's TRUE path through this blend ──
+                    // srcViews[i] is the i-th newest source frame; that frame's
+                    // window-normalized cursorX/Y (<0 if unavailable) times the
+                    // blend-buffer extent is where the cursor was IN this buffer
+                    // at that instant. Flattened newest-first as interleaved x,y
+                    // pixels -- exactly the polyline the pass-2 cursor-path blur
+                    // (cursor_path_blur.comp) walks. Unavailable samples are
+                    // skipped, so the path stays a contiguous run of real points.
+                    std::vector<float> cursorPathXY;
+                    cursorPathXY.reserve(n * 2);
+                    const float bw = static_cast<float>(s->blend->width());
+                    const float bh = static_cast<float>(s->blend->height());
+                    for (size_t i = 0; i < n; ++i) {
+                        const auto& e = window_frames[wsz - 1 - i];
+                        if (e.cursorX < 0.f || e.cursorY < 0.f) continue;
+                        cursorPathXY.push_back(e.cursorX * bw);
+                        cursorPathXY.push_back(e.cursorY * bh);
+                    }
+                    const uint32_t cursorPts =
+                        static_cast<uint32_t>(cursorPathXY.size() / 2);
+
+                    // Blur mode: 0=optical only, 1=cursor path only, 2=both.
+                    //   optical-flow (pass 1) runs for Optical + Both, and is
+                    //   swapped for a plain temporal average in Cursor mode so
+                    //   the true-path streak stands alone.
+                    //   the cursor-path streak (pass 2) runs for Cursor + Both;
+                    //   in Optical mode width 0 makes pass 2 a passthrough.
+                    const int mode = config.blurMode;
                     gmix::ResampleParams resample{};
                     resample.subSamples      = config.blurDensity;
                     resample.shutterStrength = config.shutterStrength;
+                    resample.opticalFlow     = (mode != 1);
+
+                    gmix::CursorPathBlur cursor{};
+                    cursor.pointsXY   = cursorPathXY.data();
+                    cursor.pointCount = cursorPts;
+                    cursor.width      = (mode == 0) ? 0.0f : config.cursorBlurWidth;
+                    cursor.strength   = config.cursorBlurStrength;
+                    cursor.style      = static_cast<uint32_t>(config.streakStyle);
 
                     uint32_t back = nextWriteIdx;
                     if (s->blend->dispatchAsync(srcViews.data(),
                                                 static_cast<uint32_t>(n), back,
                                                 waitSems.data(), waitVals.data(),
                                                 static_cast<uint32_t>(waitSems.size()),
-                                                resample)) {
+                                                resample, cursor)) {
                         inFlightIdx = back;
-                        inFlightDispatchTimeNs = static_cast<uint64_t>(
-                            std::chrono::duration_cast<std::chrono::nanoseconds>(
-                                nowTick.time_since_epoch()).count());
                         nextWriteIdx = (nextWriteIdx + 1) % s->dstBufferCount;
                         lastBlendArrivals = arrivalsNow;
                         lastDispatchedTickSeq = curTickSeq;
                     }
-                }
-            }
-
-            {
-                // Full pipeline, in order: [capture] -- osu! present -> the
-                // shutter window, ~1 output frame, BY DESIGN, not measured
-                // (this IS the intentional camera-shutter behavior, not
-                // latency to budget against) -- [blend] -- dispatch -> retire,
-                // pure GPU/CPU cost, this IS what the budget below bounds --
-                // [draw] -- retire -> OBS actually shows it, bounded by OBS's
-                // own render cadence but STILL counted against the same
-                // budget (a slow draw delays the pixels just as much as a
-                // slow blend does) -- [obs].
-                //
-                // The budget itself is derived from dstBufferCount (fixed at
-                // kFixedDstBufferCount now, was the user-facing "Latency
-                // mode" setting): `dstBufferCount - 1` frame intervals -- 4
-                // at the current fixed 5-buffer count. This is the SAME
-                // number the buffer count already encodes as "how many extra
-                // dispatch generations of grace before a buffer gets reused"
-                // (see BlendEngine::dstBufferCount()'s comment), so the
-                // diagnostic budget and the actual buffering mechanism use
-                // the same number instead of an unrelated hardcoded one.
-                // Only warn if it blows even this budget -- that's the point
-                // where a slow blend/draw starts meaningfully lagging the
-                // live capture, not just costing more GPU time within an
-                // already-accepted allowance.
-                double frameMs = s->obsFrameSec.load(std::memory_order_relaxed) * 1000.0;
-                double blendMs = s->blendLatencyMs.load(std::memory_order_relaxed);
-                double drawMs  = s->drawLatencyMs.load(std::memory_order_relaxed);
-                double budgetFrames = static_cast<double>(s->dstBufferCount) - 1.0;
-
-                bool overBudget = (blendMs + drawMs) > frameMs * budgetFrames;
-                if (overBudget && !loggedLatencyBudgetWarning) {
-                    blog(LOG_WARNING,
-                         "gmix: end-to-end (blend+draw) latency %.1fms exceeds the ~%.1fms "
-                         "(%.0f-frame) budget -- consider a lower blur density",
-                         blendMs + drawMs, frameMs * budgetFrames, budgetFrames);
-                    loggedLatencyBudgetWarning = true;
-                } else if (!overBudget) {
-                    loggedLatencyBudgetWarning = false;
-                }
-
-                if (nowTick - lastStatusLogTime >= kStatusLogInterval) {
-                    blog(LOG_INFO,
-                         "gmix: status: producer=%.1ffps consumer=%.1ffps blend=%.1ffps "
-                         "drawn=%.1ffps blend_latency=%.1fms draw_latency=%.1fms",
-                         s->producerRate.fps(), s->consumerRate.fps(),
-                         s->blendRate.fps(), s->drawnRate.fps(), blendMs, drawMs);
-                    lastStatusLogTime = nowTick;
                 }
             }
 
@@ -882,7 +767,6 @@ void workerMain(GmixEngine* s) {
             if (t) { obs_enter_graphics(); gs_texture_destroy(t); obs_leave_graphics(); t = nullptr; }
         }
         if (s->stop.load()) break;
-        blog(LOG_INFO, "gmix: producer disconnected, waiting for a new one");
     }
 }
 
@@ -901,6 +785,12 @@ void gmixGetDefaults(obs_data_t* settings) {
     // looks correct on its own and is confirmed live as the real neutral
     // default; the slider is still there to tune per-content.
     obs_data_set_default_double(settings, kSettingBrightness, 1.0);
+    // Cursor-path blur OFF by default (width 0 => pass 2 is a passthrough copy,
+    // output identical to the single-pass blend). See BlendConfig.hpp.
+    obs_data_set_default_double(settings, kSettingCursorBlurWidth, 0.0);
+    obs_data_set_default_double(settings, kSettingCursorBlurStrength, 1.0);
+    obs_data_set_default_int(settings, kSettingBlurMode, 2);      // 2 = Both
+    obs_data_set_default_int(settings, kSettingStreakStyle, 1);   // 1 = Comet
 }
 
 // CONFIRMED LIVE: OBS fires a property's modified-callback once automatically
@@ -921,9 +811,13 @@ void gmixGetDefaults(obs_data_t* settings) {
 // dialog session (which DOES need to write -- that's the whole feature).
 // Separate flags per control since each control's modified-callback gets its
 // own auto-fire, not one shared fire for the whole dialog.
-bool gGmixNextGpuIndexModifiedIsAutoFire   = false;
-bool gGmixNextDensityModifiedIsAutoFire    = false;
-bool gGmixNextBrightnessModifiedIsAutoFire = false;
+bool gGmixNextGpuIndexModifiedIsAutoFire       = false;
+bool gGmixNextDensityModifiedIsAutoFire        = false;
+bool gGmixNextBrightnessModifiedIsAutoFire     = false;
+bool gGmixNextCursorWidthModifiedIsAutoFire    = false;
+bool gGmixNextCursorStrengthModifiedIsAutoFire = false;
+bool gGmixNextBlurModeModifiedIsAutoFire       = false;
+bool gGmixNextStreakStyleModifiedIsAutoFire    = false;
 
 // Blend density/brightness are a property of the SHARED engine (see
 // GmixEngine::blendConfig's comment), not of any one source -- so this reads
@@ -943,6 +837,14 @@ void applyBlendConfigFromSettings(obs_data_t* settings) {
         std::clamp<long long>(obs_data_get_int(settings, kSettingBlurDensity), 4, 64));
     cfg.shutterStrength = static_cast<float>(
         std::clamp(obs_data_get_double(settings, kSettingBrightness), 0.1, 10.0));
+    cfg.cursorBlurWidth = static_cast<float>(
+        std::clamp(obs_data_get_double(settings, kSettingCursorBlurWidth), 0.0, 256.0));
+    cfg.cursorBlurStrength = static_cast<float>(
+        std::clamp(obs_data_get_double(settings, kSettingCursorBlurStrength), 0.0, 2.0));
+    cfg.blurMode = static_cast<int>(
+        std::clamp<long long>(obs_data_get_int(settings, kSettingBlurMode), 0, 2));
+    cfg.streakStyle = static_cast<int>(
+        std::clamp<long long>(obs_data_get_int(settings, kSettingStreakStyle), 0, 8));
     std::lock_guard<std::mutex> lk2(gEngine->blendConfigMu);
     gEngine->blendConfig = cfg;
 }
@@ -965,6 +867,42 @@ bool gmixBrightnessModified(void*, obs_properties_t*, obs_property_t*, obs_data_
     return false;
 }
 
+bool gmixCursorWidthModified(void*, obs_properties_t*, obs_property_t*, obs_data_t* settings) {
+    if (gGmixNextCursorWidthModifiedIsAutoFire) {
+        gGmixNextCursorWidthModifiedIsAutoFire = false;
+        return false;
+    }
+    applyBlendConfigFromSettings(settings);
+    return false;
+}
+
+bool gmixCursorStrengthModified(void*, obs_properties_t*, obs_property_t*, obs_data_t* settings) {
+    if (gGmixNextCursorStrengthModifiedIsAutoFire) {
+        gGmixNextCursorStrengthModifiedIsAutoFire = false;
+        return false;
+    }
+    applyBlendConfigFromSettings(settings);
+    return false;
+}
+
+bool gmixBlurModeModified(void*, obs_properties_t*, obs_property_t*, obs_data_t* settings) {
+    if (gGmixNextBlurModeModifiedIsAutoFire) {
+        gGmixNextBlurModeModifiedIsAutoFire = false;
+        return false;
+    }
+    applyBlendConfigFromSettings(settings);
+    return false;
+}
+
+bool gmixStreakStyleModified(void*, obs_properties_t*, obs_property_t*, obs_data_t* settings) {
+    if (gGmixNextStreakStyleModifiedIsAutoFire) {
+        gGmixNextStreakStyleModifiedIsAutoFire = false;
+        return false;
+    }
+    applyBlendConfigFromSettings(settings);
+    return false;
+}
+
 bool gmixGpuIndexModified(void*, obs_properties_t*, obs_property_t*, obs_data_t* settings) {
     if (gGmixNextGpuIndexModifiedIsAutoFire) {
         gGmixNextGpuIndexModifiedIsAutoFire = false;
@@ -972,11 +910,6 @@ bool gmixGpuIndexModified(void*, obs_properties_t*, obs_property_t*, obs_data_t*
     }
     int32_t gpuIndex = static_cast<int32_t>(obs_data_get_int(settings, kSettingGpuIndex));
     writeEngineSettingsConfig(gpuIndex);
-    blog(LOG_INFO,
-         "gmix: GPU index changed -- saved gpuIndex=%d to ~/.config/gmix/engine_settings "
-         "for the NEXT engine creation (the current engine, if any, is unaffected until "
-         "every \"GMix Motion Blur\" source is removed and re-added)",
-         gpuIndex);
     return false;   // no properties-layout change needed
 }
 
@@ -995,12 +928,43 @@ obs_properties_t* gmixGetProperties(void*) {
                                     "Blur brightness (trail exposure)", 0.1, 10.0, 0.1);
     obs_property_set_modified_callback2(brightness, gmixBrightnessModified, nullptr);
 
+    obs_property_t* blurMode = obs_properties_add_list(props, kSettingBlurMode,
+                                  "Blur mode", OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_INT);
+    obs_property_list_add_int(blurMode, "Optical flow (temporal)", 0);
+    obs_property_list_add_int(blurMode, "Cursor path", 1);
+    obs_property_list_add_int(blurMode, "Both", 2);
+    obs_property_set_modified_callback2(blurMode, gmixBlurModeModified, nullptr);
+
+    obs_property_t* streak = obs_properties_add_list(props, kSettingStreakStyle,
+                                 "Cursor streak style", OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_INT);
+    obs_property_list_add_int(streak, "Comet (bright head, fading tail)", 1);
+    obs_property_list_add_int(streak, "Even (uniform along path)", 0);
+    obs_property_list_add_int(streak, "Taper (soft both ends)", 2);
+    obs_property_list_add_int(streak, "Katana (sharp head, thin blade)", 3);
+    obs_property_list_add_int(streak, "Gaussian (soft, smooth)", 4);
+    obs_property_list_add_int(streak, "Box (flat average)", 5);
+    obs_property_list_add_int(streak, "Median (edge-preserving)", 6);
+    obs_property_list_add_int(streak, "Kawase (bloom-like)", 7);
+    obs_property_list_add_int(streak, "Radial (zoom to cursor)", 8);
+    obs_property_set_modified_callback2(streak, gmixStreakStyleModified, nullptr);
+
+    obs_property_t* cursorW = obs_properties_add_float_slider(props, kSettingCursorBlurWidth,
+                                  "Cursor blur width (px, 0 = off)", 0.0, 256.0, 1.0);
+    obs_property_set_modified_callback2(cursorW, gmixCursorWidthModified, nullptr);
+    obs_property_t* cursorS = obs_properties_add_float_slider(props, kSettingCursorBlurStrength,
+                                  "Cursor blur strength", 0.0, 2.0, 0.05);
+    obs_property_set_modified_callback2(cursorS, gmixCursorStrengthModified, nullptr);
+
     // Arm the auto-fire guard for the ONE synthetic modified-callback
     // invocation OBS makes per control while building/validating this fresh
     // obs_properties_t -- see gGmixNextGpuIndexModifiedIsAutoFire's comment.
-    gGmixNextGpuIndexModifiedIsAutoFire   = true;
-    gGmixNextDensityModifiedIsAutoFire    = true;
-    gGmixNextBrightnessModifiedIsAutoFire = true;
+    gGmixNextGpuIndexModifiedIsAutoFire       = true;
+    gGmixNextDensityModifiedIsAutoFire        = true;
+    gGmixNextBrightnessModifiedIsAutoFire     = true;
+    gGmixNextCursorWidthModifiedIsAutoFire    = true;
+    gGmixNextCursorStrengthModifiedIsAutoFire = true;
+    gGmixNextBlurModeModifiedIsAutoFire       = true;
+    gGmixNextStreakStyleModifiedIsAutoFire    = true;
 
     return props;
 }
@@ -1022,18 +986,7 @@ void gmixUpdate(void* data, obs_data_t* settings) {
     // ALREADY-EXISTING source's Properties dialog (as opposed to setting it
     // before ever creating a source) silently has NO EFFECT on the
     // already-running engine. Surface it here instead of leaving it silent.
-    if (s->engine && s->engine->gpuIndex != s->gpuIndex) {
-        blog(LOG_WARNING,
-             "gmix: GPU index change to %d will NOT take effect -- the shared engine is "
-             "already running at gpuIndex=%d (set by whichever \"GMix Motion Blur\" source "
-             "was created first). Remove every GMix Motion Blur source and re-add to apply "
-             "the new value.",
-             s->gpuIndex, s->engine->gpuIndex);
-    }
-    if (!writeTargetProcessConfig(s->targetProcess)) {
-        blog(LOG_WARNING, "gmix: failed to write ~/.config/gmix/target_process -- "
-                           "the capture layer will not activate in the game");
-    }
+    writeTargetProcessConfig(s->targetProcess);
 
     // Blend density/brightness are a property of the shared engine (see
     // GmixEngine::blendConfig comment), NOT of this specific source -- they
@@ -1080,6 +1033,10 @@ void* gmixCreate(obs_data_t* settings, obs_source_t* source) {
         { std::lock_guard<std::mutex> lk(s->engine->blendConfigMu); cfgSnapshot = s->engine->blendConfig; }
         obs_data_set_int(settings, kSettingBlurDensity, cfgSnapshot.blurDensity);
         obs_data_set_double(settings, kSettingBrightness, cfgSnapshot.shutterStrength);
+        obs_data_set_double(settings, kSettingCursorBlurWidth, cfgSnapshot.cursorBlurWidth);
+        obs_data_set_double(settings, kSettingCursorBlurStrength, cfgSnapshot.cursorBlurStrength);
+        obs_data_set_int(settings, kSettingBlurMode, cfgSnapshot.blurMode);
+        obs_data_set_int(settings, kSettingStreakStyle, cfgSnapshot.streakStyle);
         obs_data_set_int(settings, kSettingGpuIndex, s->engine->gpuIndex);
         gmixUpdate(s, settings);   // re-parse so s->targetProcess/gpuIndex match too
     } else if (s->engine) {
@@ -1166,26 +1123,6 @@ void gmixVideoRender(void* data, gs_effect_t* effect) {
     gs_eparam_t* image = gs_effect_get_param_by_name(effect, "image");
     gs_effect_set_texture(image, tex);
     gs_draw_sprite(tex, 0, e->width, e->height);
-
-    // Ticked only when the drawn frontIdx actually CHANGED since the last
-    // draw (across however many scenes this source is in, and however many
-    // GmixSource instances call video_render per real OBS frame) -- measures
-    // how often OBS is actually shown a NEW frame, not just how often it
-    // calls video_render (which would just echo OBS's own configured fps).
-    if (e->lastDrawnFrontIdx.exchange(idx, std::memory_order_relaxed) != idx) {
-        e->drawnRate.tick();
-        // retire -> actually drawn. Bounded by OBS's own render cadence, not
-        // gmix's pipeline -- see the drawLatencyMs comment on GmixEngine.
-        uint64_t readyNs = e->frontReadyTimeNs.load(std::memory_order_relaxed);
-        if (readyNs != 0) {
-            uint64_t nowNs = static_cast<uint64_t>(
-                std::chrono::duration_cast<std::chrono::nanoseconds>(
-                    std::chrono::steady_clock::now().time_since_epoch()).count());
-            if (nowNs > readyNs) {
-                e->drawLatencyMs.store((nowNs - readyNs) / 1e6, std::memory_order_relaxed);
-            }
-        }
-    }
 }
 
 struct obs_source_info gGmixSourceInfo = {};
@@ -1207,6 +1144,5 @@ bool obs_module_load(void) {
     gGmixSourceInfo.video_tick    = gmixVideoTick;
     gGmixSourceInfo.video_render  = gmixVideoRender;
     obs_register_source(&gGmixSourceInfo);
-    blog(LOG_INFO, "gmix: obs-gmix-source loaded");
     return true;
 }

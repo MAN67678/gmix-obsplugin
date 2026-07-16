@@ -32,9 +32,18 @@ public:
     // Send the one-time handshake. Blocks until the consumer acks.
     bool sendHandshake(uint32_t w, uint32_t h, uint32_t vkFormat);
 
+    enum class SendResult { Sent, Skipped, Failed };
+
     // Send a frame: header via the data payload, the two fds via SCM_RIGHTS.
-    // Takes ownership of the fds (closes them after sendmsg).
-    bool sendFrame(const FrameHeader& hdr, int memFd, int semFd);
+    // Takes ownership of the fds (closes them after sendmsg, in every
+    // outcome). Non-blocking -- called from the target app's own present
+    // thread, so this must never stall the caller waiting on the consumer.
+    // Sent: delivered. Skipped: the receiver's socket buffer is full right
+    // now (backpressure) -- this frame was dropped with ZERO blocking, the
+    // connection itself is still healthy, caller should just try again next
+    // frame. Failed: the connection is actually dead, caller should
+    // reconnect.
+    SendResult sendFrame(const FrameHeader& hdr, int memFd, int semFd);
 
     bool isConnected() const { return fd_ >= 0; }
     void disconnect();

@@ -526,7 +526,7 @@ VKAPI_ATTR VkResult VKAPI_CALL wrap_QueuePresentKHR(
         FILE* log = fopen("/tmp/gmix_layer_debug.log", "a");
         if (log) { fprintf(log, "wrap_QueuePresentKHR called (#%d)\n", presentCount); fclose(log); }
     }
-    
+
     // Local mutable copy: onQueuePresent may rewrite the wait-semaphore
     // fields to chain the real present through its own injected GPU work
     // (see FrameSource.hpp). The app's own pPresentInfo is never modified.
