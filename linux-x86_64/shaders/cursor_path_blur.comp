@@ -154,6 +154,32 @@ void main() {
         }
     }
 
+    // Head cap: the path stops AT the live cursor (pts[0]) -- there's no
+    // segment ahead of it, so the cursor sprite's leading edge falls outside
+    // the tube and stays sharp, "poking out" ahead of the blur. Extend a cap
+    // forward from pts[0] along the motion direction (by blurWidth) so that
+    // leading edge is covered. Only when the cursor is actually moving forward.
+    if (pc.pointCount >= 2u) {
+        vec2  hd = path.pts[0] - path.pts[1];    // forward motion at the head
+        float hl = length(hd);
+        if (hl > 1e-3) {
+            vec2  dir  = hd / hl;
+            vec2  a    = path.pts[0];
+            vec2  b    = a + dir * pc.blurWidth;
+            vec2  ab   = b - a;
+            float len2 = dot(ab, ab);
+            float t    = (len2 > 1e-6) ? clamp(dot(fp - a, ab) / len2, 0.0, 1.0) : 0.0;
+            float d    = distance(fp, a + t * ab);
+            if (d < bestDist) {
+                bestDist   = d;
+                bestTan    = dir;
+                bestSegLen = max(hl, pc.blurWidth);   // give the cap a real smear length
+                bestI      = 0u;
+                bestT      = 0.0;                      // treat as the head (pathPos 0)
+            }
+        }
+    }
+
     // Outside the tube, or the cursor barely moved here: leave as-is. Gating on
     // real local motion keeps EVERY style a motion blur (a still cursor => no
     // effect), including the area blurs below.
