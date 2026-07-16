@@ -45,7 +45,6 @@ struct CursorPathBlur {
     uint32_t     pointCount = 0;       // 0..kMaxBlendFrames valid points
     float        width      = 0.0f;    // streak half-thickness in px (~cursor radius)
     float        strength   = 1.0f;    // 0..1 mix of the streak over the original
-    uint32_t     style      = 1;       // envelope along the path: 0=even 1=comet 2=taper
 };
 
 class BlendEngine {

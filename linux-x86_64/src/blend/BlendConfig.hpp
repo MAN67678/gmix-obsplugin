@@ -58,10 +58,6 @@ struct BlendConfig {
     // 2 = both (optical-flow blend + cursor-path streak). Default 2 preserves
     // the pre-picker behavior (with cursorBlurWidth 0, that's optical-only).
     int      blurMode           = 2;
-    // Cursor-path streak envelope along its length: 0 = even, 1 = comet
-    // (bright head, fading tail), 2 = taper (soft both ends). See
-    // shaders/cursor_path_blur.comp.
-    int      streakStyle        = 1;
 
     // Output window size.
     uint32_t outW = 1920;

@@ -36,7 +36,6 @@ struct alignas(4) CursorPC {
     uint32_t pointCount;
     float    blurWidth;
     float    blurStrength;
-    uint32_t style;
 };
 static_assert(sizeof(CursorPC) <= 128,
               "push constants must fit the guaranteed 128-byte limit");
@@ -828,7 +827,6 @@ bool BlendEngine::dispatchAsync(VkImageView* srcViews, uint32_t srcCount, uint32
     cpc.pointCount = pts;
     cpc.blurWidth = cursor.width;
     cpc.blurStrength = cursor.strength;
-    cpc.style = cursor.style;
     vkCmdPushConstants(cmd, pipeLayout2_, VK_SHADER_STAGE_COMPUTE_BIT,
                        0, sizeof(CursorPC), &cpc);
     vkCmdDispatch(cmd, gx, gy, 1);

@@ -50,7 +50,6 @@ constexpr const char* kSettingBrightness  = "blur_brightness";
 constexpr const char* kSettingCursorBlurWidth    = "cursor_blur_width";
 constexpr const char* kSettingCursorBlurStrength = "cursor_blur_strength";
 constexpr const char* kSettingBlurMode           = "blur_mode";
-constexpr const char* kSettingStreakStyle        = "streak_style";
 constexpr const char* kDefaultTarget      = "osu!";
 
 // The plugin used to expose a "Blur preset" (Flat/Linear/Cinematic/Heavy/
@@ -715,7 +714,6 @@ void workerMain(GmixEngine* s) {
                     cursor.pointCount = cursorPts;
                     cursor.width      = (mode == 0) ? 0.0f : config.cursorBlurWidth;
                     cursor.strength   = config.cursorBlurStrength;
-                    cursor.style      = static_cast<uint32_t>(config.streakStyle);
 
                     uint32_t back = nextWriteIdx;
                     if (s->blend->dispatchAsync(srcViews.data(),
@@ -790,7 +788,6 @@ void gmixGetDefaults(obs_data_t* settings) {
     obs_data_set_default_double(settings, kSettingCursorBlurWidth, 0.0);
     obs_data_set_default_double(settings, kSettingCursorBlurStrength, 1.0);
     obs_data_set_default_int(settings, kSettingBlurMode, 2);      // 2 = Both
-    obs_data_set_default_int(settings, kSettingStreakStyle, 1);   // 1 = Comet
 }
 
 // CONFIRMED LIVE: OBS fires a property's modified-callback once automatically
@@ -817,7 +814,6 @@ bool gGmixNextBrightnessModifiedIsAutoFire     = false;
 bool gGmixNextCursorWidthModifiedIsAutoFire    = false;
 bool gGmixNextCursorStrengthModifiedIsAutoFire = false;
 bool gGmixNextBlurModeModifiedIsAutoFire       = false;
-bool gGmixNextStreakStyleModifiedIsAutoFire    = false;
 
 // Blend density/brightness are a property of the SHARED engine (see
 // GmixEngine::blendConfig's comment), not of any one source -- so this reads
@@ -843,8 +839,6 @@ void applyBlendConfigFromSettings(obs_data_t* settings) {
         std::clamp(obs_data_get_double(settings, kSettingCursorBlurStrength), 0.0, 2.0));
     cfg.blurMode = static_cast<int>(
         std::clamp<long long>(obs_data_get_int(settings, kSettingBlurMode), 0, 2));
-    cfg.streakStyle = static_cast<int>(
-        std::clamp<long long>(obs_data_get_int(settings, kSettingStreakStyle), 0, 8));
     std::lock_guard<std::mutex> lk2(gEngine->blendConfigMu);
     gEngine->blendConfig = cfg;
 }
@@ -894,15 +888,6 @@ bool gmixBlurModeModified(void*, obs_properties_t*, obs_property_t*, obs_data_t*
     return false;
 }
 
-bool gmixStreakStyleModified(void*, obs_properties_t*, obs_property_t*, obs_data_t* settings) {
-    if (gGmixNextStreakStyleModifiedIsAutoFire) {
-        gGmixNextStreakStyleModifiedIsAutoFire = false;
-        return false;
-    }
-    applyBlendConfigFromSettings(settings);
-    return false;
-}
-
 bool gmixGpuIndexModified(void*, obs_properties_t*, obs_property_t*, obs_data_t* settings) {
     if (gGmixNextGpuIndexModifiedIsAutoFire) {
         gGmixNextGpuIndexModifiedIsAutoFire = false;
@@ -935,19 +920,6 @@ obs_properties_t* gmixGetProperties(void*) {
     obs_property_list_add_int(blurMode, "Both", 2);
     obs_property_set_modified_callback2(blurMode, gmixBlurModeModified, nullptr);
 
-    obs_property_t* streak = obs_properties_add_list(props, kSettingStreakStyle,
-                                 "Cursor streak style", OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_INT);
-    obs_property_list_add_int(streak, "Comet (bright head, fading tail)", 1);
-    obs_property_list_add_int(streak, "Even (uniform along path)", 0);
-    obs_property_list_add_int(streak, "Taper (soft both ends)", 2);
-    obs_property_list_add_int(streak, "Katana (sharp head, thin blade)", 3);
-    obs_property_list_add_int(streak, "Gaussian (soft, smooth)", 4);
-    obs_property_list_add_int(streak, "Box (flat average)", 5);
-    obs_property_list_add_int(streak, "Median (edge-preserving)", 6);
-    obs_property_list_add_int(streak, "Kawase (bloom-like)", 7);
-    obs_property_list_add_int(streak, "Radial (zoom to cursor)", 8);
-    obs_property_set_modified_callback2(streak, gmixStreakStyleModified, nullptr);
-
     obs_property_t* cursorW = obs_properties_add_float_slider(props, kSettingCursorBlurWidth,
                                   "Cursor blur width (px, 0 = off)", 0.0, 256.0, 1.0);
     obs_property_set_modified_callback2(cursorW, gmixCursorWidthModified, nullptr);
@@ -964,7 +936,6 @@ obs_properties_t* gmixGetProperties(void*) {
     gGmixNextCursorWidthModifiedIsAutoFire    = true;
     gGmixNextCursorStrengthModifiedIsAutoFire = true;
     gGmixNextBlurModeModifiedIsAutoFire       = true;
-    gGmixNextStreakStyleModifiedIsAutoFire    = true;
 
     return props;
 }
@@ -1036,7 +1007,6 @@ void* gmixCreate(obs_data_t* settings, obs_source_t* source) {
         obs_data_set_double(settings, kSettingCursorBlurWidth, cfgSnapshot.cursorBlurWidth);
         obs_data_set_double(settings, kSettingCursorBlurStrength, cfgSnapshot.cursorBlurStrength);
         obs_data_set_int(settings, kSettingBlurMode, cfgSnapshot.blurMode);
-        obs_data_set_int(settings, kSettingStreakStyle, cfgSnapshot.streakStyle);
         obs_data_set_int(settings, kSettingGpuIndex, s->engine->gpuIndex);
         gmixUpdate(s, settings);   // re-parse so s->targetProcess/gpuIndex match too
     } else if (s->engine) {
