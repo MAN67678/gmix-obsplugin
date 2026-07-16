@@ -48,7 +48,7 @@ int runProducer(const std::string& path) {
     hdr.semSignalValue = 5;
     hdr.frameIndex = 42;
     hdr.timestampNs = 12345;
-    if (!s.sendFrame(hdr, memFd, semFd)) {
+    if (s.sendFrame(hdr, memFd, semFd) != FrameSender::SendResult::Sent) {
         std::fprintf(stderr, "P: sendFrame failed\n"); return 1;
     }
     // Sender closes its copies after sendmsg — fds still valid in receiver.

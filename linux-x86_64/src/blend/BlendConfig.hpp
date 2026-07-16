@@ -41,6 +41,28 @@ struct BlendConfig {
     // collection value is applied.
     float    shutterStrength = 1.0f;
 
+    // ── Cursor-path directional blur (second, post-blend pass) ──────────────
+    // A streak applied to the blended frame along the cursor's TRUE trajectory
+    // through the shutter window (see shaders/cursor_path_blur.comp). Distinct
+    // from the optical-flow blur above: driven by the real per-frame cursor
+    // positions carried in FrameHeader.cursorX/Y, not inferred from pixels.
+    // cursorBlurWidth: the streak's half-thickness in blend-buffer px -- the
+    //   cursor's on-screen radius. 0 = feature OFF (pass 2 is a pure
+    //   passthrough copy, output identical to the single-pass result). A
+    //   manual slider for now; to be driven by the real game cursor size later.
+    // cursorBlurStrength: 0..1 mix of the streak over the original.
+    float    cursorBlurWidth    = 0.0f;
+    float    cursorBlurStrength = 1.0f;
+    // Blur mode: 0 = optical-flow only (pass 2 off), 1 = cursor-path only (pass
+    // 1 falls back to a plain temporal average so the streak stands alone),
+    // 2 = both (optical-flow blend + cursor-path streak). Default 2 preserves
+    // the pre-picker behavior (with cursorBlurWidth 0, that's optical-only).
+    int      blurMode           = 2;
+    // Cursor-path streak envelope along its length: 0 = even, 1 = comet
+    // (bright head, fading tail), 2 = taper (soft both ends). See
+    // shaders/cursor_path_blur.comp.
+    int      streakStyle        = 1;
+
     // Output window size.
     uint32_t outW = 1920;
     uint32_t outH = 1080;

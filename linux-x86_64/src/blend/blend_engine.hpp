@@ -30,6 +30,22 @@ class VulkanContext;
 struct ResampleParams {
     uint32_t subSamples      = 4;      // "blur density": taps per frame, 4..32
     float    shutterStrength = 1.0f;   // motion-gated trail exposure boost
+    bool     opticalFlow     = true;   // false = plain temporal average (no
+                                       // optical-flow smearing) -- used by the
+                                       // "Cursor path" blur mode
+};
+
+// Cursor-path directional blur, applied as a SECOND pass after the resample
+// blend (see shaders/cursor_path_blur.comp). The path is the cursor's true
+// per-frame positions through the shutter window, in blend-buffer pixels,
+// newest first. width == 0 (or pointCount < 2) disables it -- pass 2 becomes a
+// pure passthrough copy, so the output matches the single-pass result exactly.
+struct CursorPathBlur {
+    const float* pointsXY   = nullptr; // pointCount * 2 floats (x,y interleaved)
+    uint32_t     pointCount = 0;       // 0..kMaxBlendFrames valid points
+    float        width      = 0.0f;    // streak half-thickness in px (~cursor radius)
+    float        strength   = 1.0f;    // 0..1 mix of the streak over the original
+    uint32_t     style      = 1;       // envelope along the path: 0=even 1=comet 2=taper
 };
 
 class BlendEngine {
@@ -111,7 +127,8 @@ public:
     bool dispatchAsync(VkImageView* srcViews, uint32_t srcCount, uint32_t dstIdx,
                        const VkSemaphore* waitSems = nullptr,
                        const uint64_t* waitVals = nullptr, uint32_t waitCount = 0,
-                       ResampleParams resample = {});
+                       ResampleParams resample = {},
+                       const CursorPathBlur& cursor = {});
     bool blendInFlight() const { return blendInFlight_; }
     // True once the in-flight blend's GPU work has completed (non-blocking).
     // Clears the in-flight flag as a side effect when it returns true.
@@ -155,6 +172,8 @@ private:
     bool createDstImage();
     bool createDescriptorSet();
     bool createPipeline();
+    bool createIntermediateImage();   // blendTmp_ (pass-1 output, pass-2 input)
+    bool createCursorPass();          // pass-2 layout/pool/set/pipeline + path SSBO
     void destroyTransient();
     void destroyAll();
 
@@ -205,6 +224,27 @@ private:
     uint64_t    blendValue_     = 0;   // last value submitted (monotonic)
     uint64_t    inFlightValue_  = 0;   // value the in-flight blend will signal
     uint64_t    frontValue_     = 0;   // value of the last retired (front) blend
+
+    // ── Second pass: cursor-path directional blur (cursor_path_blur.comp) ───
+    // blendTmp_ receives pass 1's blended result (internal, OPTIMAL tiling, not
+    // exported); pass 2 reads it + the path SSBO and writes the final exported
+    // dst. Single-buffered: only one blend is in flight at a time (caller
+    // contract), and pass 2 consumes blendTmp_ within the same command buffer.
+    VkImage        blendTmpImage_ = VK_NULL_HANDLE;
+    VkDeviceMemory blendTmpMem_   = VK_NULL_HANDLE;
+    VkImageView    blendTmpView_  = VK_NULL_HANDLE;
+
+    VkDescriptorSetLayout dsLayout2_   = VK_NULL_HANDLE;
+    VkPipelineLayout      pipeLayout2_ = VK_NULL_HANDLE;
+    VkPipeline            pipeline2_   = VK_NULL_HANDLE;
+    VkDescriptorPool      descPool2_   = VK_NULL_HANDLE;
+    VkDescriptorSet       descSet2_    = VK_NULL_HANDLE;
+
+    // Host-visible SSBO holding the cursor path (kMaxBlendFrames vec2), mapped
+    // persistently and rewritten per dispatch.
+    VkBuffer       pathBuf_    = VK_NULL_HANDLE;
+    VkDeviceMemory pathBufMem_ = VK_NULL_HANDLE;
+    void*          pathMapped_ = nullptr;
 
     uint32_t width_  = 0;
     uint32_t height_ = 0;

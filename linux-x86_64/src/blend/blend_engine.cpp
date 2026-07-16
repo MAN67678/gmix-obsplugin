@@ -24,8 +24,21 @@ struct alignas(4) PushConstants {
     float    shutterStrength;
     float    texelSizeX;
     float    texelSizeY;
+    uint32_t opticalFlow;
 };
 static_assert(sizeof(PushConstants) <= 128,
+              "push constants must fit the guaranteed 128-byte limit");
+
+// Push-constant block mirrored from shaders/cursor_path_blur.comp (pass 2).
+struct alignas(4) CursorPC {
+    uint32_t frameW;
+    uint32_t frameH;
+    uint32_t pointCount;
+    float    blurWidth;
+    float    blurStrength;
+    uint32_t style;
+};
+static_assert(sizeof(CursorPC) <= 128,
               "push constants must fit the guaranteed 128-byte limit");
 
 std::vector<char> readFile(const char* path) {
@@ -78,6 +91,13 @@ void BlendEngine::destroyAll() {
         dmaBufOffset_[i] = 0;
     }
     dmaBufCapable_ = false;
+    // Pass-2 intermediate image + path SSBO (created per init(), like dst).
+    if (blendTmpView_)  { vkDestroyImageView(dev, blendTmpView_, nullptr); blendTmpView_ = VK_NULL_HANDLE; }
+    if (blendTmpImage_) { vkDestroyImage(dev, blendTmpImage_, nullptr); blendTmpImage_ = VK_NULL_HANDLE; }
+    if (blendTmpMem_)   { vkFreeMemory(dev, blendTmpMem_, nullptr); blendTmpMem_ = VK_NULL_HANDLE; }
+    if (pathBufMem_ && pathMapped_) { vkUnmapMemory(dev, pathBufMem_); pathMapped_ = nullptr; }
+    if (pathBuf_)    { vkDestroyBuffer(dev, pathBuf_, nullptr); pathBuf_ = VK_NULL_HANDLE; }
+    if (pathBufMem_) { vkFreeMemory(dev, pathBufMem_, nullptr); pathBufMem_ = VK_NULL_HANDLE; }
     // cmd_ is freed implicitly with its pool.
     cmd_ = VK_NULL_HANDLE;
     blendInFlight_ = false;
@@ -98,6 +118,16 @@ void BlendEngine::destroyTransient() {
     dsLayout_   = VK_NULL_HANDLE;
     descPool_   = VK_NULL_HANDLE;
     descSet_    = VK_NULL_HANDLE;
+    // Pass 2 (cursor-path blur) transient objects.
+    if (pipeline2_)   vkDestroyPipeline(dev, pipeline2_, nullptr);
+    if (pipeLayout2_) vkDestroyPipelineLayout(dev, pipeLayout2_, nullptr);
+    if (dsLayout2_)   vkDestroyDescriptorSetLayout(dev, dsLayout2_, nullptr);
+    if (descPool2_)   vkDestroyDescriptorPool(dev, descPool2_, nullptr);
+    pipeline2_   = VK_NULL_HANDLE;
+    pipeLayout2_ = VK_NULL_HANDLE;
+    dsLayout2_   = VK_NULL_HANDLE;
+    descPool2_   = VK_NULL_HANDLE;
+    descSet2_    = VK_NULL_HANDLE;
 }
 
 bool BlendEngine::init(uint32_t w, uint32_t h, uint32_t dstBufferCount) {
@@ -154,6 +184,8 @@ bool BlendEngine::init(uint32_t w, uint32_t h, uint32_t dstBufferCount) {
     if (!createDstImage())    return false;
     if (!createDescriptorSet()) return false;
     if (!createPipeline())    return false;
+    if (!createIntermediateImage()) return false;
+    if (!createCursorPass())  return false;
 
     initialized_ = true;
     return true;
@@ -434,6 +466,206 @@ bool BlendEngine::createPipeline() {
     return true;
 }
 
+// blendTmp_: the intermediate that pass 1 (resample_blur) writes and pass 2
+// (cursor_path_blur) reads. Internal only -- OPTIMAL tiling, not exported, no
+// transfer usage, single-buffered (only one blend is ever in flight, and pass 2
+// consumes it within the same command buffer).
+bool BlendEngine::createIntermediateImage() {
+    VkDevice dev = vk_.device();
+
+    VkImageCreateInfo ici{};
+    ici.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+    ici.imageType = VK_IMAGE_TYPE_2D;
+    ici.format = VK_FORMAT_R8G8B8A8_UNORM;   // matches both shaders' rgba8
+    ici.extent = { width_, height_, 1 };
+    ici.mipLevels = 1;
+    ici.arrayLayers = 1;
+    ici.samples = VK_SAMPLE_COUNT_1_BIT;
+    ici.tiling = VK_IMAGE_TILING_OPTIMAL;
+    ici.usage = VK_IMAGE_USAGE_STORAGE_BIT;   // written AND read by compute
+    ici.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    ici.sharingMode = VK_SHARING_MODE_EXCLUSIVE;   // compute queue only
+    if (vkCreateImage(dev, &ici, nullptr, &blendTmpImage_) != VK_SUCCESS) {
+        std::fprintf(stderr, "gmix: blend: intermediate image create failed\n");
+        return false;
+    }
+
+    VkMemoryRequirements mr{};
+    vkGetImageMemoryRequirements(dev, blendTmpImage_, &mr);
+    uint32_t memType = findMemoryType(vk_.physicalDevice(), mr.memoryTypeBits,
+                                      VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    if (memType == ~0u) {
+        std::fprintf(stderr, "gmix: blend: no device-local mem for intermediate\n");
+        return false;
+    }
+    VkMemoryAllocateInfo mai{};
+    mai.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+    mai.allocationSize = mr.size;
+    mai.memoryTypeIndex = memType;
+    if (vkAllocateMemory(dev, &mai, nullptr, &blendTmpMem_) != VK_SUCCESS) {
+        std::fprintf(stderr, "gmix: blend: intermediate mem alloc failed\n");
+        return false;
+    }
+    vkBindImageMemory(dev, blendTmpImage_, blendTmpMem_, 0);
+
+    VkImageViewCreateInfo vci{};
+    vci.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+    vci.image = blendTmpImage_;
+    vci.viewType = VK_IMAGE_VIEW_TYPE_2D;
+    vci.format = ici.format;
+    vci.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    vci.subresourceRange.levelCount = 1;
+    vci.subresourceRange.layerCount = 1;
+    if (vkCreateImageView(dev, &vci, nullptr, &blendTmpView_) != VK_SUCCESS) {
+        std::fprintf(stderr, "gmix: blend: intermediate view failed\n");
+        return false;
+    }
+    return true;
+}
+
+// Pass 2 resources: the cursor_path_blur pipeline (bindings 0=blendTmp read,
+// 1=dst write, 2=path SSBO) + a host-visible SSBO holding the cursor path.
+bool BlendEngine::createCursorPass() {
+    VkDevice dev = vk_.device();
+
+    // Host-visible, persistently-mapped SSBO for the path (kMaxBlendFrames
+    // vec2, std430 => tightly-packed interleaved x,y floats). Rewritten per
+    // dispatch; vkQueueSubmit's implicit host-write dependency makes each
+    // update visible to that submission (HOST_COHERENT, no explicit barrier).
+    VkBufferCreateInfo bci{};
+    bci.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+    bci.size = static_cast<VkDeviceSize>(kMaxBlendFrames) * 2 * sizeof(float);
+    bci.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
+    bci.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    if (vkCreateBuffer(dev, &bci, nullptr, &pathBuf_) != VK_SUCCESS) {
+        std::fprintf(stderr, "gmix: blend: path SSBO create failed\n");
+        return false;
+    }
+    VkMemoryRequirements mr{};
+    vkGetBufferMemoryRequirements(dev, pathBuf_, &mr);
+    uint32_t mt = findMemoryType(vk_.physicalDevice(), mr.memoryTypeBits,
+                                 VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                                 VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+    if (mt == ~0u) {
+        std::fprintf(stderr, "gmix: blend: no host-visible mem for path SSBO\n");
+        return false;
+    }
+    VkMemoryAllocateInfo mai{};
+    mai.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+    mai.allocationSize = mr.size;
+    mai.memoryTypeIndex = mt;
+    if (vkAllocateMemory(dev, &mai, nullptr, &pathBufMem_) != VK_SUCCESS) {
+        std::fprintf(stderr, "gmix: blend: path SSBO mem alloc failed\n");
+        return false;
+    }
+    vkBindBufferMemory(dev, pathBuf_, pathBufMem_, 0);
+    if (vkMapMemory(dev, pathBufMem_, 0, VK_WHOLE_SIZE, 0, &pathMapped_) != VK_SUCCESS) {
+        std::fprintf(stderr, "gmix: blend: path SSBO map failed\n");
+        return false;
+    }
+    std::memset(pathMapped_, 0, static_cast<size_t>(bci.size));
+
+    // Descriptor set layout: 0=blendTmp (storage image, read), 1=dst (storage
+    // image, write), 2=path (storage buffer).
+    VkDescriptorSetLayoutBinding b[3]{};
+    b[0].binding = 0; b[0].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+    b[0].descriptorCount = 1; b[0].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+    b[1].binding = 1; b[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+    b[1].descriptorCount = 1; b[1].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+    b[2].binding = 2; b[2].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    b[2].descriptorCount = 1; b[2].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+
+    VkDescriptorSetLayoutCreateInfo lci{};
+    lci.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+    lci.bindingCount = 3;
+    lci.pBindings = b;
+    if (vkCreateDescriptorSetLayout(dev, &lci, nullptr, &dsLayout2_) != VK_SUCCESS) {
+        std::fprintf(stderr, "gmix: blend: cursor dsLayout failed\n");
+        return false;
+    }
+
+    VkDescriptorPoolSize ps[2]{};
+    ps[0].type = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;  ps[0].descriptorCount = 2;
+    ps[1].type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; ps[1].descriptorCount = 1;
+    VkDescriptorPoolCreateInfo ppi{};
+    ppi.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+    ppi.maxSets = 1;
+    ppi.poolSizeCount = 2;
+    ppi.pPoolSizes = ps;
+    if (vkCreateDescriptorPool(dev, &ppi, nullptr, &descPool2_) != VK_SUCCESS) {
+        std::fprintf(stderr, "gmix: blend: cursor descPool failed\n");
+        return false;
+    }
+    VkDescriptorSetAllocateInfo ai{};
+    ai.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+    ai.descriptorPool = descPool2_;
+    ai.descriptorSetCount = 1;
+    ai.pSetLayouts = &dsLayout2_;
+    if (vkAllocateDescriptorSets(dev, &ai, &descSet2_) != VK_SUCCESS) {
+        std::fprintf(stderr, "gmix: blend: cursor descSet alloc failed\n");
+        return false;
+    }
+
+    // Binding 2 (path SSBO) never changes handle -- write it once here. The two
+    // storage-image bindings vary per dispatch (dst rotates), written there.
+    VkDescriptorBufferInfo pbi{};
+    pbi.buffer = pathBuf_;
+    pbi.offset = 0;
+    pbi.range  = VK_WHOLE_SIZE;
+    VkWriteDescriptorSet pw{};
+    pw.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    pw.dstSet = descSet2_;
+    pw.dstBinding = 2;
+    pw.descriptorCount = 1;
+    pw.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    pw.pBufferInfo = &pbi;
+    vkUpdateDescriptorSets(dev, 1, &pw, 0, nullptr);
+
+    VkPushConstantRange pcr{};
+    pcr.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+    pcr.offset = 0;
+    pcr.size = sizeof(CursorPC);
+    VkPipelineLayoutCreateInfo pli{};
+    pli.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+    pli.setLayoutCount = 1;
+    pli.pSetLayouts = &dsLayout2_;
+    pli.pushConstantRangeCount = 1;
+    pli.pPushConstantRanges = &pcr;
+    if (vkCreatePipelineLayout(dev, &pli, nullptr, &pipeLayout2_) != VK_SUCCESS) {
+        std::fprintf(stderr, "gmix: blend: cursor pipeLayout failed\n");
+        return false;
+    }
+
+    auto code = readFile(GMIX_SHADER_DIR "/cursor_path_blur.spv");
+    if (code.empty()) {
+        std::fprintf(stderr, "gmix: blend: cannot read cursor_path_blur.spv\n");
+        return false;
+    }
+    VkShaderModuleCreateInfo smi{};
+    smi.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
+    smi.codeSize = code.size();
+    smi.pCode = reinterpret_cast<const uint32_t*>(code.data());
+    VkShaderModule mod{};
+    if (vkCreateShaderModule(dev, &smi, nullptr, &mod) != VK_SUCCESS) {
+        std::fprintf(stderr, "gmix: blend: cursor shader module failed\n");
+        return false;
+    }
+    VkComputePipelineCreateInfo cpi{};
+    cpi.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
+    cpi.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    cpi.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+    cpi.stage.module = mod;
+    cpi.stage.pName = "main";
+    cpi.layout = pipeLayout2_;
+    VkResult r = vkCreateComputePipelines(dev, VK_NULL_HANDLE, 1, &cpi, nullptr, &pipeline2_);
+    vkDestroyShaderModule(dev, mod, nullptr);
+    if (r != VK_SUCCESS) {
+        std::fprintf(stderr, "gmix: blend: cursor pipeline create failed (%d)\n", r);
+        return false;
+    }
+    return true;
+}
+
 VkImageView BlendEngine::dispatch(VkImageView* srcViews, uint32_t srcCount,
                                   ResampleParams resample) {
     // Synchronous wrapper (tests / readback): kick the async blend into buffer
@@ -446,7 +678,8 @@ VkImageView BlendEngine::dispatch(VkImageView* srcViews, uint32_t srcCount,
 
 bool BlendEngine::dispatchAsync(VkImageView* srcViews, uint32_t srcCount, uint32_t dstIdx,
                                 const VkSemaphore* waitSems, const uint64_t* waitVals,
-                                uint32_t waitCount, ResampleParams resample) {
+                                uint32_t waitCount, ResampleParams resample,
+                                const CursorPathBlur& cursor) {
     if (!initialized_) return false;
     if (srcCount == 0 || srcCount > (uint32_t)kMaxBlendFrames) return false;
     if (dstIdx >= numDstBuffers_) return false;
@@ -461,15 +694,19 @@ bool BlendEngine::dispatchAsync(VkImageView* srcViews, uint32_t srcCount, uint32
     // are never read — but the validation layer can't prove that statically,
     // so we fill every unused slot with the first valid view to keep the
     // descriptors technically "valid".
+    // ── Pass-1 descriptor set: srcViews + blendTmp (pass-1 output) ──────────
+    // Binding 1 now targets the INTERNAL blendTmp image, not the exported dst:
+    // the resample blend writes there so pass 2 can read a complete blended
+    // frame and write the final (streaked) result into dst.
     std::vector<VkDescriptorImageInfo> srcInfos(kMaxBlendFrames);
     for (uint32_t i = 0; i < kMaxBlendFrames; ++i) {
         srcInfos[i].sampler = VK_NULL_HANDLE;
         srcInfos[i].imageView = srcViews[i < srcCount ? i : 0];
         srcInfos[i].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
     }
-    VkDescriptorImageInfo dstInfo{};
-    dstInfo.imageView = dstView_[dstIdx];   // write into the chosen back buffer
-    dstInfo.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+    VkDescriptorImageInfo tmpInfo{};
+    tmpInfo.imageView = blendTmpView_;
+    tmpInfo.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
 
     VkWriteDescriptorSet writes[2]{};
     writes[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
@@ -484,8 +721,41 @@ bool BlendEngine::dispatchAsync(VkImageView* srcViews, uint32_t srcCount, uint32
     writes[1].dstBinding = 1;
     writes[1].descriptorCount = 1;
     writes[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
-    writes[1].pImageInfo = &dstInfo;
+    writes[1].pImageInfo = &tmpInfo;
     vkUpdateDescriptorSets(dev, 2, writes, 0, nullptr);
+
+    // ── Pass-2 descriptor set: blendTmp (read) + dst (write). Binding 2 (the
+    // path SSBO) was written once in createCursorPass() -- its handle is
+    // constant; only its CONTENTS change, uploaded just below. ──────────────
+    VkDescriptorImageInfo p2src{};
+    p2src.imageView = blendTmpView_;
+    p2src.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+    VkDescriptorImageInfo p2dst{};
+    p2dst.imageView = dstView_[dstIdx];
+    p2dst.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+    VkWriteDescriptorSet w2[2]{};
+    w2[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    w2[0].dstSet = descSet2_;
+    w2[0].dstBinding = 0;
+    w2[0].descriptorCount = 1;
+    w2[0].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+    w2[0].pImageInfo = &p2src;
+    w2[1].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    w2[1].dstSet = descSet2_;
+    w2[1].dstBinding = 1;
+    w2[1].descriptorCount = 1;
+    w2[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+    w2[1].pImageInfo = &p2dst;
+    vkUpdateDescriptorSets(dev, 2, w2, 0, nullptr);
+
+    // ── Upload the cursor path into the SSBO. HOST_COHERENT + the write
+    // happening before vkQueueSubmit makes it visible to this submission
+    // without an explicit barrier. ─────────────────────────────────────────
+    uint32_t pts = cursor.pointsXY ? cursor.pointCount : 0u;
+    if (pts > static_cast<uint32_t>(kMaxBlendFrames)) pts = kMaxBlendFrames;
+    if (pts > 0 && pathMapped_)
+        std::memcpy(pathMapped_, cursor.pointsXY,
+                    static_cast<size_t>(pts) * 2 * sizeof(float));
 
     // ── Record the persistent command buffer (reset by begin) ───────────────
     VkCommandBuffer cmd = cmd_;
@@ -494,23 +764,28 @@ bool BlendEngine::dispatchAsync(VkImageView* srcViews, uint32_t srcCount, uint32
     bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
     vkBeginCommandBuffer(cmd, &bi);
 
-    // Transition dst → GENERAL.
-    VkImageMemoryBarrier dstBar{};
-    dstBar.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
-    dstBar.dstAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
-    dstBar.newLayout = VK_IMAGE_LAYOUT_GENERAL;
-    dstBar.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    dstBar.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    dstBar.image = dstImage_[dstIdx];
-    dstBar.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+    uint32_t gx = (width_  + 7) / 8;   // workgroups = ceil(extent / 8)
+    uint32_t gy = (height_ + 7) / 8;
+
+    // blendTmp → GENERAL for the pass-1 write (contents discarded/overwritten).
+    VkImageMemoryBarrier tmpBar{};
+    tmpBar.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+    tmpBar.srcAccessMask = 0;
+    tmpBar.dstAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+    tmpBar.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    tmpBar.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+    tmpBar.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    tmpBar.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    tmpBar.image = blendTmpImage_;
+    tmpBar.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
     vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
                          VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0,
-                         0, nullptr, 0, nullptr, 1, &dstBar);
+                         0, nullptr, 0, nullptr, 1, &tmpBar);
 
+    // Pass 1: resample blend → blendTmp.
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline_);
     vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipeLayout_,
                             0, 1, &descSet_, 0, nullptr);
-
     PushConstants pc{};
     pc.frameCount = srcCount;
     pc.frameW = width_;
@@ -519,19 +794,56 @@ bool BlendEngine::dispatchAsync(VkImageView* srcViews, uint32_t srcCount, uint32
     pc.shutterStrength = resample.shutterStrength;
     pc.texelSizeX = width_  ? 1.0f / static_cast<float>(width_)  : 0.0f;
     pc.texelSizeY = height_ ? 1.0f / static_cast<float>(height_) : 0.0f;
+    pc.opticalFlow = resample.opticalFlow ? 1u : 0u;
     vkCmdPushConstants(cmd, pipeLayout_, VK_SHADER_STAGE_COMPUTE_BIT,
                        0, sizeof(PushConstants), &pc);
-
-    // (workgroups) = ceil(extent / 8)
-    uint32_t gx = (width_  + 7) / 8;
-    uint32_t gy = (height_ + 7) / 8;
     vkCmdDispatch(cmd, gx, gy, 1);
 
-    // Transition dst → TRANSFER_SRC_OPTIMAL for the presenter to blit from.
+    // Barrier: blendTmp write→read for pass 2, AND dst → GENERAL for pass-2 write.
+    VkImageMemoryBarrier midBars[2]{};
+    midBars[0] = tmpBar;
+    midBars[0].srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+    midBars[0].dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+    midBars[0].oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+    midBars[0].newLayout = VK_IMAGE_LAYOUT_GENERAL;
+    midBars[0].image = blendTmpImage_;
+    midBars[1] = tmpBar;
+    midBars[1].srcAccessMask = 0;
+    midBars[1].dstAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+    midBars[1].oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    midBars[1].newLayout = VK_IMAGE_LAYOUT_GENERAL;
+    midBars[1].image = dstImage_[dstIdx];
+    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0,
+                         0, nullptr, 0, nullptr, 2, midBars);
+
+    // Pass 2: cursor-path directional blur blendTmp → dst (passthrough copy
+    // when pts < 2 / width <= 0; see cursor_path_blur.comp).
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline2_);
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipeLayout2_,
+                            0, 1, &descSet2_, 0, nullptr);
+    CursorPC cpc{};
+    cpc.frameW = width_;
+    cpc.frameH = height_;
+    cpc.pointCount = pts;
+    cpc.blurWidth = cursor.width;
+    cpc.blurStrength = cursor.strength;
+    cpc.style = cursor.style;
+    vkCmdPushConstants(cmd, pipeLayout2_, VK_SHADER_STAGE_COMPUTE_BIT,
+                       0, sizeof(CursorPC), &cpc);
+    vkCmdDispatch(cmd, gx, gy, 1);
+
+    // dst → TRANSFER_SRC_OPTIMAL for the presenter to blit from.
+    VkImageMemoryBarrier dstBar{};
+    dstBar.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
     dstBar.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
     dstBar.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
     dstBar.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
     dstBar.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+    dstBar.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    dstBar.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    dstBar.image = dstImage_[dstIdx];
+    dstBar.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
     vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                          VK_PIPELINE_STAGE_TRANSFER_BIT, 0,
                          0, nullptr, 0, nullptr, 1, &dstBar);

@@ -50,6 +50,7 @@ function(gmix_compile_shader src_file)
     add_custom_target(gmix_shader_${_name} DEPENDS "${_out}")
 endfunction()
 gmix_compile_shader("${CMAKE_CURRENT_SOURCE_DIR}/shaders/resample_blur.comp")
+gmix_compile_shader("${CMAKE_CURRENT_SOURCE_DIR}/shaders/cursor_path_blur.comp")
 
 # ── gmix_core: Vulkan context, blend engine, IPC-receive pieces ─────────────
 # Shared by the `gmix` CLI executable and the OBS plugin target. Deliberately
@@ -68,6 +69,7 @@ target_link_libraries(gmix_core PUBLIC
 target_compile_definitions(gmix_core PUBLIC
     GMIX_SHADER_DIR="${CMAKE_CURRENT_BINARY_DIR}/shaders")
 add_dependencies(gmix_core gmix_shader_resample_blur)
+add_dependencies(gmix_core gmix_shader_cursor_path_blur)
 
 # ── gmix CLI: minimal utility (layer install / GPU list / IPC debug client) ─
 add_executable(gmix

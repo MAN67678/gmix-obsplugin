@@ -1,0 +1,214 @@
+#version 450 core
+#extension GL_EXT_scalar_block_layout : enable
+
+// ─────────────────────────────────────────────────────────────────────────────
+// GMix cursor-path directional blur -- the SECOND, post-blend pass.
+//
+// The first pass (resample_blur.comp) produces the temporally-blended frame.
+// This pass takes the cursor's TRUE trajectory through the shutter window --
+// the exact per-frame cursor positions, read from the game's own SDL inside
+// the capture layer and carried per-frame to the plugin (see FrameHeader
+// .cursorX/Y) -- reconstructed here as a polyline in blend-buffer pixels
+// (`pts`, `pointCount` valid, newest first; pts[0] is the live cursor head).
+//
+// For each output pixel we find the nearest path segment; if the pixel is
+// within `blurWidth` px of it (the cursor's on-screen half-thickness -- a
+// manual slider for now), we apply a blur localized to that "cursor tube" and
+// gated by real local motion, then mix it over the original by `blurStrength`
+// with a soft perpendicular falloff.
+//
+// `style` picks the LOOK. Styles 0..4 are directional smears ALONG the path
+// tangent with different envelopes/kernels; styles 5..8 are classic 2D blur
+// algorithms applied within the tube:
+//   0 even     directional, uniform along path
+//   1 comet    directional, bright head -> fading tail
+//   2 taper    directional, soft at both ends
+//   3 katana   directional, sharp concentrated head -> thin blade
+//   4 gaussian directional, soft bell taps + soft (bell) perpendicular edge
+//   5 box      2D box average (flat, soft)
+//   6 median   McGuire 3x3 median (edge-preserving, painterly)
+//   7 kawase   iterated 4-diagonal-tap average (bloom-like soft blur)
+//   8 radial   zoom blur toward the cursor head (path.pts[0])
+//
+// When the feature is off (blurWidth <= 0, blurStrength <= 0, or < 2 path
+// points) this is a pure passthrough copy blendSrc -> dst.
+// ─────────────────────────────────────────────────────────────────────────────
+
+#define MAX_PTS 64   // must match kMaxBlendFrames
+#define GMIX_PI 3.14159265
+
+// McGuire 3x3 median sorting network (min/max comparators). Operates on vec3
+// (per-channel). A block-scoped temp avoids a shared global. Median ends in v4.
+#define GMIX_S2(a, b)                { vec3 gm_t = min(a, b); b = max(a, b); a = gm_t; }
+#define GMIX_MN3(a, b, c)            { GMIX_S2(a, b); GMIX_S2(a, c); }
+#define GMIX_MX3(a, b, c)            { GMIX_S2(b, c); GMIX_S2(a, c); }
+#define GMIX_MNMX3(a, b, c)          { GMIX_MX3(a, b, c); GMIX_S2(a, b); }
+#define GMIX_MNMX4(a, b, c, d)       { GMIX_S2(a, b); GMIX_S2(c, d); GMIX_S2(a, c); GMIX_S2(b, d); }
+#define GMIX_MNMX5(a, b, c, d, e)    { GMIX_S2(a, b); GMIX_S2(c, d); GMIX_MN3(a, c, e); GMIX_MX3(b, d, e); }
+#define GMIX_MNMX6(a, b, c, d, e, f) { GMIX_S2(a, d); GMIX_S2(b, e); GMIX_S2(c, f); GMIX_MN3(a, b, c); GMIX_MX3(d, e, f); }
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, rgba8) readonly  uniform image2D blendSrc; // pass-1 result
+layout(set = 0, binding = 1, rgba8) writeonly uniform image2D dstImage; // exported output
+
+// Cursor path in blend-buffer pixels, newest first, pointCount entries valid.
+layout(std430, set = 0, binding = 2) readonly buffer Path {
+    vec2 pts[MAX_PTS];
+} path;
+
+layout(push_constant) uniform PC {
+    uint  frameW;
+    uint  frameH;
+    uint  pointCount;    // valid entries in path.pts (0..MAX_PTS)
+    float blurWidth;     // half-thickness of the streak in px (~cursor radius)
+    float blurStrength;  // 0..1 mix of the streak over the original
+    uint  style;         // 0=even 1=comet 2=taper 3=katana 4=gaussian 5=box 6=median 7=kawase 8=radial
+} pc;
+
+vec3 ldc(ivec2 p, ivec2 sz) {
+    return imageLoad(blendSrc, clamp(p, ivec2(0), sz - ivec2(1))).rgb;
+}
+
+// ── Isotropic / area blur kernels (styles 5..8), all localized to the tube ──
+vec3 boxBlur(ivec2 P, ivec2 sz, int R) {
+    vec3 s = vec3(0.0);
+    float n = 0.0;
+    for (int dy = -R; dy <= R; ++dy)
+        for (int dx = -R; dx <= R; ++dx) { s += ldc(P + ivec2(dx, dy), sz); n += 1.0; }
+    return s / max(n, 1.0);
+}
+
+vec3 median3x3(ivec2 P, ivec2 sz) {
+    vec3 v[9];
+    int k = 0;
+    for (int dy = -1; dy <= 1; ++dy)
+        for (int dx = -1; dx <= 1; ++dx) v[k++] = ldc(P + ivec2(dx, dy), sz);
+    GMIX_MNMX6(v[0], v[1], v[2], v[3], v[4], v[5]);
+    GMIX_MNMX5(v[1], v[2], v[3], v[4], v[6]);
+    GMIX_MNMX4(v[2], v[3], v[4], v[7]);
+    GMIX_MNMX3(v[3], v[4], v[8]);
+    return v[4];
+}
+
+// A few Kawase iterations: 4 diagonal taps averaged, offset growing per pass.
+vec3 kawase(ivec2 P, ivec2 sz, float base) {
+    vec3 s = vec3(0.0);
+    for (int it = 0; it < 3; ++it) {
+        int io = int(round(base * (float(it) + 1.0) + 0.5));
+        s += 0.25 * (ldc(P + ivec2( io,  io), sz) + ldc(P + ivec2(-io,  io), sz) +
+                     ldc(P + ivec2( io, -io), sz) + ldc(P + ivec2(-io, -io), sz));
+    }
+    return s / 3.0;
+}
+
+// Zoom blur: sample from the pixel back toward `center` (the cursor head).
+vec3 radialZoom(vec2 fp, vec2 center, ivec2 sz, float amt) {
+    const int RT = 16;
+    vec3 s = vec3(0.0);
+    for (int i = 0; i < RT; ++i) {
+        float t = float(i) / float(RT - 1);
+        vec2 sp = mix(fp, center, t * amt);
+        s += ldc(ivec2(round(sp)), sz);
+    }
+    return s / float(RT);
+}
+
+void main() {
+    uvec2 gid = gl_GlobalInvocationID.xy;
+    if (gid.x >= pc.frameW || gid.y >= pc.frameH) return;
+
+    ivec2 sz = ivec2(pc.frameW, pc.frameH);
+    ivec2 P  = ivec2(gid);
+    vec4  orig = imageLoad(blendSrc, P);
+
+    // Feature off / nothing to trace: pure passthrough (identical to pass 1).
+    if (pc.pointCount < 2u || pc.blurWidth <= 0.0 || pc.blurStrength <= 0.0) {
+        imageStore(dstImage, P, orig);
+        return;
+    }
+
+    vec2  fp         = vec2(P) + 0.5;
+    float bestDist   = 1e9;
+    vec2  bestTan    = vec2(0.0);
+    float bestSegLen = 0.0;
+    uint  bestI      = 0u;    // nearest segment index (0 = head/newest segment)
+    float bestT      = 0.0;   // param along that segment [0,1]
+
+    // Nearest path segment to this pixel + that segment's tangent/length.
+    for (uint i = 0u; i + 1u < pc.pointCount; ++i) {
+        vec2  a    = path.pts[i];
+        vec2  b    = path.pts[i + 1u];
+        vec2  ab   = b - a;
+        float len2 = dot(ab, ab);
+        float t    = (len2 > 1e-6) ? clamp(dot(fp - a, ab) / len2, 0.0, 1.0) : 0.0;
+        vec2  proj = a + t * ab;
+        float d    = distance(fp, proj);
+        if (d < bestDist) {
+            bestDist   = d;
+            float L    = sqrt(max(len2, 0.0));
+            bestTan    = (L > 1e-3) ? (ab / L) : vec2(0.0);
+            bestSegLen = L;
+            bestI      = i;
+            bestT      = t;
+        }
+    }
+
+    // Outside the tube, or the cursor barely moved here: leave as-is. Gating on
+    // real local motion keeps EVERY style a motion blur (a still cursor => no
+    // effect), including the area blurs below.
+    if (bestDist > pc.blurWidth || bestSegLen < 1.0 || bestTan == vec2(0.0)) {
+        imageStore(dstImage, P, orig);
+        return;
+    }
+
+    // Perpendicular falloff across the tube. Linear for most; a soft bell for
+    // gaussian so it's smooth in the across-path axis too.
+    float perp = bestDist / pc.blurWidth;                // 0 centerline .. 1 edge
+    float edge = (pc.style == 4u) ? exp(-3.0 * perp * perp) : (1.0 - perp);
+
+    float halfLen = 0.5 * bestSegLen;
+    int   taps    = int(clamp(halfLen, 1.0, 48.0));
+
+    // ── Compute the blurred color for this pixel per the chosen style ────────
+    vec3 blurred;
+    if (pc.style <= 4u) {
+        // Directional smear along the tangent over the segment's own length
+        // (the true local displacement). Gaussian style bell-weights taps.
+        vec4  acc  = vec4(0.0);
+        float wsum = 0.0;
+        for (int s = -taps; s <= taps; ++s) {
+            float u   = float(s) / float(taps);          // -1 .. 1 along the smear
+            float w   = (pc.style == 4u) ? exp(-3.0 * u * u) : 1.0;
+            vec2  off = bestTan * (halfLen * u);
+            acc  += w * vec4(ldc(P + ivec2(round(off)), sz), 1.0);
+            wsum += w;
+        }
+        blurred = (wsum > 0.0) ? (acc.rgb / wsum) : orig.rgb;
+    } else if (pc.style == 5u) {                         // box
+        blurred = boxBlur(P, sz, int(clamp(pc.blurWidth * 0.4, 1.0, 10.0)));
+    } else if (pc.style == 6u) {                         // median
+        blurred = median3x3(P, sz);
+    } else if (pc.style == 7u) {                         // kawase
+        blurred = kawase(P, sz, max(pc.blurWidth * 0.15, 1.0));
+    } else {                                             // radial (zoom to head)
+        blurred = radialZoom(fp, path.pts[0], sz, clamp(pc.blurWidth / 512.0, 0.0, 0.4));
+    }
+
+    // Envelope ALONG the path (pathPos: 0 = head/newest, 1 = tail/oldest). Only
+    // the directional styles vary along the path; area blurs are uniform.
+    float pathPos = (pc.pointCount > 1u)
+                  ? clamp((float(bestI) + bestT) / float(pc.pointCount - 1u), 0.0, 1.0)
+                  : 0.0;
+    float env = 1.0;
+    if      (pc.style == 1u) env = 1.0 - pathPos;                 // comet
+    else if (pc.style == 2u) env = sin(pathPos * GMIX_PI);        // taper
+    else if (pc.style == 3u) env = pow(1.0 - pathPos, 2.5);       // katana
+
+    // Strength up to 2.0: past 1.0, mix() extrapolates beyond the blurred value
+    // (over-driving the effect at the tube core; imageStore clamps to [0,1]).
+    float amt  = clamp(pc.blurStrength, 0.0, 2.0) * edge * env;
+    vec4  outc = mix(orig, vec4(blurred, 1.0), amt);
+    outc.a = 1.0;
+    imageStore(dstImage, P, outc);
+}
