@@ -100,7 +100,11 @@ void main() {
         if (hl > 1e-3) {
             vec2  dir  = hd / hl;
             vec2  a    = path.pts[0];
-            vec2  b    = a + dir * pc.blurWidth;
+            // Forward reach scales with real head motion (full blurWidth once
+            // moving ~width/4 per frame): a fast cursor gets its leading edge
+            // covered, while a creeping one keeps a near-symmetric halo
+            // instead of a forward-lobed one.
+            vec2  b    = a + dir * clamp(hl * 4.0, 0.0, pc.blurWidth);
             vec2  ab   = b - a;
             float len2 = dot(ab, ab);
             float t    = (len2 > 1e-6) ? clamp(dot(fp - a, ab) / len2, 0.0, 1.0) : 0.0;
@@ -130,19 +134,23 @@ void main() {
     float perp = bestDist / pc.blurWidth;
     float edge = 1.0 - perp;
 
-    // Rest blur: a soft isotropic soften (iterated 4-diagonal-tap, kawase
-    // style), always active inside the tube -- this is what the still cursor
-    // sits in, and what low-speed motion fades out of.
+    // Rest blur: a soft isotropic soften, always active inside the tube --
+    // what the still cursor sits in, and what low-speed motion fades out of.
+    // MUST include the center tap: a ring-only kernel (the first version)
+    // loses the bright cursor core's own energy, which read as a dark hollow
+    // where the cursor should be. Center-weighted two-ring disc (4/2/1),
+    // gaussian-ish, keeps a bright dot a bright soft blob.
     vec3 still;
     {
         float base = max(pc.blurWidth * 0.15, 1.0);
-        vec3 s3 = vec3(0.0);
-        for (int it = 0; it < 3; ++it) {
-            int io = int(round(base * (float(it) + 1.0) + 0.5));
-            s3 += 0.25 * (ldc(P + ivec2( io,  io), sz) + ldc(P + ivec2(-io,  io), sz) +
-                          ldc(P + ivec2( io, -io), sz) + ldc(P + ivec2(-io, -io), sz));
-        }
-        still = s3 / 3.0;
+        int   o1   = int(round(base + 0.5));
+        int   o2   = int(round(base * 2.0 + 0.5));
+        vec3  s3   = orig.rgb * 4.0;
+        s3 += 2.0 * (ldc(P + ivec2( o1, 0), sz) + ldc(P + ivec2(-o1, 0), sz) +
+                     ldc(P + ivec2(0,  o1), sz) + ldc(P + ivec2(0, -o1), sz));
+        s3 +=       (ldc(P + ivec2( o2,  o2), sz) + ldc(P + ivec2(-o2,  o2), sz) +
+                     ldc(P + ivec2( o2, -o2), sz) + ldc(P + ivec2(-o2, -o2), sz));
+        still = s3 / 16.0;
     }
 
     // Directional smear along the tangent over the segment's own length (the
@@ -166,16 +174,24 @@ void main() {
     vec3 blurred = mix(still, smear, m);
 
     // Comet envelope along the path (pathPos: 0 = head/newest, 1 = tail/oldest)
-    // -- bright at the head, fading toward the tail.
+    // -- bright at the head, fading toward the tail. The shape fades in WITH
+    // motion: on a near-still path every pixel behind the cursor projects to
+    // the tail (pathPos ~ 1), which zeroed the back half of the halo entirely
+    // (the "blur only covers the front" artifact). At rest the halo must be
+    // symmetric; the comet look belongs to actual movement.
     float pathPos = (pc.pointCount > 1u)
                   ? clamp((float(bestI) + bestT) / float(pc.pointCount - 1u), 0.0, 1.0)
                   : 0.0;
-    float env = 1.0 - pathPos;
+    float env = mix(1.0, 1.0 - pathPos, m);
 
-    // Strength up to 2.0: past 1.0, mix() extrapolates beyond the blurred value
-    // (over-driving the effect at the tube core; imageStore clamps to [0,1]).
+    // Strength up to 2.0. Past 1.0 the excess BRIGHTENS the blur (a glow
+    // boost) rather than extrapolating mix() past the blurred value -- the
+    // old extrapolation computed 2*blurred - orig, which INVERTED bright
+    // cursor cores into dark hollows (the "dark cursor at strength 2" bug).
     float amt  = clamp(pc.blurStrength, 0.0, 2.0) * edge * env;
-    vec4  outc = mix(orig, vec4(blurred, 1.0), amt);
+    float over = max(amt - 1.0, 0.0);
+    vec3  bcol = blurred * (1.0 + 0.5 * over);
+    vec4  outc = mix(orig, vec4(bcol, 1.0), min(amt, 1.0));
     outc.a = 1.0;
     imageStore(dstImage, P, outc);
 }
