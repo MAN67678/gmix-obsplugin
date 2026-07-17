@@ -834,9 +834,9 @@ void applyBlendConfigFromSettings(obs_data_t* settings) {
     cfg.shutterStrength = static_cast<float>(
         std::clamp(obs_data_get_double(settings, kSettingBrightness), 0.1, 10.0));
     cfg.cursorBlurWidth = static_cast<float>(
-        std::clamp(obs_data_get_double(settings, kSettingCursorBlurWidth), 0.0, 256.0));
+        std::clamp(obs_data_get_double(settings, kSettingCursorBlurWidth), 0.0, 512.0));
     cfg.cursorBlurStrength = static_cast<float>(
-        std::clamp(obs_data_get_double(settings, kSettingCursorBlurStrength), 0.0, 2.0));
+        std::clamp(obs_data_get_double(settings, kSettingCursorBlurStrength), 0.0, 3.0));
     cfg.blurMode = static_cast<int>(
         std::clamp<long long>(obs_data_get_int(settings, kSettingBlurMode), 0, 2));
     std::lock_guard<std::mutex> lk2(gEngine->blendConfigMu);
@@ -921,10 +921,10 @@ obs_properties_t* gmixGetProperties(void*) {
     obs_property_set_modified_callback2(blurMode, gmixBlurModeModified, nullptr);
 
     obs_property_t* cursorW = obs_properties_add_float_slider(props, kSettingCursorBlurWidth,
-                                  "Cursor blur width (px, 0 = off)", 0.0, 256.0, 1.0);
+                                  "Cursor blur width (px, 0 = off)", 0.0, 512.0, 1.0);
     obs_property_set_modified_callback2(cursorW, gmixCursorWidthModified, nullptr);
     obs_property_t* cursorS = obs_properties_add_float_slider(props, kSettingCursorBlurStrength,
-                                  "Cursor blur strength", 0.0, 2.0, 0.05);
+                                  "Cursor blur strength", 0.0, 3.0, 0.05);
     obs_property_set_modified_callback2(cursorS, gmixCursorStrengthModified, nullptr);
 
     // Arm the auto-fire guard for the ONE synthetic modified-callback

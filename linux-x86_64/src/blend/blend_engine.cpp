@@ -36,6 +36,14 @@ struct alignas(4) CursorPC {
     uint32_t pointCount;
     float    blurWidth;
     float    blurStrength;
+    // Bounding box of the cursor tube (path extent + margin), in pixels.
+    // Pixels outside it early-out BEFORE the per-pixel nearest-segment scan --
+    // without this, every pixel of the full frame paid the whole path loop
+    // every dispatch, real GPU contention against the game on the same GPU.
+    float    bboxMinX;
+    float    bboxMinY;
+    float    bboxMaxX;
+    float    bboxMaxY;
 };
 static_assert(sizeof(CursorPC) <= 128,
               "push constants must fit the guaranteed 128-byte limit");
@@ -827,6 +835,25 @@ bool BlendEngine::dispatchAsync(VkImageView* srcViews, uint32_t srcCount, uint32
     cpc.pointCount = pts;
     cpc.blurWidth = cursor.width;
     cpc.blurStrength = cursor.strength;
+    // Tube bounding box: path extent + margin. Margin covers the tube radius
+    // (blurWidth) plus the head cap's forward reach (up to another blurWidth
+    // beyond pts[0]) plus rounding slack. See CursorPC's comment for why.
+    {
+        float mnx = 1e9f, mny = 1e9f, mxx = -1e9f, mxy = -1e9f;
+        for (uint32_t i = 0; i < pts; ++i) {
+            float x = cursor.pointsXY[i * 2 + 0];
+            float y = cursor.pointsXY[i * 2 + 1];
+            if (x < mnx) mnx = x;
+            if (y < mny) mny = y;
+            if (x > mxx) mxx = x;
+            if (y > mxy) mxy = y;
+        }
+        float margin = cursor.width * 2.0f + 2.0f;
+        cpc.bboxMinX = mnx - margin;
+        cpc.bboxMinY = mny - margin;
+        cpc.bboxMaxX = mxx + margin;
+        cpc.bboxMaxY = mxy + margin;
+    }
     vkCmdPushConstants(cmd, pipeLayout2_, VK_SHADER_STAGE_COMPUTE_BIT,
                        0, sizeof(CursorPC), &cpc);
     vkCmdDispatch(cmd, gx, gy, 1);
