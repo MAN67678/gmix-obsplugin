@@ -13,10 +13,12 @@
 //
 // For each output pixel we find the nearest path segment; if the pixel is
 // within `blurWidth` px of it (the cursor's on-screen half-thickness -- a
-// manual slider for now), we apply a directional smear along that segment's
-// tangent (gated by real local motion -- a still cursor has no effect), with
-// a comet envelope (bright head, fading tail) and a soft perpendicular
-// falloff, then mix it over the original by `blurStrength`.
+// manual slider for now), we blur it: a soft isotropic REST blur that is
+// always active inside the tube, crossfaded into a directional smear along
+// the segment's tangent as local motion grows -- so rest -> moving is
+// continuous, with no pop at a motion threshold. A comet envelope (bright
+// head, fading tail) and a soft perpendicular falloff shape the result,
+// mixed over the original by `blurStrength`.
 //
 // When the feature is off (blurWidth <= 0, blurStrength <= 0, or < 2 path
 // points) this is a pure passthrough copy blendSrc -> dst.
@@ -39,7 +41,8 @@ layout(push_constant) uniform PC {
     uint  frameH;
     uint  pointCount;    // valid entries in path.pts (0..MAX_PTS)
     float blurWidth;     // half-thickness of the streak in px (~cursor radius)
-    float blurStrength;  // 0..1 mix of the streak over the original
+    float blurStrength;  // 0..2 mix of the streak over the original; >1
+                         // over-drives (mix() extrapolation, see the amt line)
 } pc;
 
 vec3 ldc(ivec2 p, ivec2 sz) {
@@ -105,17 +108,20 @@ void main() {
             if (d < bestDist) {
                 bestDist   = d;
                 bestTan    = dir;
-                bestSegLen = max(hl, pc.blurWidth);   // give the cap a real smear length
+                // Real head motion, not an inflated floor: the rest<->motion
+                // crossfade below (not an artificial smear length) is what
+                // keeps the cap visible/continuous at low speeds now.
+                bestSegLen = hl;
                 bestI      = 0u;
                 bestT      = 0.0;                      // treat as the head (pathPos 0)
             }
         }
     }
 
-    // Outside the tube, or the cursor barely moved here: leave as-is. Gating on
-    // real local motion keeps this a genuine motion blur (a still cursor => no
-    // effect).
-    if (bestDist > pc.blurWidth || bestSegLen < 1.0 || bestTan == vec2(0.0)) {
+    // Outside the tube: leave as-is. Proximity is the ONLY gate -- a still
+    // cursor keeps a soft blur disc around itself (rest blur below), so the
+    // effect no longer pops in and out as motion starts and stops.
+    if (bestDist > pc.blurWidth) {
         imageStore(dstImage, P, orig);
         return;
     }
@@ -124,19 +130,40 @@ void main() {
     float perp = bestDist / pc.blurWidth;
     float edge = 1.0 - perp;
 
-    // Directional smear along the tangent over the segment's own length (the
-    // true local displacement).
-    float halfLen = 0.5 * bestSegLen;
-    int   taps    = int(clamp(halfLen, 1.0, 48.0));
-    vec4  acc  = vec4(0.0);
-    float wsum = 0.0;
-    for (int s = -taps; s <= taps; ++s) {
-        float u   = float(s) / float(taps);          // -1 .. 1 along the smear
-        vec2  off = bestTan * (halfLen * u);
-        acc  += vec4(ldc(P + ivec2(round(off)), sz), 1.0);
-        wsum += 1.0;
+    // Rest blur: a soft isotropic soften (iterated 4-diagonal-tap, kawase
+    // style), always active inside the tube -- this is what the still cursor
+    // sits in, and what low-speed motion fades out of.
+    vec3 still;
+    {
+        float base = max(pc.blurWidth * 0.15, 1.0);
+        vec3 s3 = vec3(0.0);
+        for (int it = 0; it < 3; ++it) {
+            int io = int(round(base * (float(it) + 1.0) + 0.5));
+            s3 += 0.25 * (ldc(P + ivec2( io,  io), sz) + ldc(P + ivec2(-io,  io), sz) +
+                          ldc(P + ivec2( io, -io), sz) + ldc(P + ivec2(-io, -io), sz));
+        }
+        still = s3 / 3.0;
     }
-    vec3 blurred = (wsum > 0.0) ? (acc.rgb / wsum) : orig.rgb;
+
+    // Directional smear along the tangent over the segment's own length (the
+    // true local A->B displacement between those two real frames), crossfaded
+    // with the rest blur by local motion so rest -> moving is seamless.
+    vec3 smear = still;
+    if (bestSegLen >= 1.0 && bestTan != vec2(0.0)) {
+        float halfLen = 0.5 * bestSegLen;
+        int   taps    = int(clamp(halfLen, 1.0, 48.0));
+        vec4  acc  = vec4(0.0);
+        float wsum = 0.0;
+        for (int s = -taps; s <= taps; ++s) {
+            float u   = float(s) / float(taps);          // -1 .. 1 along the smear
+            vec2  off = bestTan * (halfLen * u);
+            acc  += vec4(ldc(P + ivec2(round(off)), sz), 1.0);
+            wsum += 1.0;
+        }
+        smear = (wsum > 0.0) ? (acc.rgb / wsum) : still;
+    }
+    float m = clamp(bestSegLen / 4.0, 0.0, 1.0);         // 0 at rest, 1 by ~4 px/frame
+    vec3 blurred = mix(still, smear, m);
 
     // Comet envelope along the path (pathPos: 0 = head/newest, 1 = tail/oldest)
     // -- bright at the head, fading toward the tail.

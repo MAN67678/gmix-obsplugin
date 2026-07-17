@@ -44,7 +44,8 @@ struct CursorPathBlur {
     const float* pointsXY   = nullptr; // pointCount * 2 floats (x,y interleaved)
     uint32_t     pointCount = 0;       // 0..kMaxBlendFrames valid points
     float        width      = 0.0f;    // streak half-thickness in px (~cursor radius)
-    float        strength   = 1.0f;    // 0..1 mix of the streak over the original
+    float        strength   = 1.0f;    // 0..2 mix of the streak over the original;
+                                       // >1 over-drives (shader-side mix extrapolation)
 };
 
 class BlendEngine {
