@@ -75,6 +75,21 @@ struct BlendConfig {
 
     // Max frames the engine will blend in one dispatch (the shader's MAX_FRAMES).
     int maxBlendFrames() const { return kMaxBlendFrames; }
+
+    // ── Bloom/glow post-process for cursor trail ─────────────────────────────
+    bool   bloomEnabled   = true;
+    float  bloomThreshold = 0.8f;
+    float  bloomStrength  = 1.0f;
+    float  bloomRadius    = 8.0f;
+    float  bloomSigma     = 4.0f;
+
+    // ── Cursor sprite (sharp cursor on top of trail) ──────────────────────────
+    int      cursorSpriteStyle       = 0;    // 0=circle, 1=crosshair, 2=dot
+    float    cursorSpriteAlpha       = 1.0f; // opacity 0..1
+    float    cursorSpriteReleaseTime = 0.3f; // fade-out seconds
+    bool     cursorSpriteEnabled     = true; // enable/disable sharp cursor
+    float    cursorTrailFade         = 0.0f; // extra fade px beyond blurWidth
+    float    cursorTrailFadeInTime   = 0.0f; // fade-in seconds (0 = instant)
 };
 
 } // namespace gmix

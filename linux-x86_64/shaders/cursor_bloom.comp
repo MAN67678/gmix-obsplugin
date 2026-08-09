@@ -1,0 +1,95 @@
+#version 450 core
+#extension GL_EXT_scalar_block_layout : enable
+
+// ─────────────────────────────────────────────────────────────────────────────
+// GMix cursor bloom/glow — OPTIMIZED single-pass bright boost for cursor trail.
+// 
+// Instead of expensive separable Gaussian blur (3 full-frame passes), this does
+// a single-pass bright pixel enhancement within the cursor path bounding box.
+// Much faster, still gives a visible glow on the cursor trail.
+// ─────────────────────────────────────────────────────────────────────────────
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, rgba8) readonly  uniform image2D srcImage;  // input (cursor trail result)
+layout(set = 0, binding = 1, rgba8) writeonly uniform image2D dstImage; // output (with glow)
+
+layout(push_constant) uniform PC {
+    uint  frameW;
+    uint  frameH;
+    float bloomThreshold;   // luma threshold for bright pixel boost
+    float bloomStrength;    // intensity multiplier for glow
+    float bloomRadius;      // glow radius in px (used for local neighborhood boost)
+    // Bounding box of cursor trail (same as cursor_path_blur) — pixels outside
+    // skip all bloom math entirely.
+    float bboxMinX;
+    float bboxMinY;
+    float bboxMaxX;
+    float bboxMaxY;
+} pc;
+
+float luma(vec3 c) { return dot(c, vec3(0.2126, 0.7152, 0.0722)); }
+
+vec4 loadClamped(ivec2 p, ivec2 sz) {
+    p = clamp(p, ivec2(0), sz - ivec2(1));
+    return imageLoad(srcImage, p);
+}
+
+void main()
+{
+    uvec2 gid = gl_GlobalInvocationID.xy;
+    if (gid.x >= pc.frameW || gid.y >= pc.frameH) return;
+
+    ivec2 sz = ivec2(pc.frameW, pc.frameH);
+    ivec2 P  = ivec2(gid);
+    vec2 fp = vec2(P) + 0.5f;
+
+    // Outside cursor trail bounding box: pure passthrough.
+    if (fp.x < pc.bboxMinX || fp.x > pc.bboxMaxX ||
+        fp.y < pc.bboxMinY || fp.y > pc.bboxMaxY) {
+        imageStore(dstImage, P, loadClamped(P, sz));
+        return;
+    }
+
+    vec4 orig = loadClamped(P, sz);
+    float bright = luma(orig.rgb);
+
+    // Only boost pixels above threshold (the cursor trail).
+    if (bright <= pc.bloomThreshold || pc.bloomStrength <= 0.0f) {
+        imageStore(dstImage, P, orig);
+        return;
+    }
+
+    // Single-pass local glow: sample a small neighborhood and boost bright pixels.
+    // This approximates a bloom without the 3-pass separable blur cost.
+    int radius = int(clamp(pc.bloomRadius, 0.0f, 16.0f));  // cap at 16px for perf
+    vec3 glow = vec3(0.0f);
+    float glowWeight = 0.0f;
+
+    if (radius > 0) {
+        // Sample 3x3 or 5x5 neighborhood for local glow
+        int sampleRadius = min(radius, 4);  // max 4px = 9x9 = 81 samples max
+        for (int dy = -sampleRadius; dy <= sampleRadius; ++dy) {
+            for (int dx = -sampleRadius; dx <= sampleRadius; ++dx) {
+                vec4 n = loadClamped(P + ivec2(dx, dy), sz);
+                float nb = luma(n.rgb);
+                if (nb > pc.bloomThreshold) {
+                    float dist = float(dx*dx + dy*dy);
+                    float w = exp(-dist / (pc.bloomRadius * pc.bloomRadius * 0.5f));
+                    glow += n.rgb * (nb - pc.bloomThreshold) * w;
+                    glowWeight += w;
+                }
+            }
+        }
+    }
+
+    vec3 result = orig.rgb;
+    if (glowWeight > 0.0f) {
+        result += (glow / glowWeight) * pc.bloomStrength;
+    } else {
+        // Fallback: simple per-pixel boost
+        result += orig.rgb * (bright - pc.bloomThreshold) * pc.bloomStrength;
+    }
+
+    imageStore(dstImage, P, vec4(min(result, vec3(1.0f)), orig.a));
+}
