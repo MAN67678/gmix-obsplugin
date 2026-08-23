@@ -46,18 +46,7 @@ struct CursorPathBlur {
     float        width      = 0.0f;    // streak half-thickness in px (~cursor radius)
     float        strength   = 1.0f;    // 0..3 mix of the streak over the original;
                                        // >1 brightens the blur (glow boost in the shader)
-    float        trailFade  = 0.0f;    // extra fade px beyond width for smoother edge
-    float        trailFadeInTime = 0.0f; // fade-in seconds (0 = instant)
-};
-
-// Bloom/glow post-process for cursor trail (see shaders/cursor_bloom.comp).
-// Single-pass bright boost within cursor trail bounding box.
-struct BloomParams {
-    float threshold = 0.8f;   // luma threshold for bright pixel extraction (0..1)
-    float strength  = 1.0f;   // bloom intensity multiplier
-    float radius    = 8.0f;   // blur radius in pixels (0 = disabled)
-    float sigma     = 4.0f;   // Gaussian sigma
-    bool  enabled   = true;   // master toggle
+    float        trailFade  = 0.0f;    // extra fade px beyond width for smoother edge (0 = hard cutoff)
 };
 
 class BlendEngine {
@@ -140,8 +129,7 @@ public:
                        const VkSemaphore* waitSems = nullptr,
                        const uint64_t* waitVals = nullptr, uint32_t waitCount = 0,
                        ResampleParams resample = {},
-                       const CursorPathBlur& cursor = {},
-                       const BloomParams& bloom = {});
+                       const CursorPathBlur& cursor = {});
     bool blendInFlight() const { return blendInFlight_; }
     // True once the in-flight blend's GPU work has completed (non-blocking).
     // Clears the in-flight flag as a side effect when it returns true.
@@ -170,6 +158,14 @@ public:
     // last dispatch. Used by tests; the presenter does its own blit.
     bool readbackDst(uint8_t* outPixels);
 
+    // ── Passthrough (normal capture) ───────────────────────────────────────
+    // Single-shader copy of srcViews[0] → dst[dstIdx], no blending. Used for
+    // "Normal Capture" mode. Skips both the resample-blur and cursor-path
+    // passes. Still signals blendTimeline_ so pollBlendDone() works.
+    bool dispatchPassthrough(VkImageView srcView, uint32_t dstIdx,
+                             VkSemaphore waitSem = VK_NULL_HANDLE,
+                             uint64_t waitVal = 0);
+
     // ── Zero-copy dma-buf export (for the OBS plugin) ──────────────────────
     // True once init() has confirmed R8G8B8A8_UNORM supports LINEAR+STORAGE
     // on this device and both dst buffers were successfully exported.
@@ -187,7 +183,7 @@ private:
     bool createPipeline();
     bool createIntermediateImage();   // blendTmp_ (pass-1 output, pass-2 input)
     bool createCursorPass();          // pass-2 layout/pool/set/pipeline + path SSBO
-    bool createBloomPass();           // pass-3: bloom/glow (bright filter + blur + combine)
+    bool createPassthrough();         // single-shader copy pipeline (normal capture)
     void destroyTransient();
     void destroyAll();
 
@@ -260,20 +256,12 @@ private:
     VkDeviceMemory pathBufMem_ = VK_NULL_HANDLE;
     void*          pathMapped_ = nullptr;
 
-    // ── Third pass: cursor bloom/glow (cursor_bloom.comp) ───────────────────
-    // Single-pass bright boost within cursor trail bounding box.
-    VkDescriptorSetLayout dsLayout3_   = VK_NULL_HANDLE;
-    VkPipelineLayout      pipeLayout3_ = VK_NULL_HANDLE;
-    VkPipeline            pipeline3_   = VK_NULL_HANDLE;
-    VkDescriptorPool      descPool3_   = VK_NULL_HANDLE;
-    VkDescriptorSet       descSet3_    = VK_NULL_HANDLE;
-
-    // Cursor trail fade state (for release delay / fade-out).
-    float cursorFade_ = 0.0f;
-    double lastValidCursorTime_ = 0.0;
-    // Cursor trail fade-in state.
-    float trailFadeIn_ = 1.0f;
-    double lastTrailStartTime_ = 0.0;
+    // ── Passthrough (normal capture) pipeline ───────────────────────────────
+    VkDescriptorSetLayout dsLayoutP_   = VK_NULL_HANDLE;
+    VkPipelineLayout      pipeLayoutP_ = VK_NULL_HANDLE;
+    VkPipeline            pipelineP_   = VK_NULL_HANDLE;
+    VkDescriptorPool      descPoolP_   = VK_NULL_HANDLE;
+    VkDescriptorSet       descSetP_    = VK_NULL_HANDLE;
 
     uint32_t width_  = 0;
     uint32_t height_ = 0;

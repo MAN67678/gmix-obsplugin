@@ -53,11 +53,16 @@ struct BlendConfig {
     // cursorBlurStrength: 0..1 mix of the streak over the original.
     float    cursorBlurWidth    = 0.0f;
     float    cursorBlurStrength = 1.0f;
+    float    cursorTrailFade    = 0.0f; // extra fade px beyond width for smoother edge (0 = hard cutoff)
     // Blur mode: 0 = optical-flow only (pass 2 off), 1 = cursor-path only (pass
     // 1 falls back to a plain temporal average so the streak stands alone),
     // 2 = both (optical-flow blend + cursor-path streak). Default 2 preserves
     // the pre-picker behavior (with cursorBlurWidth 0, that's optical-only).
     int      blurMode           = 2;
+    // Capture mode: 0 = motion blur (the full blend pipeline above), 1 = normal
+    // capture (latest frame copied straight through, no blending). When set to 1
+    // the blend density/brightness/cursor/blurMode fields are ignored.
+    int      captureMode        = 0;
 
     // Output window size.
     uint32_t outW = 1920;
@@ -75,21 +80,6 @@ struct BlendConfig {
 
     // Max frames the engine will blend in one dispatch (the shader's MAX_FRAMES).
     int maxBlendFrames() const { return kMaxBlendFrames; }
-
-    // ── Bloom/glow post-process for cursor trail ─────────────────────────────
-    bool   bloomEnabled   = true;
-    float  bloomThreshold = 0.8f;
-    float  bloomStrength  = 1.0f;
-    float  bloomRadius    = 8.0f;
-    float  bloomSigma     = 4.0f;
-
-    // ── Cursor sprite (sharp cursor on top of trail) ──────────────────────────
-    int      cursorSpriteStyle       = 0;    // 0=circle, 1=crosshair, 2=dot
-    float    cursorSpriteAlpha       = 1.0f; // opacity 0..1
-    float    cursorSpriteReleaseTime = 0.3f; // fade-out seconds
-    bool     cursorSpriteEnabled     = true; // enable/disable sharp cursor
-    float    cursorTrailFade         = 0.0f; // extra fade px beyond blurWidth
-    float    cursorTrailFadeInTime   = 0.0f; // fade-in seconds (0 = instant)
 };
 
 } // namespace gmix

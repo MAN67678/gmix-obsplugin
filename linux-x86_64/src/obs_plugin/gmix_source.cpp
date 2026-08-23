@@ -49,16 +49,9 @@ constexpr const char* kSettingBlurDensity = "blur_density";
 constexpr const char* kSettingBrightness  = "blur_brightness";
 constexpr const char* kSettingCursorBlurWidth    = "cursor_blur_width";
 constexpr const char* kSettingCursorBlurStrength = "cursor_blur_strength";
+constexpr const char* kSettingCursorTrailFade    = "cursor_trail_fade";
 constexpr const char* kSettingBlurMode           = "blur_mode";
-constexpr const char* kSettingLatencyMode        = "latency_mode";
-// Bloom settings
-constexpr const char* kSettingBloomEnabled    = "bloom_enabled";
-constexpr const char* kSettingBloomThreshold  = "bloom_threshold";
-constexpr const char* kSettingBloomStrength   = "bloom_strength";
-constexpr const char* kSettingBloomRadius     = "bloom_radius";
-constexpr const char* kSettingBloomSigma      = "bloom_sigma";
-constexpr const char* kSettingCursorTrailFade         = "cursor_trail_fade";
-constexpr const char* kSettingCursorTrailFadeInTime   = "cursor_trail_fade_in_time";
+constexpr const char* kSettingCaptureMode       = "capture_mode";
 constexpr const char* kDefaultTarget      = "osu!";
 
 // The plugin used to expose a "Blur preset" (Flat/Linear/Cinematic/Heavy/
@@ -66,9 +59,9 @@ constexpr const char* kDefaultTarget      = "osu!";
 // dstBufferCount 2/3/4/5) dropdown. Both removed 2026-07-03 when the plugin
 // was stripped down to only what was actually being used live: Advanced
 // mode, at the most tolerant (5-buffer) Latency mode setting -- see
-// DEV_NOTES.md. Latency mode is now restored as a user-configurable setting.
-// Default is 5 ("Very slow") to preserve existing behavior.
-constexpr int kDefaultLatencyMode = 5;   // 2=Fast, 3=Medium, 4=Slow, 5=Very slow
+// DEV_NOTES.md. dstBufferCount is now this one fixed constant everywhere
+// instead of a user-configurable, persisted-to-disk value.
+constexpr uint32_t kFixedDstBufferCount = 5;   // was "Very slow"
 
 // ── Diagnostics: EMA-smoothed rate tracker for the periodic status log ─────
 // Mutex-guarded rather than lock-free: this is a low-frequency diagnostic
@@ -123,10 +116,10 @@ bool writeTargetProcessConfig(const std::string& target) {
     return out.good();
 }
 
-// ── Persisted engine-wide settings (GPU index + latency mode) ─────────────────
-// GPU index and latency mode are fundamentally PROCESS-WIDE -- one shared
-// GmixEngine for however many "GMix Motion Blur" sources exist -- but OBS only
-// gives plugins PER-SOURCE settings storage (obs_data_t). With N sources,
+// ── Persisted engine-wide setting (GPU index) ───────────────────────────────
+// GPU index is fundamentally PROCESS-WIDE -- one shared GmixEngine for
+// however many "GMix Motion Blur" sources exist -- but OBS only gives
+// plugins PER-SOURCE settings storage (obs_data_t). With N sources,
 // whichever one OBS happens to construct FIRST decides the value for ALL of
 // them, which depends on OBS's internal source-load order, not anything the
 // user controls. Worse: CONFIRMED live, a brand-new "+"-added source always
@@ -136,62 +129,53 @@ bool writeTargetProcessConfig(const std::string& target) {
 // either; there's no way to escape the default under pure per-source
 // storage. This file breaks that: it's the value the NEXT freshly-created
 // engine uses, written ONLY when the user actually interacts with the GPU
-// index or latency mode field in Properties (see gmixGpuIndexModified() /
-// gmixLatencyModeModified() modified-callbacks -- NOT from gmixUpdate()'s
-// routine settings-application path, which also runs on ordinary source
-// creation/scene-collection load with whatever default/stale value that
-// particular source happens to have; writing from THAT path would silently
-// clobber a deliberately-set value the moment any other default-configured
-// source gets created).
+// index field in Properties (see gmixGpuIndexModified()'s modified-callback
+// -- NOT from gmixUpdate()'s routine settings-application path, which also
+// runs on ordinary source creation/scene-collection load with whatever
+// default/stale value that particular source happens to have; writing from
+// THAT path would silently clobber a deliberately-set value the moment any
+// other default-configured source gets created).
 //
-// Latency mode (dstBufferCount) requires engine restart to take effect, same
-// as GPU index. Both are stored in ~/.config/gmix/engine_settings as two
-// integers: "gpuIndex latencyMode" (default latencyMode = 5 if missing).
+// Blur density/brightness do NOT need an equivalent file: unlike GPU index
+// (and, formerly, Latency mode/dstBufferCount), they apply LIVE to the
+// running engine without needing a rebuild (see applyBlendConfigFromSettings
+// below), and with the plugin's simplified single-shared-engine model
+// (see README: use ONE "GMix Motion Blur" source, reused across scenes via
+// "Add Existing Source", not multiple independent source instances) OBS's
+// own scene-collection persistence of this one source's obs_data is enough
+// -- there's no other differently-configured source instance for a freshly
+// rebuilt engine to need to recover a value FROM. gmixCreate() pushes this
+// source's own saved density/brightness into a freshly-created engine
+// directly (see its comment) instead of going through a file.
 std::filesystem::path engineSettingsConfigPath() {
     const char* home = std::getenv("HOME");
     if (!home) return {};
     return std::filesystem::path(home) / ".config" / "gmix" / "engine_settings";
 }
 
-bool writeEngineSettingsConfig(int32_t gpuIndex, int32_t latencyMode = -1) {
+bool writeEngineSettingsConfig(int32_t gpuIndex) {
     auto path = engineSettingsConfigPath();
     if (path.empty()) return false;
     std::error_code ec;
     std::filesystem::create_directories(path.parent_path(), ec);
     if (ec) return false;
-
-    // Read existing values to preserve the one we're not changing
-    int32_t existingGpuIndex = -1;
-    int32_t existingLatencyMode = kDefaultLatencyMode;
-    {
-        std::ifstream in(path);
-        if (in) {
-            in >> existingGpuIndex >> existingLatencyMode;
-        }
-    }
-
-    if (gpuIndex != -1) existingGpuIndex = gpuIndex;
-    if (latencyMode != -1) existingLatencyMode = latencyMode;
-
     std::ofstream out(path);
     if (!out) return false;
-    out << existingGpuIndex << ' ' << existingLatencyMode;
+    out << gpuIndex;
     return out.good();
 }
 
-// Returns false (leaving outputs untouched) if the file doesn't exist yet --
-// the very first engine ever created on this machine, before any settings
-// have ever been persisted -- so the caller's own (first-source's) values
-// are used, matching the pre-existing behavior.
-bool readEngineSettingsConfig(int32_t& gpuIndex, int32_t& latencyMode) {
+// Returns false (leaving gpuIndex untouched) if the file doesn't exist yet --
+// the very first engine ever created on this machine, before any GPU index
+// change has ever been persisted -- so the caller's own (first-source's)
+// value is used, matching the pre-existing behavior.
+bool readEngineSettingsConfig(int32_t& gpuIndex) {
     auto path = engineSettingsConfigPath();
     std::ifstream in(path);
     if (!in) return false;
-    int32_t gi = -1;
-    int32_t lm = kDefaultLatencyMode;
-    if (!(in >> gi >> lm)) return false;
+    int32_t gi;
+    if (!(in >> gi)) return false;
     gpuIndex = gi;
-    latencyMode = lm;
     return true;
 }
 
@@ -313,7 +297,11 @@ struct GmixEngine {
     gmix::BlendEngine* blend = nullptr;   // heap: BlendEngine has no default ctor
     bool blendReady = false;
     int32_t gpuIndex = -1;
-    uint32_t dstBufferCount = 5;   // configurable via latency mode setting (2-5)
+    // Always kFixedDstBufferCount now (see its comment) -- kept as a member,
+    // rather than reading the constant directly everywhere below, so the
+    // rest of this struct/workerMain() didn't need to change when Latency
+    // mode stopped being user-configurable.
+    uint32_t dstBufferCount = kFixedDstBufferCount;
 
     // gs_texture_t handles imported ONCE per dst buffer (see workerMain()).
     // Sized to dstBufferCount in acquireEngine(), before the worker thread
@@ -366,7 +354,7 @@ void workerMain(GmixEngine* s);
 // First caller (refCount 0->1) spins up the shared worker thread and headless
 // Vulkan context; later callers just bump the refcount and attach to the
 // already-running pipeline. gpuIndex only takes effect for the first caller
-// (dstBufferCount is now configurable via latency mode setting, persisted to config).
+// (dstBufferCount is now always kFixedDstBufferCount, see its comment).
 GmixEngine* acquireEngine(int32_t gpuIndex) {
     std::lock_guard<std::mutex> lk(gEngineMu);
     if (!gEngine) {
@@ -375,11 +363,9 @@ GmixEngine* acquireEngine(int32_t gpuIndex) {
         // storage can't reliably express a process-wide setting. If the file
         // doesn't exist yet (nothing has ever been persisted), fall through
         // to this caller's own value, matching the original behavior.
-        int32_t latencyMode = kDefaultLatencyMode;
-        readEngineSettingsConfig(gpuIndex, latencyMode);
+        readEngineSettingsConfig(gpuIndex);
         auto* e = new GmixEngine();
         e->gpuIndex = gpuIndex;
-        e->dstBufferCount = static_cast<uint32_t>(latencyMode);
         e->tex.assign(e->dstBufferCount, nullptr);
         if (!e->vk.init(gpuIndex, /*headless=*/true)) {
             delete e;
@@ -660,178 +646,106 @@ void workerMain(GmixEngine* s) {
                 auto window_frames = queue.snapshot();
                 if (!window_frames.empty()) {
                     const size_t wsz = window_frames.size();
-                    // Select by TIME, not frame count: every ring entry whose
-                    // capture timestamp falls within the trailing shutter
-                    // window behind the newest arrival. Use ACTUAL capture rate
-                    // (producerRate) for adaptive window: at 240fps game, 1/60s
-                    // shutter = 4 frames; at 60fps = 1 frame; at 360fps = 6 frames.
-                    // Fallback to OBS configured interval if producer rate unknown.
-                    // Add a small margin (1.2x) to capture the FULL movement --
-                    // fast cursor moves often span slightly more than 1/60s due to
-                    // frame timing variance; without this, the tail gets cut.
-                    double producerFps = s->producerRate.fps();
-                    uint64_t shutterNs;
-                    if (producerFps > 1.0) {
-                        // Target 1/60s of real motion regardless of capture fps
-                        shutterNs = static_cast<uint64_t>(1.2 * 1e9 / 60.0);  // 20ms instead of 16.67ms
+
+                    if (config.captureMode == 1) {
+                        // ── Normal capture: copy the latest frame straight through ──
+                        // No blending — just the newest frame to the dst buffer.
+                        auto& latest = window_frames[wsz - 1];
+                        VkSemaphore latestSem = latest.frame->producerSemaphore();
+                        uint64_t latestVal = latest.frame->producerWaitValue();
+
+                        uint32_t back = nextWriteIdx;
+                        if (s->blend->dispatchPassthrough(latest.frame->view(), back,
+                                latestSem, latestVal)) {
+                            inFlightIdx = back;
+                            nextWriteIdx = (nextWriteIdx + 1) % s->dstBufferCount;
+                            lastBlendArrivals = arrivalsNow;
+                            lastDispatchedTickSeq = curTickSeq;
+                        }
                     } else {
-                        shutterNs = static_cast<uint64_t>(
-                            1.2 * s->obsFrameSec.load(std::memory_order_relaxed) * 1e9);
-                    }
-                    uint64_t newestTs = window_frames.back().timestampNs;
-                    size_t n = 0;
-                    while (n < wsz && newestTs - window_frames[wsz - 1 - n].timestampNs <= shutterNs)
-                        ++n;
-                    if (n < 1) n = 1;
-                    n = std::min(n, static_cast<size_t>(config.maxBlendFrames()));
+                        // ── Motion blur: select by TIME, not frame count ──────────
+                        // Every ring entry whose capture timestamp falls within the
+                        // trailing shutter window (OBS's real frame interval)
+                        // behind the newest arrival. Exact regardless of how the
+                        // capture rate fluctuates -- see the FrameQueue comment above.
+                        uint64_t shutterNs = static_cast<uint64_t>(
+                            s->obsFrameSec.load(std::memory_order_relaxed) * 1e9);
+                        uint64_t newestTs = window_frames.back().timestampNs;
+                        size_t n = 0;
+                        while (n < wsz && newestTs - window_frames[wsz - 1 - n].timestampNs <= shutterNs)
+                            ++n;
+                        if (n < 1) n = 1;
+                        n = std::min(n, static_cast<size_t>(config.maxBlendFrames()));
 
-                    std::vector<VkImageView> srcViews(n);
-                    std::vector<VkSemaphore> waitSems;
-                    std::vector<uint64_t>    waitVals;
-                    waitSems.reserve(n);
-                    waitVals.reserve(n);
-                    for (size_t i = 0; i < n; ++i) {
-                        auto& f = window_frames[wsz - 1 - i].frame;
-                        srcViews[i] = f->view();
-                        VkSemaphore sem = f->producerSemaphore();
-                        if (sem == VK_NULL_HANDLE) continue;
-                        uint64_t v = f->producerWaitValue();
-                        bool merged = false;
-                        for (size_t k = 0; k < waitSems.size(); ++k) {
-                            if (waitSems[k] == sem) { if (v > waitVals[k]) waitVals[k] = v; merged = true; break; }
-                        }
-                        if (!merged) { waitSems.push_back(sem); waitVals.push_back(v); }
-                    }
-
-                    // ── Reconstruct the cursor's TRUE path through this blend ──
-                    // srcViews[i] is the i-th newest source frame; that frame's
-                    // window-normalized cursorX/Y (<0 if unavailable) times the
-                    // blend-buffer extent is where the cursor was IN this buffer
-                    // at that instant. Flattened newest-first as interleaved x,y
-                    // pixels -- exactly the polyline the pass-2 cursor-path blur
-                    // (cursor_path_blur.comp) walks. Unavailable samples are
-                    // INTERPOLATED from neighbors so the path stays contiguous --
-                    // skipping creates gaps that show as discrete blur blobs.
-                    //
-                    // IMPORTANT: Use ALL captured frames in the shutter window for
-                    // cursor path (not just the `n` blended frames). At high capture
-                    // rates (240fps, 360fps) this gives 4-6x more path points than
-                    // blended frames, creating a much denser, smoother polyline.
-                    std::vector<float> cursorPathXY;
-                    const float bw = static_cast<float>(s->blend->width());
-                    const float bh = static_cast<float>(s->blend->height());
-                    
-                    // Count ALL frames in shutter window (not capped by maxBlendFrames)
-                    size_t pathFrameCount = 0;
-                    while (pathFrameCount < wsz && newestTs - window_frames[wsz - 1 - pathFrameCount].timestampNs <= shutterNs)
-                        ++pathFrameCount;
-                    if (pathFrameCount < 1) pathFrameCount = 1;
-                    
-                    // First pass: collect all positions (with NaN for unavailable)
-                    std::vector<std::pair<float, float>> rawPath(pathFrameCount);
-                    for (size_t i = 0; i < pathFrameCount; ++i) {
-                        const auto& e = window_frames[wsz - 1 - i];
-                        if (e.cursorX >= 0.f && e.cursorY >= 0.f) {
-                            rawPath[i] = {e.cursorX * bw, e.cursorY * bh};
-                        } else {
-                            rawPath[i] = {NAN, NAN};  // mark unavailable
-                        }
-                    }
-                    // Second pass: interpolate unavailable positions
-                    for (size_t i = 0; i < pathFrameCount; ++i) {
-                        if (!std::isnan(rawPath[i].first)) {
-                            cursorPathXY.push_back(rawPath[i].first);
-                            cursorPathXY.push_back(rawPath[i].second);
-                            continue;
-                        }
-                        // Find nearest available neighbor before and after
-                        float prevX = NAN, prevY = NAN;
-                        float nextX = NAN, nextY = NAN;
-                        for (size_t j = 1; j <= i; ++j) {
-                            if (!std::isnan(rawPath[i - j].first)) {
-                                prevX = rawPath[i - j].first;
-                                prevY = rawPath[i - j].second;
-                                break;
+                        std::vector<VkImageView> srcViews(n);
+                        std::vector<VkSemaphore> waitSems;
+                        std::vector<uint64_t>    waitVals;
+                        waitSems.reserve(n);
+                        waitVals.reserve(n);
+                        for (size_t i = 0; i < n; ++i) {
+                            auto& f = window_frames[wsz - 1 - i].frame;
+                            srcViews[i] = f->view();
+                            VkSemaphore sem = f->producerSemaphore();
+                            if (sem == VK_NULL_HANDLE) continue;
+                            uint64_t v = f->producerWaitValue();
+                            bool merged = false;
+                            for (size_t k = 0; k < waitSems.size(); ++k) {
+                                if (waitSems[k] == sem) { if (v > waitVals[k]) waitVals[k] = v; merged = true; break; }
                             }
+                            if (!merged) { waitSems.push_back(sem); waitVals.push_back(v); }
                         }
-                        for (size_t j = 1; i + j < pathFrameCount; ++j) {
-                            if (!std::isnan(rawPath[i + j].first)) {
-                                nextX = rawPath[i + j].first;
-                                nextY = rawPath[i + j].second;
-                                break;
-                            }
+
+                        // ── Reconstruct the cursor's TRUE path through this blend ──
+                        // srcViews[i] is the i-th newest source frame; that frame's
+                        // window-normalized cursorX/Y (<0 if unavailable) times the
+                        // blend-buffer extent is where the cursor was IN this buffer
+                        // at that instant. Flattened newest-first as interleaved x,y
+                        // pixels -- exactly the polyline the pass-2 cursor-path blur
+                        // (cursor_path_blur.comp) walks. Unavailable samples are
+                        // skipped, so the path stays a contiguous run of real points.
+                        std::vector<float> cursorPathXY;
+                        cursorPathXY.reserve(n * 2);
+                        const float bw = static_cast<float>(s->blend->width());
+                        const float bh = static_cast<float>(s->blend->height());
+                        for (size_t i = 0; i < n; ++i) {
+                            const auto& e = window_frames[wsz - 1 - i];
+                            if (e.cursorX < 0.f || e.cursorY < 0.f) continue;
+                            cursorPathXY.push_back(e.cursorX * bw);
+                            cursorPathXY.push_back(e.cursorY * bh);
                         }
-                        float ix, iy;
-                        if (!std::isnan(prevX) && !std::isnan(nextX)) {
-                            // Linear interpolate between prev and next
-                            ix = (prevX + nextX) * 0.5f;
-                            iy = (prevY + nextY) * 0.5f;
-                        } else if (!std::isnan(prevX)) {
-                            ix = prevX; iy = prevY;
-                        } else if (!std::isnan(nextX)) {
-                            ix = nextX; iy = nextY;
-                        } else {
-                            ix = bw * 0.5f; iy = bh * 0.5f;  // center fallback
+                        const uint32_t cursorPts =
+                            static_cast<uint32_t>(cursorPathXY.size() / 2);
+
+                        // Blur mode: 0=optical only, 1=cursor path only, 2=both.
+                        //   optical-flow (pass 1) runs for Optical + Both, and is
+                        //   swapped for a plain temporal average in Cursor mode so
+                        //   the true-path streak stands alone.
+                        //   the cursor-path streak (pass 2) runs for Cursor + Both;
+                        //   in Optical mode width 0 makes pass 2 a passthrough.
+                        const int mode = config.blurMode;
+                        gmix::ResampleParams resample{};
+                        resample.subSamples      = config.blurDensity;
+                        resample.shutterStrength = config.shutterStrength;
+                        resample.opticalFlow     = (mode != 1);
+
+                        gmix::CursorPathBlur cursor{};
+                        cursor.pointsXY   = cursorPathXY.data();
+                        cursor.pointCount = cursorPts;
+                        cursor.width      = (mode == 0) ? 0.0f : config.cursorBlurWidth;
+                        cursor.strength   = config.cursorBlurStrength;
+                        cursor.trailFade  = config.cursorTrailFade;
+
+                        uint32_t back = nextWriteIdx;
+                        if (s->blend->dispatchAsync(srcViews.data(),
+                                                    static_cast<uint32_t>(n), back,
+                                                    waitSems.data(), waitVals.data(),
+                                                    static_cast<uint32_t>(waitSems.size()),
+                                                    resample, cursor)) {
+                            inFlightIdx = back;
+                            nextWriteIdx = (nextWriteIdx + 1) % s->dstBufferCount;
+                            lastBlendArrivals = arrivalsNow;
+                            lastDispatchedTickSeq = curTickSeq;
                         }
-                        cursorPathXY.push_back(ix);
-                        cursorPathXY.push_back(iy);
-                    }
-                    const uint32_t cursorPts =
-                        static_cast<uint32_t>(cursorPathXY.size() / 2);
-
-                    // Blur mode: 0=optical only, 1=cursor path only, 2=both.
-                    //   optical-flow (pass 1) runs for Optical + Both, and is
-                    //   swapped for a plain temporal average in Cursor mode so
-                    //   the true-path streak stands alone.
-                    //   the cursor-path streak (pass 2) runs for Cursor + Both;
-                    //   in Optical mode width 0 makes pass 2 a passthrough.
-                    const int mode = config.blurMode;
-                    gmix::ResampleParams resample{};
-                    resample.subSamples      = config.blurDensity;
-                    resample.shutterStrength = config.shutterStrength;
-                    resample.opticalFlow     = (mode != 1);
-
-                    gmix::CursorPathBlur cursor{};
-                    cursor.pointsXY   = cursorPathXY.data();
-                    cursor.pointCount = cursorPts;
-                    cursor.width      = (mode == 0) ? 0.0f : config.cursorBlurWidth;
-                    cursor.strength   = config.cursorBlurStrength;
-                    cursor.trailFade  = config.cursorTrailFade;
-                    cursor.trailFadeInTime = config.cursorTrailFadeInTime;
-
-                    gmix::BloomParams bloom{};
-                    bloom.enabled   = config.bloomEnabled;
-                    bloom.threshold = config.bloomThreshold;
-                    bloom.strength  = config.bloomStrength;
-                    bloom.radius    = config.bloomRadius;
-                    bloom.sigma     = config.bloomSigma;
-
-                    // Cursor sprite: use the NEWEST cursor position (index 0 in cursorPathXY)
-                    // for a sharp, smooth danser-style cursor on top of the trail.
-                    gmix::CursorSpriteParams cursorSprite{};
-                    cursorSprite.enabled = config.cursorSpriteEnabled;
-                    if (cursorPts > 0) {
-                        cursorSprite.cursorX = cursorPathXY[0] / static_cast<float>(s->blend->width());
-                        cursorSprite.cursorY = cursorPathXY[1] / static_cast<float>(s->blend->height());
-                    } else {
-                        cursorSprite.cursorX = -1.0f;  // disabled (will fade out via releaseTime)
-                        cursorSprite.cursorY = -1.0f;
-                    }
-                    cursorSprite.cursorSize = config.cursorBlurWidth > 0.0f ? config.cursorBlurWidth : 16.0f;
-                    cursorSprite.cursorAlpha = config.cursorSpriteAlpha;
-                    cursorSprite.cursorStyle = static_cast<uint32_t>(config.cursorSpriteStyle);
-                    cursorSprite.releaseTime = config.cursorSpriteReleaseTime;
-
-                    uint32_t back = nextWriteIdx;
-                    if (s->blend->dispatchAsync(srcViews.data(),
-                                                static_cast<uint32_t>(n), back,
-                                                waitSems.data(), waitVals.data(),
-                                                static_cast<uint32_t>(waitSems.size()),
-                                                resample, cursor, bloom, cursorSprite)) {
-                        inFlightIdx = back;
-                        nextWriteIdx = (nextWriteIdx + 1) % s->dstBufferCount;
-                        lastBlendArrivals = arrivalsNow;
-                        lastDispatchedTickSeq = curTickSeq;
                     }
                 }
             }
@@ -886,28 +800,17 @@ void gmixGetDefaults(obs_data_t* settings) {
     // 1.0 = pure energy-conserving average, no boost. Used to be raised to
     // 1.3 to compensate for a shader that under-filled the trail (see
     // BlendConfig.hpp's comment / etc/DEV_NOTES.md's 2026-07-05 entry) --
-    // now that per-frame-pair motion estimation fills the trail properly, 1.0
-    // is genuinely neutral and looks correct on its own and is confirmed live
-    // as the real neutral default; the slider is still there to tune per-content.
+    // now that per-frame-pair motion estimation fills it properly, 1.0
+    // looks correct on its own and is confirmed live as the real neutral
+    // default; the slider is still there to tune per-content.
     obs_data_set_default_double(settings, kSettingBrightness, 1.0);
     // Cursor-path blur OFF by default (width 0 => pass 2 is a passthrough copy,
     // output identical to the single-pass blend). See BlendConfig.hpp.
     obs_data_set_default_double(settings, kSettingCursorBlurWidth, 0.0);
     obs_data_set_default_double(settings, kSettingCursorBlurStrength, 1.0);
+    obs_data_set_default_double(settings, kSettingCursorTrailFade, 0.0);
     obs_data_set_default_int(settings, kSettingBlurMode, 2);      // 2 = Both
-    // Latency mode: 2=Fast, 3=Medium, 4=Slow, 5=Very slow (default 5 preserves
-    // existing behavior). Requires engine restart to take effect.
-    obs_data_set_default_int(settings, kSettingLatencyMode, kDefaultLatencyMode);
-    // Bloom/glow settings for cursor trail
-    obs_data_set_default_bool(settings, kSettingBloomEnabled, true);
-    obs_data_set_default_double(settings, kSettingBloomThreshold, 0.8);  // luma threshold 0..1
-    obs_data_set_default_double(settings, kSettingBloomStrength, 1.0);   // intensity multiplier
-    obs_data_set_default_double(settings, kSettingBloomRadius, 8.0);     // blur radius in pixels
-    obs_data_set_default_double(settings, kSettingBloomSigma, 4.0);      // Gaussian sigma
-    // Cursor trail fade-out (extends beyond blurWidth for smoother transition)
-    obs_data_set_default_double(settings, kSettingCursorTrailFade, 0.0);    // 0=hard cutoff, >0=extra fade px
-    // Cursor trail fade-in time (smooth appearance when cursor starts moving)
-    obs_data_set_default_double(settings, kSettingCursorTrailFadeInTime, 0.0); // 0=instant, >0=fade in sec
+    obs_data_set_default_int(settings, kSettingCaptureMode, 0);   // 0 = Motion Blur
 }
 
 // CONFIRMED LIVE: OBS fires a property's modified-callback once automatically
@@ -933,19 +836,9 @@ bool gGmixNextDensityModifiedIsAutoFire        = false;
 bool gGmixNextBrightnessModifiedIsAutoFire     = false;
 bool gGmixNextCursorWidthModifiedIsAutoFire    = false;
 bool gGmixNextCursorStrengthModifiedIsAutoFire = false;
+bool gGmixNextCursorTrailFadeModifiedIsAutoFire = false;
 bool gGmixNextBlurModeModifiedIsAutoFire       = false;
-bool gGmixNextLatencyModeModifiedIsAutoFire    = false;
-bool gGmixNextBloomEnabledModifiedIsAutoFire   = false;
-bool gGmixNextBloomThresholdModifiedIsAutoFire = false;
-bool gGmixNextBloomStrengthModifiedIsAutoFire  = false;
-bool gGmixNextBloomRadiusModifiedIsAutoFire    = false;
-bool gGmixNextBloomSigmaModifiedIsAutoFire     = false;
-bool gGmixNextCursorSpriteStyleModifiedIsAutoFire       = false;
-bool gGmixNextCursorSpriteAlphaModifiedIsAutoFire       = false;
-bool gGmixNextCursorSpriteReleaseTimeModifiedIsAutoFire = false;
-bool gGmixNextCursorSpriteEnabledModifiedIsAutoFire     = false;
-bool gGmixNextCursorTrailFadeModifiedIsAutoFire         = false;
-bool gGmixNextCursorTrailFadeInTimeModifiedIsAutoFire   = false;
+bool gGmixNextCaptureModeModifiedIsAutoFire     = false;
 
 // Blend density/brightness are a property of the SHARED engine (see
 // GmixEngine::blendConfig's comment), not of any one source -- so this reads
@@ -969,19 +862,12 @@ void applyBlendConfigFromSettings(obs_data_t* settings) {
         std::clamp(obs_data_get_double(settings, kSettingCursorBlurWidth), 0.0, 512.0));
     cfg.cursorBlurStrength = static_cast<float>(
         std::clamp(obs_data_get_double(settings, kSettingCursorBlurStrength), 0.0, 3.0));
-    cfg.blurMode = static_cast<int>(
-        std::clamp<long long>(obs_data_get_int(settings, kSettingBlurMode), 0, 2));
-    cfg.cursorSpriteStyle = static_cast<int>(
-        std::clamp<long long>(obs_data_get_int(settings, kSettingCursorSpriteStyle), 0, 2));
-    cfg.cursorSpriteAlpha = static_cast<float>(
-        std::clamp(obs_data_get_double(settings, kSettingCursorSpriteAlpha), 0.0, 1.0));
-    cfg.cursorSpriteReleaseTime = static_cast<float>(
-        std::clamp(obs_data_get_double(settings, kSettingCursorSpriteReleaseTime), 0.0, 2.0));
-    cfg.cursorSpriteEnabled = obs_data_get_bool(settings, kSettingCursorSpriteEnabled);
     cfg.cursorTrailFade = static_cast<float>(
         std::clamp(obs_data_get_double(settings, kSettingCursorTrailFade), 0.0, 64.0));
-    cfg.cursorTrailFadeInTime = static_cast<float>(
-        std::clamp(obs_data_get_double(settings, kSettingCursorTrailFadeInTime), 0.0, 2.0));
+    cfg.blurMode = static_cast<int>(
+        std::clamp<long long>(obs_data_get_int(settings, kSettingBlurMode), 0, 2));
+    cfg.captureMode = static_cast<int>(
+        std::clamp<long long>(obs_data_get_int(settings, kSettingCaptureMode), 0, 1));
     std::lock_guard<std::mutex> lk2(gEngine->blendConfigMu);
     gEngine->blendConfig = cfg;
 }
@@ -1022,9 +908,27 @@ bool gmixCursorStrengthModified(void*, obs_properties_t*, obs_property_t*, obs_d
     return false;
 }
 
+bool gmixCursorTrailFadeModified(void*, obs_properties_t*, obs_property_t*, obs_data_t* settings) {
+    if (gGmixNextCursorTrailFadeModifiedIsAutoFire) {
+        gGmixNextCursorTrailFadeModifiedIsAutoFire = false;
+        return false;
+    }
+    applyBlendConfigFromSettings(settings);
+    return false;
+}
+
 bool gmixBlurModeModified(void*, obs_properties_t*, obs_property_t*, obs_data_t* settings) {
     if (gGmixNextBlurModeModifiedIsAutoFire) {
         gGmixNextBlurModeModifiedIsAutoFire = false;
+        return false;
+    }
+    applyBlendConfigFromSettings(settings);
+    return false;
+}
+
+bool gmixCaptureModeModified(void*, obs_properties_t*, obs_property_t*, obs_data_t* settings) {
+    if (gGmixNextCaptureModeModifiedIsAutoFire) {
+        gGmixNextCaptureModeModifiedIsAutoFire = false;
         return false;
     }
     applyBlendConfigFromSettings(settings);
@@ -1041,111 +945,6 @@ bool gmixGpuIndexModified(void*, obs_properties_t*, obs_property_t*, obs_data_t*
     return false;   // no properties-layout change needed
 }
 
-bool gmixLatencyModeModified(void*, obs_properties_t*, obs_property_t*, obs_data_t* settings) {
-    if (gGmixNextLatencyModeModifiedIsAutoFire) {
-        gGmixNextLatencyModeModifiedIsAutoFire = false;
-        return false;
-    }
-    int32_t latencyMode = static_cast<int32_t>(obs_data_get_int(settings, kSettingLatencyMode));
-    writeEngineSettingsConfig(-1, latencyMode);  // -1 means don't change GPU index
-    return false;   // no properties-layout change needed
-}
-
-// Bloom modified callbacks - bloom settings apply live via BlendConfig
-void applyBloomConfigFromSettings(obs_data_t* settings) {
-    // Bloom settings don't need engine-wide persistence - they apply per-source
-    // and are passed directly in dispatchAsync. No persistent file needed.
-}
-
-bool gmixBloomEnabledModified(void*, obs_properties_t*, obs_property_t*, obs_data_t* settings) {
-    if (gGmixNextBloomEnabledModifiedIsAutoFire) {
-        gGmixNextBloomEnabledModifiedIsAutoFire = false;
-        return false;
-    }
-    // No engine config to update - bloom is passed per-dispatch
-    return false;
-}
-
-bool gmixBloomThresholdModified(void*, obs_properties_t*, obs_property_t*, obs_data_t* settings) {
-    if (gGmixNextBloomThresholdModifiedIsAutoFire) {
-        gGmixNextBloomThresholdModifiedIsAutoFire = false;
-        return false;
-    }
-    return false;
-}
-
-bool gmixBloomStrengthModified(void*, obs_properties_t*, obs_property_t*, obs_data_t* settings) {
-    if (gGmixNextBloomStrengthModifiedIsAutoFire) {
-        gGmixNextBloomStrengthModifiedIsAutoFire = false;
-        return false;
-    }
-    return false;
-}
-
-bool gmixBloomRadiusModified(void*, obs_properties_t*, obs_property_t*, obs_data_t* settings) {
-    if (gGmixNextBloomRadiusModifiedIsAutoFire) {
-        gGmixNextBloomRadiusModifiedIsAutoFire = false;
-        return false;
-    }
-    return false;
-}
-
-bool gmixBloomSigmaModified(void*, obs_properties_t*, obs_property_t*, obs_data_t* settings) {
-    if (gGmixNextBloomSigmaModifiedIsAutoFire) {
-        gGmixNextBloomSigmaModifiedIsAutoFire = false;
-        return false;
-    }
-    return false;
-}
-
-bool gmixCursorSpriteStyleModified(void*, obs_properties_t*, obs_property_t*, obs_data_t* settings) {
-    if (gGmixNextCursorSpriteStyleModifiedIsAutoFire) {
-        gGmixNextCursorSpriteStyleModifiedIsAutoFire = false;
-        return false;
-    }
-    return false;
-}
-
-bool gmixCursorSpriteAlphaModified(void*, obs_properties_t*, obs_property_t*, obs_data_t* settings) {
-    if (gGmixNextCursorSpriteAlphaModifiedIsAutoFire) {
-        gGmixNextCursorSpriteAlphaModifiedIsAutoFire = false;
-        return false;
-    }
-    return false;
-}
-
-bool gmixCursorSpriteReleaseTimeModified(void*, obs_properties_t*, obs_property_t*, obs_data_t* settings) {
-    if (gGmixNextCursorSpriteReleaseTimeModifiedIsAutoFire) {
-        gGmixNextCursorSpriteReleaseTimeModifiedIsAutoFire = false;
-        return false;
-    }
-    return false;
-}
-
-bool gmixCursorSpriteEnabledModified(void*, obs_properties_t*, obs_property_t*, obs_data_t* settings) {
-    if (gGmixNextCursorSpriteEnabledModifiedIsAutoFire) {
-        gGmixNextCursorSpriteEnabledModifiedIsAutoFire = false;
-        return false;
-    }
-    return false;
-}
-
-bool gmixCursorTrailFadeModified(void*, obs_properties_t*, obs_property_t*, obs_data_t* settings) {
-    if (gGmixNextCursorTrailFadeModifiedIsAutoFire) {
-        gGmixNextCursorTrailFadeModifiedIsAutoFire = false;
-        return false;
-    }
-    return false;
-}
-
-bool gmixCursorTrailFadeInTimeModified(void*, obs_properties_t*, obs_property_t*, obs_data_t* settings) {
-    if (gGmixNextCursorTrailFadeInTimeModifiedIsAutoFire) {
-        gGmixNextCursorTrailFadeInTimeModifiedIsAutoFire = false;
-        return false;
-    }
-    return false;
-}
-
 obs_properties_t* gmixGetProperties(void*) {
     obs_properties_t* props = obs_properties_create();
     obs_properties_add_text(props, kSettingTarget,
@@ -1153,15 +952,6 @@ obs_properties_t* gmixGetProperties(void*) {
     obs_property_t* gpuIndex = obs_properties_add_int(
         props, kSettingGpuIndex, "GPU index (-1 = auto)", -1, 15, 1);
     obs_property_set_modified_callback2(gpuIndex, gmixGpuIndexModified, nullptr);
-
-    obs_property_t* latencyMode = obs_properties_add_list(props, kSettingLatencyMode,
-                                  "Latency mode (buffer count, requires restart)",
-                                  OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_INT);
-    obs_property_list_add_int(latencyMode, "Fast (2 buffers)", 2);
-    obs_property_list_add_int(latencyMode, "Medium (3 buffers)", 3);
-    obs_property_list_add_int(latencyMode, "Slow (4 buffers)", 4);
-    obs_property_list_add_int(latencyMode, "Very slow (5 buffers)", 5);
-    obs_property_set_modified_callback2(latencyMode, gmixLatencyModeModified, nullptr);
 
     obs_property_t* density = obs_properties_add_int_slider(props, kSettingBlurDensity,
                                   "Blur density (oversampling taps/frame)", 4, 64, 1);
@@ -1177,52 +967,21 @@ obs_properties_t* gmixGetProperties(void*) {
     obs_property_list_add_int(blurMode, "Both", 2);
     obs_property_set_modified_callback2(blurMode, gmixBlurModeModified, nullptr);
 
+    obs_property_t* captureMode = obs_properties_add_list(props, kSettingCaptureMode,
+                                    "Capture mode", OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_INT);
+    obs_property_list_add_int(captureMode, "Motion Blur", 0);
+    obs_property_list_add_int(captureMode, "Normal Capture", 1);
+    obs_property_set_modified_callback2(captureMode, gmixCaptureModeModified, nullptr);
+
     obs_property_t* cursorW = obs_properties_add_float_slider(props, kSettingCursorBlurWidth,
                                   "Cursor blur width (px, 0 = off)", 0.0, 512.0, 1.0);
     obs_property_set_modified_callback2(cursorW, gmixCursorWidthModified, nullptr);
     obs_property_t* cursorS = obs_properties_add_float_slider(props, kSettingCursorBlurStrength,
                                   "Cursor blur strength", 0.0, 3.0, 0.05);
     obs_property_set_modified_callback2(cursorS, gmixCursorStrengthModified, nullptr);
-
-    // Bloom/glow settings
-    obs_property_t* bloomEnabled = obs_properties_add_bool(props, kSettingBloomEnabled,
-                                   "Bloom / glow (additive bloom on cursor trail)");
-    obs_property_set_modified_callback2(bloomEnabled, gmixBloomEnabledModified, nullptr);
-    obs_property_t* bloomThresh = obs_properties_add_float_slider(props, kSettingBloomThreshold,
-                                      "Bloom threshold (luma > value)", 0.0, 1.0, 0.05);
-    obs_property_set_modified_callback2(bloomThresh, gmixBloomThresholdModified, nullptr);
-    obs_property_t* bloomStr = obs_properties_add_float_slider(props, kSettingBloomStrength,
-                                     "Bloom strength (intensity)", 0.0, 5.0, 0.1);
-    obs_property_set_modified_callback2(bloomStr, gmixBloomStrengthModified, nullptr);
-    obs_property_t* bloomRad = obs_properties_add_float_slider(props, kSettingBloomRadius,
-                                     "Bloom radius (blur size in px)", 0.0, 32.0, 1.0);
-    obs_property_set_modified_callback2(bloomRad, gmixBloomRadiusModified, nullptr);
-obs_property_t* bloomSig = obs_properties_add_float_slider(props, kSettingBloomSigma,
-                                      "Bloom sigma (Gaussian spread)", 0.5, 16.0, 0.5);
-    obs_property_set_modified_callback2(bloomSig, gmixBloomSigmaModified, nullptr);
-
-    // Cursor sprite settings (sharp cursor on top of trail)
-    obs_property_t* cursorSpriteStyle = obs_properties_add_list(props, kSettingCursorSpriteStyle,
-                                        "Cursor sprite style", OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_INT);
-    obs_property_list_add_int(cursorSpriteStyle, "Circle", 0);
-    obs_property_list_add_int(cursorSpriteStyle, "Crosshair", 1);
-    obs_property_list_add_int(cursorSpriteStyle, "Dot", 2);
-    obs_property_set_modified_callback2(cursorSpriteStyle, gmixCursorSpriteStyleModified, nullptr);
-    obs_property_t* cursorSpriteAlpha = obs_properties_add_float_slider(props, kSettingCursorSpriteAlpha,
-                                              "Cursor sprite opacity", 0.0, 1.0, 0.05);
-    obs_property_set_modified_callback2(cursorSpriteAlpha, gmixCursorSpriteAlphaModified, nullptr);
-    obs_property_t* cursorSpriteReleaseTime = obs_properties_add_float_slider(props, kSettingCursorSpriteReleaseTime,
-                                                      "Cursor sprite release time (fade-out sec)", 0.0, 2.0, 0.05);
-    obs_property_set_modified_callback2(cursorSpriteReleaseTime, gmixCursorSpriteReleaseTimeModified, nullptr);
-    obs_property_t* cursorSpriteEnabled = obs_properties_add_bool(props, kSettingCursorSpriteEnabled,
-                                          "Enable cursor sprite (sharp cursor on top)");
-    obs_property_set_modified_callback2(cursorSpriteEnabled, gmixCursorSpriteEnabledModified, nullptr);
-    obs_property_t* cursorTrailFade = obs_properties_add_float_slider(props, kSettingCursorTrailFade,
-                                              "Cursor trail fade (extra fade px beyond blur width)", 0.0, 64.0, 1.0);
-    obs_property_set_modified_callback2(cursorTrailFade, gmixCursorTrailFadeModified, nullptr);
-    obs_property_t* cursorTrailFadeInTime = obs_properties_add_float_slider(props, kSettingCursorTrailFadeInTime,
-                                                      "Cursor trail fade in time (sec, 0 = instant)", 0.0, 2.0, 0.05);
-    obs_property_set_modified_callback2(cursorTrailFadeInTime, gmixCursorTrailFadeInTimeModified, nullptr);
+    obs_property_t* cursorF = obs_properties_add_float_slider(props, kSettingCursorTrailFade,
+                                  "Cursor trail fade (extra fade px beyond blur width)", 0.0, 64.0, 1.0);
+    obs_property_set_modified_callback2(cursorF, gmixCursorTrailFadeModified, nullptr);
 
     // Arm the auto-fire guard for the ONE synthetic modified-callback
     // invocation OBS makes per control while building/validating this fresh
@@ -1232,19 +991,9 @@ obs_property_t* bloomSig = obs_properties_add_float_slider(props, kSettingBloomS
     gGmixNextBrightnessModifiedIsAutoFire     = true;
     gGmixNextCursorWidthModifiedIsAutoFire    = true;
     gGmixNextCursorStrengthModifiedIsAutoFire = true;
+    gGmixNextCursorTrailFadeModifiedIsAutoFire = true;
     gGmixNextBlurModeModifiedIsAutoFire       = true;
-    gGmixNextLatencyModeModifiedIsAutoFire    = true;
-    gGmixNextBloomEnabledModifiedIsAutoFire   = true;
-    gGmixNextBloomThresholdModifiedIsAutoFire = true;
-    gGmixNextBloomStrengthModifiedIsAutoFire  = true;
-    gGmixNextBloomRadiusModifiedIsAutoFire    = true;
-gGmixNextBloomSigmaModifiedIsAutoFire     = true;
-    gGmixNextCursorSpriteStyleModifiedIsAutoFire       = true;
-    gGmixNextCursorSpriteAlphaModifiedIsAutoFire       = true;
-    gGmixNextCursorSpriteReleaseTimeModifiedIsAutoFire = true;
-    gGmixNextCursorSpriteEnabledModifiedIsAutoFire     = true;
-    gGmixNextCursorTrailFadeModifiedIsAutoFire         = true;
-    gGmixNextCursorTrailFadeInTimeModifiedIsAutoFire   = true;
+    gGmixNextCaptureModeModifiedIsAutoFire     = true;
 
     return props;
 }
@@ -1315,10 +1064,10 @@ void* gmixCreate(obs_data_t* settings, obs_source_t* source) {
         obs_data_set_double(settings, kSettingBrightness, cfgSnapshot.shutterStrength);
         obs_data_set_double(settings, kSettingCursorBlurWidth, cfgSnapshot.cursorBlurWidth);
         obs_data_set_double(settings, kSettingCursorBlurStrength, cfgSnapshot.cursorBlurStrength);
+        obs_data_set_double(settings, kSettingCursorTrailFade, cfgSnapshot.cursorTrailFade);
         obs_data_set_int(settings, kSettingBlurMode, cfgSnapshot.blurMode);
+        obs_data_set_int(settings, kSettingCaptureMode, cfgSnapshot.captureMode);
         obs_data_set_int(settings, kSettingGpuIndex, s->engine->gpuIndex);
-        obs_data_set_int(settings, kSettingLatencyMode,
-                         static_cast<int>(s->engine->dstBufferCount));
         gmixUpdate(s, settings);   // re-parse so s->targetProcess/gpuIndex match too
     } else if (s->engine) {
         // Just created a fresh engine: it default-constructed BlendConfig to
@@ -1332,14 +1081,6 @@ void* gmixCreate(obs_data_t* settings, obs_source_t* source) {
         // genuine attachment, never an auto-fire artifact, so no suppression
         // flag is needed for this specific call).
         applyBlendConfigFromSettings(settings);
-    }
-    // Sync displayed latency mode (dstBufferCount) from engine in both cases.
-    // For existing engine: shows the actually-running value.
-    // For fresh engine: shows the value read from config (or default) that
-    // was used to initialize the engine.
-    if (s->engine) {
-        obs_data_set_int(settings, kSettingLatencyMode,
-                         static_cast<int>(s->engine->dstBufferCount));
     }
     return s;
 }
