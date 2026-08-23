@@ -1,9 +1,8 @@
 #version 450 core
-// Polyline blur — smear the scene along the cursor's true path.
-// Not a painted brush. The polyline (pts, newest first) is the blur kernel guide.
-// For each pixel P: d = distance to polyline, wCross = thickness from centerline,
-// wAlong = head->tail fade, smear samples along the polyline tangent at the
-// closest projection (not at P) so gaps between sparse points are filled.
+// Polyline blur — create a smooth cursor trail along the true path.
+// Only affects pixels near the cursor path (within cursor radius).
+// For each pixel P: d = distance to polyline, apply blur only if within cursor tube.
+// Preserves cursor size while smoothing along the movement direction.
 
 #define MAX_PTS 64
 
@@ -20,7 +19,7 @@ layout(push_constant) uniform PC {
     uint  frameW;
     uint  frameH;
     uint  pointCount;
-    float blurWidth;     // half-thickness from centerline (px)
+    float blurWidth;     // half-thickness from centerline (px) ~ cursor radius
     float blurStrength;  // 0..3
     float trailFade;     // soft edge beyond width (px)
     uint  splineSubdiv;  // compat, unused
@@ -86,51 +85,70 @@ void main() {
         }
     }
 
+    // CRITICAL FIX: Only affect pixels within the cursor tube (blurWidth + trailFade)
+    // This prevents smearing everything and keeps the effect constrained to cursor size
     float outer = pc.blurWidth + max(pc.trailFade, 0.0);
-    float inner = max(pc.blurWidth - 1.0, 0.0);
+    float inner = max(pc.blurWidth - 1.5, 0.0); // softer inner edge
     float wCross = 1.0 - smoothstep(inner, outer, bestDist);
-    if(wCross <= 0.001){ imageStore(dstImage, P, orig); return; }
+    
+    // Early exit for pixels far from the path - preserves original image
+    if(wCross <= 0.01){ imageStore(dstImage, P, orig); return; }
 
+    // Calculate speed-based weighting for natural motion blur
     float speed = totalLen / float(max(n-1u,1u));
-    float moving = clamp(speed / 4.0, 0.0, 1.0);
-    // wAlong: head 1.0, tail ~0.25, only when moving
-    float wAlong = mix(1.0, mix(0.25, 1.0, bestParam), moving);
+    float moving = clamp(speed / 3.0, 0.0, 1.0);
+    
+    // wAlong: head 1.0, tail fades out, only when moving
+    float wAlong = mix(1.0, mix(0.3, 1.0, bestParam), moving);
+    
+    // Blend strength gated by distance from path and movement
     float amt = wCross * wAlong * clamp(pc.blurStrength, 0.0, 3.0);
-    if(amt <= 0.001){ imageStore(dstImage, P, orig); return; }
+    if(amt <= 0.01){ imageStore(dstImage, P, orig); return; }
 
-    // rest blur at P (small isotropic)
+    // Small isotropic blur for stationary/slow regions (preserves cursor detail)
     vec3 still;
     {
-        float base = max(pc.blurWidth * 0.15, 1.0);
+        float base = max(pc.blurWidth * 0.12, 0.8);
         int o1=int(round(base+0.5));
-        int o2=int(round(base*2.0+0.5));
+        int o2=int(round(base*1.8+0.5));
         vec3 s3=orig.rgb*4.0;
         s3 += 2.0*(ldc(P+ivec2(o1,0),sz)+ldc(P+ivec2(-o1,0),sz)+ldc(P+ivec2(0,o1),sz)+ldc(P+ivec2(0,-o1),sz));
         s3 += (ldc(P+ivec2(o2,o2),sz)+ldc(P+ivec2(-o2,o2),sz)+ldc(P+ivec2(o2,-o2),sz)+ldc(P+ivec2(-o2,-o2),sz));
         still=s3/16.0;
     }
-    // smear along polyline at the projection (fills gaps between sparse points)
+    
+    // Directional smear ALONG the path tangent ONLY (not perpendicular)
+    // This creates smooth trail without widening the cursor
     vec3 smear = still;
-    if(bestSegLen >= 1.0 && dot(bestTan,bestTan)>1e-6){
-        float halfLen = min(bestSegLen * 0.5, 18.0);
-        int taps = int(clamp(halfLen, 1.0, 24.0));
+    if(bestSegLen >= 0.5 && dot(bestTan,bestTan)>1e-6){
+        // Limit smear length based on actual movement between points
+        float halfLen = min(bestSegLen * 0.35, 12.0); // reduced from 0.5 to 0.35
+        int taps = int(clamp(halfLen * 1.5, 2.0, 16.0));
         vec3 acc=vec3(0.0);
         float wsum=0.0;
+        
+        // Gaussian-weighted sampling along path direction
         for(int s=-taps; s<=taps; ++s){
-            float u=float(s)/float(taps);
+            float u=float(s)/float(max(taps,1));
+            float gaussian = exp(-2.5 * u * u); // tighter gaussian weight
             vec2 off=bestTan * (halfLen * u);
-            // sample at the projection along the line, not at P
+            // Sample at projection + offset along tangent
             ivec2 sp = ivec2(bestProj + off + 0.5);
-            acc += ldc(sp, sz);
-            wsum+=1.0;
+            acc += ldc(sp, sz) * gaussian;
+            wsum += gaussian;
         }
         smear = wsum>0.0? acc / wsum : still;
     }
-    float m = clamp(bestSegLen / 4.0, 0.0, 1.0);
+    
+    // Motion-gated blending: more smear when moving fast
+    float m = clamp(bestSegLen / 3.0, 0.0, 1.0);
     vec3 blurred = mix(still, smear, m);
 
-    float over = max(amt - 1.0, 0.0);
-    vec3 bcol = blurred * (1.0 + 0.35 * over);
+    // Gentle brightness boost for high-strength values (glow effect)
+    float over = max(amt - 1.5, 0.0);
+    vec3 bcol = blurred * (1.0 + 0.25 * over);
+    
+    // Final blend: mix original with blurred based on calculated amount
     vec4 outc = mix(orig, vec4(bcol, 1.0), min(amt, 1.0));
     outc.a=1.0;
     imageStore(dstImage, P, outc);
