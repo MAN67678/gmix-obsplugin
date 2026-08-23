@@ -37,6 +37,7 @@ struct alignas(4) CursorPC {
     float    blurWidth;
     float    blurStrength;
     float    trailFade;  // extra fade px beyond blurWidth for smoother edge
+    uint32_t splineSubdiv;  // Catmull-Rom subdivisions per segment (1 = linear, 4+ = smooth)
     // Bounding box of the cursor tube (path extent + margin), in pixels.
     // Pixels outside it early-out BEFORE the per-pixel nearest-segment scan --
     // without this, every pixel of the full frame paid the whole path loop
@@ -1047,6 +1048,7 @@ bool BlendEngine::dispatchAsync(VkImageView* srcViews, uint32_t srcCount, uint32
     cpc.blurWidth = cursor.width;
     cpc.blurStrength = cursor.strength;
     cpc.trailFade = cursor.trailFade;
+    cpc.splineSubdiv = cursor.splineSubdiv;
     // Tube bounding box: path extent + margin. Margin covers the tube radius
     // (blurWidth + trailFade) plus the head cap's forward reach plus rounding slack.
     {

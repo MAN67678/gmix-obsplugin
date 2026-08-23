@@ -47,6 +47,7 @@ struct CursorPathBlur {
     float        strength   = 1.0f;    // 0..3 mix of the streak over the original;
                                        // >1 brightens the blur (glow boost in the shader)
     float        trailFade  = 0.0f;    // extra fade px beyond width for smoother edge (0 = hard cutoff)
+    uint32_t     splineSubdiv = 4;     // Catmull-Rom subdivisions per segment (1 = linear, 4+ = smooth)
 };
 
 class BlendEngine {

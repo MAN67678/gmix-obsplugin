@@ -713,6 +713,19 @@ void workerMain(GmixEngine* s) {
                             cursorPathXY.push_back(e.cursorX * bw);
                             cursorPathXY.push_back(e.cursorY * bh);
                         }
+                        // Light Danser-like smoothing inside the shutter window:
+                        // 3-tap Gaussian (0.25,0.5,0.25) along the sequence.
+                        // Removes 1ms jitter kinks but keeps intentional motion.
+                        // Endpoints kept sharp to preserve head/tail accuracy.
+                        if (cursorPathXY.size() >= 6) {
+                            std::vector<float> tmp = cursorPathXY;
+                            size_t pts = tmp.size() / 2;
+                            for (size_t i = 1; i + 1 < pts; ++i) {
+                                tmp[i*2 + 0] = cursorPathXY[(i-1)*2 + 0] * 0.25f + cursorPathXY[i*2 + 0] * 0.5f + cursorPathXY[(i+1)*2 + 0] * 0.25f;
+                                tmp[i*2 + 1] = cursorPathXY[(i-1)*2 + 1] * 0.25f + cursorPathXY[i*2 + 1] * 0.5f + cursorPathXY[(i+1)*2 + 1] * 0.25f;
+                            }
+                            cursorPathXY.swap(tmp);
+                        }
                         const uint32_t cursorPts =
                             static_cast<uint32_t>(cursorPathXY.size() / 2);
 
