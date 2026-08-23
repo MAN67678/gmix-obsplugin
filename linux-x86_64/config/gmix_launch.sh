@@ -43,15 +43,44 @@ flatpak_app_id="$(ini_get capture flatpak_app_id)"
 layer_dir="$HOME/.local/share/vulkan/implicit_layer.d"
 socket_dir="$HOME/.cache/gmix"
 
+# OBS plugin install paths (Flatpak OBS)
+obs_plugin_dir="$HOME/.var/app/com.obsproject.Studio/config/obs-studio/plugins/obs-gmix-source"
+obs_plugin_bin_dir="$obs_plugin_dir/bin/64bit"
+obs_plugin_locale_dir="$obs_plugin_dir/data/locale"
+
+# Locate build artifacts (release vs dev tree)
+if [[ -f "$here/obs_plugin/bin/64bit/obs-gmix-source.so" ]]; then
+  build_plugin_so="$here/obs_plugin/bin/64bit/obs-gmix-source.so"
+  build_plugin_locale="$here/obs_plugin/data/locale/en-US.ini"
+elif [[ -f "$here/../build/obs_plugin/bin/64bit/obs-gmix-source.so" ]]; then
+  build_plugin_so="$here/../build/obs_plugin/bin/64bit/obs-gmix-source.so"
+  build_plugin_locale="$here/../build/obs_plugin/data/locale/en-US.ini"
+else
+  build_plugin_so=""
+  build_plugin_locale=""
+fi
+
 echo "  ===================================================================="
 echo "    GMix - real-time motion blur for osu!   (v1.0.0, OBS plugin)"
 echo "  ===================================================================="
 
-# 1) Make sure the implicit capture layer is registered (idempotent refresh).
-echo "  [1/2] installing/refreshing the GMix capture layer ..."
+# 1) Install OBS plugin (idempotent refresh)
+if [[ -n "$build_plugin_so" && -f "$build_plugin_so" ]]; then
+  echo "  [1/3] installing/refreshing OBS plugin (obs-gmix-source) ..."
+  mkdir -p "$obs_plugin_bin_dir" "$obs_plugin_locale_dir"
+  cp -f "$build_plugin_so" "$obs_plugin_bin_dir/"
+  cp -f "$build_plugin_locale" "$obs_plugin_locale_dir/"
+  echo "        done -- plugin installed to $obs_plugin_dir"
+else
+  echo "  [1/3] WARNING: obs-gmix-source.so not found (build with -DGMIX_BUILD_OBS_PLUGIN=ON)"
+  echo "        Skipping OBS plugin install. Layer + capture config will still be set up."
+fi
+
+# 2) Make sure the implicit capture layer is registered (idempotent refresh).
+echo "  [2/3] installing/refreshing the GMix capture layer ..."
 "$GMIX" --install-layer || echo "        (layer install skipped/failed - continuing)"
 
-# 2) Flatpak-sandboxed target: grant PERSISTENT sandbox access to the layer +
+# 3) Flatpak-sandboxed target: grant PERSISTENT sandbox access to the layer +
 # IPC-socket dirs, and PERSISTENT env vars enabling capture. Two sandbox
 # quirks, both confirmed by testing against this exact app:
 #  - Flatpak apps do not see the host's real XDG_DATA_HOME by default (it's
@@ -68,14 +97,14 @@ echo "  [1/2] installing/refreshing the GMix capture layer ..."
 # setup, not something re-applied per launch.
 if [[ -n "$flatpak_app_id" ]]; then
   if ! flatpak info "$flatpak_app_id" >/dev/null 2>&1; then
-    echo "  [2/2] ERROR: flatpak app '$flatpak_app_id' is not installed" >&2
+    echo "  [3/3] ERROR: flatpak app '$flatpak_app_id' is not installed" >&2
     exit 1
   fi
   # Query the sandbox's own baseline XDG_DATA_DIRS rather than hardcoding it
   # (varies by runtime/extensions) and prepend $HOME/.local/share to it.
   base_data_dirs="$(flatpak run --command=sh "$flatpak_app_id" -c 'echo "$XDG_DATA_DIRS"' 2>/dev/null || true)"
   : "${base_data_dirs:=/app/share:/usr/share:/usr/share/runtime/share:/run/host/user-share:/run/host/share}"
-  echo "  [2/2] granting '$flatpak_app_id' persistent capture access (flatpak override) ..."
+  echo "  [3/3] granting '$flatpak_app_id' persistent capture access (flatpak override) ..."
   flatpak override --user \
     --filesystem="$layer_dir:ro" \
     --filesystem="$socket_dir" \
@@ -87,11 +116,11 @@ if [[ -n "$flatpak_app_id" ]]; then
     "$flatpak_app_id"
   echo "        done -- launch '$flatpak_app_id' normally from now on, capture is always on."
 else
-  echo "  [2/2] no 'flatpak_app_id' set in $ini -- set it (e.g. sh.ppy.osu) to have"
+  echo "  [3/3] no 'flatpak_app_id' set in $ini -- set it (e.g. sh.ppy.osu) to have"
   echo "        this script grant it persistent capture access, or export these"
   echo "        yourself before launching a non-Flatpak build:"
   echo "          ENABLE_GMIX=1 GMIX_TARGET_PROCESS='$target' <your osu! binary>"
 fi
 
 echo ""
-echo "  Done. Add the 'GMix Motion Blur' source in OBS (once) to see the blur."
+echo "  Done. Restart OBS, then add the 'GMix Motion Blur' source (once) to see the blur."
