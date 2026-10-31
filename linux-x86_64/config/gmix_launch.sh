@@ -100,7 +100,8 @@ echo "  [2/3] installing/refreshing the GMix capture layer ..."
 # `flatpak override` persists all of this forever -- this is a one-time
 # setup, not something re-applied per launch.
 if [[ -n "$wine_launcher" ]]; then
-  # osu-winello: osu!stable under Wine + DXVK, launched through yawl/Steam
+  # osu!stable under Wine (yawl/Steam pressure-vessel): renders OpenGL, which
+  # the 00-gmix.cfg below bridges through mesa Zink (GL-on-Vulkan).
   # Runtime (pressure-vessel). No sandbox override is needed -- pressure-
   # vessel re-exports the host's implicit Vulkan layers into the container
   # (the same mechanism that makes MangoHud/vkBasalt work there), and the
@@ -177,16 +178,6 @@ GMIXCFG
     echo "                 $osu_configs_dir/*.cfg -- check that file and re-run" >&2
   fi
 
-  # osu!stable only reaches Vulkan through DXVK's d3d9; if the prefix is on
-  # Wine's builtin d3d9 it renders with OpenGL and there is nothing for the
-  # Vulkan layer to hook. Check only when we can find the prefix.
-  wine_prefix="${WINEPREFIX:-$osuconfig_data/wineprefixes/osu-wineprefix}"
-  dxvk_d3d9="$wine_prefix/drive_c/windows/system32/d3d9.dll"
-  if [[ -f "$dxvk_d3d9" ]] && ! grep -qa "dxvk" "$dxvk_d3d9" 2>/dev/null; then
-    echo "        WARNING: $dxvk_d3d9 looks like Wine's builtin d3d9, not DXVK."
-    echo "                 osu! then renders via OpenGL and GMix cannot capture it."
-    echo "                 Install DXVK (e.g. 'osu-wine --winetricks dxvk') and retry."
-  fi
   echo "        done -- launch osu! with '$wine_launcher' as usual; capture is always on."
   echo "        (a game that is already running must be restarted to pick this up)"
 elif [[ -n "$flatpak_app_id" ]]; then

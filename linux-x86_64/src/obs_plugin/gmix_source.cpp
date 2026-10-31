@@ -1169,8 +1169,8 @@ obs_properties_t* gmixGetProperties(void*) {
     obs_property_t* blurMode = obs_properties_add_list(props, kSettingBlurMode,
                                   "Blur mode", OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_INT);
     obs_property_list_add_int(blurMode, "Optical flow (temporal)", 0);
-    obs_property_list_add_int(blurMode, "Cursor path", 1);
-    obs_property_list_add_int(blurMode, "Both", 2);
+    obs_property_list_add_int(blurMode, "Cursor path (needs osu!lazer)", 1);
+    obs_property_list_add_int(blurMode, "Both (cursor part needs osu!lazer)", 2);
     obs_property_set_modified_callback2(blurMode, gmixBlurModeModified, nullptr);
 
     obs_property_t* captureMode = obs_properties_add_list(props, kSettingCaptureMode,
@@ -1179,14 +1179,22 @@ obs_properties_t* gmixGetProperties(void*) {
     obs_property_list_add_int(captureMode, "Normal Capture", 1);
     obs_property_set_modified_callback2(captureMode, gmixCaptureModeModified, nullptr);
 
+    // The cursor-path term of the blur rides on the cursor-position channel
+    // in the frame header, which is read from the target's own SDL3
+    // (SDL_GetMouseState) inside the capture layer -- osu!lazer carries it;
+    // osu!stable (Wine capture) does not, and sends the <0 sentinel every
+    // frame. Marked here rather than removed: the options stay selectable so
+    // switching to a lazer capture needs no other change, and selecting them
+    // under stable is harmless (the cursor path just has no samples; the
+    // optical-flow blend is unaffected either way).
     obs_property_t* cursorW = obs_properties_add_float_slider(props, kSettingCursorBlurWidth,
-                                  "Cursor blur width (px, 0 = off)", 0.0, 512.0, 1.0);
+                                  "Cursor blur width (px, 0 = off; needs osu!lazer)", 0.0, 512.0, 1.0);
     obs_property_set_modified_callback2(cursorW, gmixCursorWidthModified, nullptr);
     obs_property_t* cursorS = obs_properties_add_float_slider(props, kSettingCursorBlurStrength,
-                                  "Cursor blur strength", 0.0, 3.0, 0.05);
+                                  "Cursor blur strength (needs osu!lazer)", 0.0, 3.0, 0.05);
     obs_property_set_modified_callback2(cursorS, gmixCursorStrengthModified, nullptr);
     obs_property_t* cursorF = obs_properties_add_float_slider(props, kSettingCursorTrailFade,
-                                  "Cursor trail fade (extra fade px beyond blur width)", 0.0, 64.0, 1.0);
+                                  "Cursor trail fade (needs osu!lazer)", 0.0, 64.0, 1.0);
     obs_property_set_modified_callback2(cursorF, gmixCursorTrailFadeModified, nullptr);
 
     // Arm the auto-fire guard for the ONE synthetic modified-callback

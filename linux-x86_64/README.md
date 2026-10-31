@@ -8,14 +8,13 @@ blur from real frame data — then hands the result to OBS **zero-copy** (GPU
 dma-buf export/import, no CPU readback, no virtual camera, no kernel module).
 
 status: working end-to-end (zero-copy render verified live against
-osu!lazer on RADV/Polaris10), and live-tested against a real streaming
+osu!lazer on RADV/Polaris10, and since 2026-10-31 (v1.0.1) against
+osu!stable via osu-winello too), and live-tested against a real streaming
 session with the motion blur quality confirmed against a reference video.
-osu!stable via [osu-winello](https://github.com/NelloKudo/osu-winello)
-(Wine + DXVK) is supported too — see "osu!stable via osu-winello" below.
-A real cause of in-game stutter was found and fixed 2026-07-05 (see
-"System requirements" below and `etc/DEV_NOTES.md`) -- confirmed live
-afterward as smooth at ~1000fps with no perceptible drop from gmix's own
-work.
+osu!stable support went live with a **mesa Zink (GL-on-Vulkan) bridge** —
+see "osu!stable via osu-winello" below. The capture layer's per-frame GPU
+cost is instrumented (`GMIX export: ... blitAvg/...` in the game's stderr)
+and the presentation path never blocks for it by design.
 
 ## What GMix is (and isn't)
 
@@ -74,12 +73,13 @@ osu! (Vulkan) -> GMix capture layer (VkLayer_GMIX) -> IPC (dma-buf handoff,
    own render loop -- gmix has no output clock of its own)
 ```
 
-"For osu! (Vulkan)" includes osu!stable under Wine: osu-winello runs it on
-DXVK, i.e. D3D9 translated to Vulkan, and that present call is exactly what
-the same layer hooks — no second capture backend. The layer's target match
-checks `/proc/self/comm` and `argv[0]` in addition to `/proc/self/exe`
-because under Wine the Unix process is `wine-preloader` and the game's module
-name only appears in the former two.
+"For osu! (Vulkan)" also includes osu!stable under Wine: it renders
+OpenGL, which never presents through Vulkan by itself, so GMix routes its
+GL through mesa's Zink (GL-on-Vulkan) via an export in `00-gmix.cfg` — the
+present call then reaches the same layer, again as one capture backend. The
+layer's target match checks `/proc/self/comm` and `argv[0]` in addition to
+`/proc/self/exe` because under Wine the Unix process is `wine-preloader`
+and the game's module name only appears in the former two.
 
 There is no standalone "gmix window" or virtual camera anymore -- GMix runs
 *inside* OBS. The `gmix` CLI binary that remains is just a small setup/debug
@@ -127,10 +127,11 @@ Runtime (always needed, whether you build from source or use a release):
   Linux covers this for AMD GPUs).
 - OBS Studio.
 - osu! — osu!lazer (native/Flatpak/AppImage), or osu!stable via
-  [osu-winello](https://github.com/NelloKudo/osu-winello). osu!stable must
-  render through DXVK (`"*d3d9"="native"` in the prefix, which osu-winello
-  sets up by default); on Wine's builtin d3d9 it renders with OpenGL and
-  there is no Vulkan present to capture.
+  [osu-winello](https://github.com/NelloKudo/osu-winello). osu!stable's
+  support rides on mesa's Zink (GL-on-Vulkan); osu-winello's rendering stack
+  (DXVK for D3D games in the prefix, `"*d3d9"="native"`) is irrelevant here
+  — the capture config forces `MESA_LOADER_DRIVER_OVERRIDE=zink` for the
+  game's own OpenGL presentation instead, and no d3d9 settings matter.
 
 Build-time only (not needed if you're installing from a release archive):
 - CMake >= 3.18 and Ninja (or another CMake generator).
@@ -205,7 +206,7 @@ Finding the Flatpak OBS's `OBS_INCLUDE_DIR`:
 
     find /var/lib/flatpak/app/com.obsproject.Studio -maxdepth 6 -type d -name obs 2>/dev/null | grep include
 
-## osu!stable via osu-winello (Wine + DXVK)
+## osu!stable via osu-winello (Wine + Zink)
 
 osu!stable renders through **OpenGL** (mesa `libGL`/`libEGL` under Wine — there
 is no D3D9/DXVK swapchain on this setup, and GL never presents through
@@ -255,21 +256,34 @@ Notes and limits:
 - A running game only picks this up on its next launch (the layer is loaded
   at `vkCreateInstance`, and pressure-vessel re-exports host layers when its
   container starts).
-- If the prefix uses Wine's builtin d3d9 instead of DXVK, osu! renders via
-  OpenGL and nothing can be captured; `gmix_launch.sh` warns if it can see
-  the prefix's `d3d9.dll` and it doesn't look like DXVK.
+- If the prefix's `d3d9.dll` handling changes, none of it matters for the
+  capture: osu!stable is captured as **OpenGL through Zink**, and the
+  `d3d9` state of the prefix is irrelevant to it.
 - Confirm the layer reached the game with the Properties dialog's "Apps
   with the GMix layer loaded" list (see step 6 above): osu!stable appears as
   `osu!.exe` while running.
-- The cursor-position channel is populated from osu!lazer's own SDL3, which
-  osu!stable doesn't have, so the "Cursor path" blur mode has no cursor
-  samples there (its default width is 0, i.e. off). Optical-flow motion blur,
-  the default, is unaffected — osu!stable draws its cursor into the frame
-  itself anyway, so it is blurred along with everything else.
+- **Cursor-path blur is osu!lazer-only here, and the Properties dialog says
+  so.** The cursor channel comes from the capture layer reading the target's
+  own SDL3 (`SDL_GetMouseState`), which osu!stable has no equivalent of, so
+  the layer's frame header carries the "no cursor" sentinel every frame
+  there. The "Cursor path"/"Both" blur-mode entries and the cursor sliders
+  are marked "(needs osu!lazer)"; selecting them while capturing osu!stable
+  is harmless — the cursor path just has no samples and the optical-flow
+  blend is unaffected (osu!stable draws its cursor into the frame itself, so
+  it is blurred along with everything else).
 
 ## Blur settings
 
-The plugin has exactly one blend mode: velocity-aware ("optical awareness")
+The Properties dialog offers a **Blur mode** list — "Optical flow (temporal)"
+(the default, described below), "Cursor path", and "Both". The cursor-path
+term rides on the capture's cursor-position channel, which comes from the
+target's own SDL3 pointer read inside the layer, i.e. it has real samples
+for **osu!lazer**; for osu!stable the channel carries no samples, so the
+cursor entries and sliders are labelled "(needs osu!lazer)" — picking them
+under a stable capture is harmless (no cursor samples, the optical-flow
+blend is unaffected).
+
+The main blend is one mode: velocity-aware ("optical awareness")
 motion blur -- estimates a per-pixel motion vector for **each real captured
 frame individually** (a windowed Lucas-Kanade optical flow between every
 consecutive pair of real frames, not just one global estimate) and smears
@@ -359,7 +373,7 @@ scenes via **Add Existing Source**) rather than several independent
   producer, fd-passing over the socket, GPU import on the OBS side); when a
   producer connects, the plugin confirms it in the OBS log with
   `gmix: producer connected (WxH) -- zero-copy dma-buf receive active`.
-- Frame handoff is capped at ~4500 fps on both sides (export throttle on the
+- Frame handoff is capped at ~2000 fps on both sides (export throttle on the
   producer, hard receive cap in the plugin), so a game running at "unlimited"
   fps cannot flood the receive path either way. The test suite includes
   `ctest -R gpu_bandwidth`, which measures the GPU's device-to-device copy
