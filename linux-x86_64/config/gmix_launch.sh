@@ -3,10 +3,13 @@
 #  GMix Linux setup  (OBS-plugin, v1.0.0)
 #
 #  GMix runs INSIDE OBS as a plugin (obs-gmix-source) and osu!'s capture is
-#  enabled via PERSISTENT Flatpak overrides (`flatpak override --user`), not
-#  a per-launch wrapper -- once this script has run, capture is active every
-#  time you launch osu! normally (app menu, `flatpak run`, Steam, whatever),
-#  no special command needed. Re-running this script is safe/idempotent
+#  enabled persistently, not via a per-launch wrapper:
+#    - osu!lazer Flatpak: `flatpak override --user` (sandbox access + env)
+#    - osu!stable via osu-winello: a 00-gmix.cfg in osu-winello's own config
+#      dir (named to sort first -- osu-wine only sources the first *.cfg),
+#  Once this script has run, capture is active every time you launch osu!
+#  normally (app menu, `osu-wine`, `flatpak run`, Steam, whatever) -- no
+#  special command needed. Re-running this script is safe/idempotent
 #  (e.g. after rebuilding gmix, to refresh the installed layer).
 #
 #  This script does NOT launch osu! itself -- launch it however you normally
@@ -40,6 +43,7 @@ ini_get() {
 
 target="$(ini_get capture target)";   : "${target:=osu!}"
 flatpak_app_id="$(ini_get capture flatpak_app_id)"
+wine_launcher="$(ini_get capture wine_launcher)"
 layer_dir="$HOME/.local/share/vulkan/implicit_layer.d"
 socket_dir="$HOME/.cache/gmix"
 
@@ -95,7 +99,97 @@ echo "  [2/3] installing/refreshing the GMix capture layer ..."
 #    (trusted) loader search path the sandbox restriction doesn't block.
 # `flatpak override` persists all of this forever -- this is a one-time
 # setup, not something re-applied per launch.
-if [[ -n "$flatpak_app_id" ]]; then
+if [[ -n "$wine_launcher" ]]; then
+  # osu-winello: osu!stable under Wine + DXVK, launched through yawl/Steam
+  # Runtime (pressure-vessel). No sandbox override is needed -- pressure-
+  # vessel re-exports the host's implicit Vulkan layers into the container
+  # (the same mechanism that makes MangoHud/vkBasalt work there), and the
+  # game runs as the same user with HOME shared, so the IPC socket under
+  # ~/.cache/gmix and the dma-buf fds cross the boundary unchanged. The only
+  # thing to arrange is ENABLE_GMIX reaching the game's environment, which
+  # osu-wine's own config mechanism does persistently -- with one caveat: it
+  # sources only the FIRST *.cfg (bash `source` takes a single file), so the
+  # written file must sort before the others and re-source them itself (see
+  # the heredoc below). Capture then stays on for plain `osu-wine` launches,
+  # desktop entry included.
+  if ! command -v "$wine_launcher" >/dev/null 2>&1; then
+    echo "  [3/3] ERROR: wine_launcher '$wine_launcher' not found in PATH" >&2
+    exit 1
+  fi
+  osuconfig_data="${XDG_DATA_HOME:-$HOME/.local/share}"
+  osu_configs_dir="$osuconfig_data/osuconfig/configs"
+  if [[ ! -d "$osu_configs_dir" ]]; then
+    echo "  [3/3] ERROR: osu-winello config dir not found: $osu_configs_dir" >&2
+    echo "        (is osu-winello installed for this user, and wine_launcher correct?)" >&2
+    exit 1
+  fi
+  echo "  [3/3] enabling capture for osu-winello ($wine_launcher) ..."
+
+  # IMPORTANT: osu-wine does `source "$dir/"*.cfg`, and bash's `source` only
+  # sources the FIRST file -- the rest become positional parameters ($1, $2...)
+  # and are silently ignored. A file named `gmix.cfg` therefore never applies
+  # as soon as anything sorts before it (e.g. example.cfg), which is exactly
+  # what happened live. So: sort FIRST (00-) and re-source the others here,
+  # keeping their settings working while guaranteeing ours apply.
+  cat > "$osu_configs_dir/00-gmix.cfg" <<'GMIXCFG'
+# Written by GMix's gmix_launch.sh -- delete this file to disable capture.
+#
+# This file sorts first on purpose: osu-wine sources only the first *.cfg in
+# this directory (bash's `source` takes one file; extra glob matches become
+# $1, $2...), so a later-sorting file would never be applied. The loop below
+# re-sources the other config files so their settings keep working.
+gmix_self="${BASH_SOURCE[0]}"
+for gmix_cfg in "$XDG_DATA_HOME/osuconfig/configs/"*.cfg; do
+    [ "$gmix_cfg" = "$gmix_self" ] && continue
+    [ -r "$gmix_cfg" ] && . "$gmix_cfg"
+done
+unset gmix_self gmix_cfg
+
+# Read by VkLayer_GMIX's manifest `enable_environment` (implicit Vulkan layer).
+ENABLE_GMIX=1
+GMIX_TARGET_PROCESS=@GMIX_TARGET@
+
+# osu! renders in OpenGL; Vulkan-layer capture can only intercept a present
+# that flows through hookable Vulkan (vkQueuePresentKHR after a VK_KHR_swapchain
+# comes from the app). Force mesa's Zink (GL-on-Vulkan) so osu!'s GL goes over
+# Vulkan -- the game then presents through the GMix layer's hooks like any
+# native Vulkan app. Wine itself does NOT translate GL to Vulkan, and without
+# these lines the game's presentation never touches our layer (capture would
+# stay dark). Remove to render GL directly again.
+MESA_LOADER_DRIVER_OVERRIDE=zink
+GMIXCFG
+  sed -i "s|@GMIX_TARGET@|$target|" "$osu_configs_dir/00-gmix.cfg"
+  echo "        wrote $osu_configs_dir/00-gmix.cfg"
+
+  # Older versions of this script wrote gmix.cfg, which osu-wine never sourced.
+  legacy_cfg="$osu_configs_dir/gmix.cfg"
+  if [[ -f "$legacy_cfg" ]] && grep -q "Written by GMix's gmix_launch.sh" "$legacy_cfg"; then
+    rm -f "$legacy_cfg"
+    echo "        removed obsolete $legacy_cfg (osu-wine never sourced it)"
+  fi
+
+  # Verify with the exact command osu-wine runs, not just by writing the file.
+  if bash -c 'set -a; source "$1"/*.cfg 2>/dev/null; set +a; [ "$ENABLE_GMIX" = 1 ]' \
+       _ "$osu_configs_dir"; then
+    echo "        verified: osu-wine's config sourcing exports ENABLE_GMIX"
+  else
+    echo "        WARNING: ENABLE_GMIX is still not exported after sourcing" >&2
+    echo "                 $osu_configs_dir/*.cfg -- check that file and re-run" >&2
+  fi
+
+  # osu!stable only reaches Vulkan through DXVK's d3d9; if the prefix is on
+  # Wine's builtin d3d9 it renders with OpenGL and there is nothing for the
+  # Vulkan layer to hook. Check only when we can find the prefix.
+  wine_prefix="${WINEPREFIX:-$osuconfig_data/wineprefixes/osu-wineprefix}"
+  dxvk_d3d9="$wine_prefix/drive_c/windows/system32/d3d9.dll"
+  if [[ -f "$dxvk_d3d9" ]] && ! grep -qa "dxvk" "$dxvk_d3d9" 2>/dev/null; then
+    echo "        WARNING: $dxvk_d3d9 looks like Wine's builtin d3d9, not DXVK."
+    echo "                 osu! then renders via OpenGL and GMix cannot capture it."
+    echo "                 Install DXVK (e.g. 'osu-wine --winetricks dxvk') and retry."
+  fi
+  echo "        done -- launch osu! with '$wine_launcher' as usual; capture is always on."
+  echo "        (a game that is already running must be restarted to pick this up)"
+elif [[ -n "$flatpak_app_id" ]]; then
   if ! flatpak info "$flatpak_app_id" >/dev/null 2>&1; then
     echo "  [3/3] ERROR: flatpak app '$flatpak_app_id' is not installed" >&2
     exit 1
@@ -116,9 +210,11 @@ if [[ -n "$flatpak_app_id" ]]; then
     "$flatpak_app_id"
   echo "        done -- launch '$flatpak_app_id' normally from now on, capture is always on."
 else
-  echo "  [3/3] no 'flatpak_app_id' set in $ini -- set it (e.g. sh.ppy.osu) to have"
-  echo "        this script grant it persistent capture access, or export these"
-  echo "        yourself before launching a non-Flatpak build:"
+  echo "  [3/3] neither 'flatpak_app_id' nor 'wine_launcher' is set in $ini --"
+  echo "        set one of them to have this script grant persistent capture"
+  echo "        access ('sh.ppy.osu' for Flatpak lazer, 'osu-wine' for"
+  echo "        osu-winello), or export these yourself before launching a"
+  echo "        non-Flatpak build:"
   echo "          ENABLE_GMIX=1 GMIX_TARGET_PROCESS='$target' <your osu! binary>"
 fi
 

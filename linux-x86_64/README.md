@@ -10,6 +10,8 @@ dma-buf export/import, no CPU readback, no virtual camera, no kernel module).
 status: working end-to-end (zero-copy render verified live against
 osu!lazer on RADV/Polaris10), and live-tested against a real streaming
 session with the motion blur quality confirmed against a reference video.
+osu!stable via [osu-winello](https://github.com/NelloKudo/osu-winello)
+(Wine + DXVK) is supported too — see "osu!stable via osu-winello" below.
 A real cause of in-game stutter was found and fixed 2026-07-05 (see
 "System requirements" below and `etc/DEV_NOTES.md`) -- confirmed live
 afterward as smooth at ~1000fps with no perceptible drop from gmix's own
@@ -32,7 +34,10 @@ concept of scores, timing windows, judgements, or input.
 3. Hand that blended video straight to OBS as a live source, zero-copy
    (no virtual camera device, no extra encode/decode round-trip).
 4. Work with osu!lazer's Flatpak sandbox on Linux (persistent capture via
-   `flatpak override`, no manual re-launch flags needed after setup).
+   `flatpak override`, no manual re-launch flags needed after setup), and
+   with osu!stable installed through osu-winello (Wine's pressure-vessel
+   container re-exports the layer, so no wrapper command is needed there
+   either).
 5. Let you tune the motion blur's density and brightness via OBS's own
    source Properties dialog -- see "Blur settings" below.
 
@@ -68,6 +73,13 @@ osu! (Vulkan) -> GMix capture layer (VkLayer_GMIX) -> IPC (dma-buf handoff,
    -> OBS renders it directly ("GMix Motion Blur" source, paced by OBS's
    own render loop -- gmix has no output clock of its own)
 ```
+
+"For osu! (Vulkan)" includes osu!stable under Wine: osu-winello runs it on
+DXVK, i.e. D3D9 translated to Vulkan, and that present call is exactly what
+the same layer hooks — no second capture backend. The layer's target match
+checks `/proc/self/comm` and `argv[0]` in addition to `/proc/self/exe`
+because under Wine the Unix process is `wine-preloader` and the game's module
+name only appears in the former two.
 
 There is no standalone "gmix window" or virtual camera anymore -- GMix runs
 *inside* OBS. The `gmix` CLI binary that remains is just a small setup/debug
@@ -114,8 +126,11 @@ Runtime (always needed, whether you build from source or use a release):
 - A Vulkan driver with `VK_EXT_external_memory_dma_buf` (Mesa RADV on
   Linux covers this for AMD GPUs).
 - OBS Studio.
-- osu! (osu!lazer, native or Flatpak; the AppImage-based osu!stable path
-  also works if you point `config/gmix_config.ini` at it).
+- osu! — osu!lazer (native/Flatpak/AppImage), or osu!stable via
+  [osu-winello](https://github.com/NelloKudo/osu-winello). osu!stable must
+  render through DXVK (`"*d3d9"="native"` in the prefix, which osu-winello
+  sets up by default); on Wine's builtin d3d9 it renders with OpenGL and
+  there is no Vulkan present to capture.
 
 Build-time only (not needed if you're installing from a release archive):
 - CMake >= 3.18 and Ninja (or another CMake generator).
@@ -146,12 +161,25 @@ Build-time only (not needed if you're installing from a release archive):
    it persists in your scene collection).
 5. Register the capture layer + enable capture for your game (edit
    `config/gmix_config.ini`'s `[capture]` section first — target process
-   name, and either `appimage` or `flatpak_app_id`):
+   name, and exactly one of `flatpak_app_id` (osu!lazer Flatpak, e.g.
+   `sh.ppy.osu`), `wine_launcher` (osu!stable via osu-winello, e.g.
+   `osu-wine`) or `appimage`):
 
        ./config/gmix_launch.sh
 
 6. Launch the game normally. Gameplay should appear live (motion-blurred)
    in the "GMix Motion Blur" source's OBS preview.
+
+**Checking that the layer actually reached the game:** open the source's
+Properties. The **"Apps with the GMix layer loaded"** dropdown lists every
+process that has loaded `VkLayer_GMIX`, with its state — `capturing into
+OBS`, `target, waiting for OBS to connect`, or `layer loaded, NOT the
+capture target (target is '...')` — plus a **Refresh detected apps** button
+and a receiver status line. If the game isn't listed at all, the layer is
+not enabled in that process (wrong environment/launcher), so there is
+nothing for the plugin to receive; if it's listed as not-target, the
+`target` fragment doesn't match. Picking an app in the dropdown writes its
+name into "Capture target" (takes effect the next time the app starts).
 
 ## Option B — Build from source
 
@@ -176,6 +204,68 @@ is exactly what the commands above already are relative to).
 Finding the Flatpak OBS's `OBS_INCLUDE_DIR`:
 
     find /var/lib/flatpak/app/com.obsproject.Studio -maxdepth 6 -type d -name obs 2>/dev/null | grep include
+
+## osu!stable via osu-winello (Wine + DXVK)
+
+osu!stable renders through **OpenGL** (mesa `libGL`/`libEGL` under Wine — there
+is no D3D9/DXVK swapchain on this setup, and GL never presents through
+Vulkan, so there is no `vkQueuePresentKHR`/`vkCreateSwapchainKHR` call for the
+layer to hook). The bridge is **Zink**, mesa's GL-on-Vulkan driver:
+`00-gmix.cfg` exports `MESA_LOADER_DRIVER_OVERRIDE=zink`, which routes
+osu!'s GL through Vulkan — every present then flows through the layer's
+hooks like any native Vulkan app (verified end-to-end: OBS logs
+`producer connected (1920x1080) -- zero-copy dma-buf receive active`).
+
+Capture costs ~0.35ms of GPU time inside each *captured* frame (measured
+from the two per-slot GPU timestamps); frames arrive into a 2000fps cap on
+both the producer (export throttle) and receiver (accept cap) — at present
+rates below the cap every frame is captured and pays that cost; a live
+counter of what the layer did every second is printed as
+`GMIX export: ok=N blitAvg=... blitMax=...` to the game's stderr
+(`winello.log` under osu-winello).
+
+Two Wine-specific details are handled for you:
+
+- **Enablement.** `osu-wine` sources the `*.cfg` files in
+  `~/.local/share/osuconfig/configs` with `set -a` (auto-export) — but bash's
+  `source` only sources the *first* file of a glob (the rest become `$1`,
+  `$2`, ...), so `gmix_launch.sh` writes **`00-gmix.cfg`**: it sorts first on
+  purpose and re-sources the other config files itself so their settings keep
+  working. Capture is then on for every normal launch, desktop entry
+  included, and survives osu-winello updates (that file is yours, not the
+  script's). The script verifies this by running the same `source` command
+  `osu-wine` uses and checking that `ENABLE_GMIX` ends up exported.
+- **Process matching.** Inside Wine the Unix process is `wine-preloader`, not
+  `osu!.exe`; the layer therefore matches the configured target against
+  `/proc/self/exe`, `/proc/self/comm` and `argv[0]`.
+
+Setup is the normal one, with `wine_launcher` set:
+
+    [capture]
+    target        = osu!
+    wine_launcher = osu-wine
+    appimage      =
+    flatpak_app_id =
+
+    ./config/gmix_launch.sh        # installs the layer + writes 00-gmix.cfg
+    osu-wine                       # then launch as usual
+
+Notes and limits:
+
+- A running game only picks this up on its next launch (the layer is loaded
+  at `vkCreateInstance`, and pressure-vessel re-exports host layers when its
+  container starts).
+- If the prefix uses Wine's builtin d3d9 instead of DXVK, osu! renders via
+  OpenGL and nothing can be captured; `gmix_launch.sh` warns if it can see
+  the prefix's `d3d9.dll` and it doesn't look like DXVK.
+- Confirm the layer reached the game with the Properties dialog's "Apps
+  with the GMix layer loaded" list (see step 6 above): osu!stable appears as
+  `osu!.exe` while running.
+- The cursor-position channel is populated from osu!lazer's own SDL3, which
+  osu!stable doesn't have, so the "Cursor path" blur mode has no cursor
+  samples there (its default width is 0, i.e. off). Optical-flow motion blur,
+  the default, is unaffected — osu!stable draws its cursor into the frame
+  itself anyway, so it is blurred along with everything else.
 
 ## Blur settings
 
@@ -265,6 +355,16 @@ scenes via **Add Existing Source**) rather than several independent
 - Zero-copy relies on `VK_EXT_external_memory_dma_buf` + `VK_IMAGE_TILING_LINEAR`
   (this GPU has no `VK_EXT_image_drm_format_modifier`) on the producer/layer
   side, and OBS's public `gs_texture_create_from_dmabuf` on the import side.
+  There is no CPU copy anywhere on the live path (one GPU-side blit on the
+  producer, fd-passing over the socket, GPU import on the OBS side); when a
+  producer connects, the plugin confirms it in the OBS log with
+  `gmix: producer connected (WxH) -- zero-copy dma-buf receive active`.
+- Frame handoff is capped at ~4500 fps on both sides (export throttle on the
+  producer, hard receive cap in the plugin), so a game running at "unlimited"
+  fps cannot flood the receive path either way. The test suite includes
+  `ctest -R gpu_bandwidth`, which measures the GPU's device-to-device copy
+  bandwidth (RX 480: ~122 GB/s) to confirm the frame handoff is nowhere near
+  memory-bound.
 - A previous version used a v4l2loopback virtual camera as the output sink.
   That path (and its vendored out-of-tree kernel module) has been removed
   entirely — it was implicated in a kernel panic and is superseded by the
@@ -278,5 +378,13 @@ scenes via **Add Existing Source**) rather than several independent
   `~/.cache/gmix/presents.log`, that's this bug; it's safe to delete and
   won't come back on a current build. The one diagnostic that replaced it
   is a rate-limited `gmix: blend buffer overload` warning in the OBS log,
-  logged only when the blend pipeline is actually dropping backlogged
-  frames (i.e. a real overload, not routine per-frame noise).
+   logged only when the blend pipeline is actually dropping backlogged
+   frames (i.e. a real overload, not routine per-frame noise). A second,
+   1-in-60-present log line in `vkQueuePresentKHR` also survived that fix;
+   it is now opt-in via `GMIX_LAYER_DEBUG=1` (along with the layer's
+   `/tmp/gmix_layer_debug.log` tracing) so the default hot path does no I/O
+   at all. The one line the layer still prints to stderr is a single
+   `VkLayer_GMIX: no capture -- process names [...]` diagnostic per Vulkan
+   instance, which is what to look at if capture doesn't start (it shows both
+   what the process is called and the target it was matched against — e.g.
+   Wine's `osu!.exe` vs target `osu!`).

@@ -15,6 +15,7 @@
 #include <vulkan/vk_layer.h>
 
 #include "capture/FrameSource.hpp"
+#include "capture/LayerStatus.hpp"
 
 #include <cstdio>
 #include <cstring>
@@ -89,19 +90,57 @@ DeviceState* getDeviceState(VkDevice d) {
     return it == g_devices.end() ? nullptr : it->second;
 }
 
-std::string getCurrentProcessName() {
+// Every name the current process is known by, in the order a user would
+// recognize them. /proc/self/exe names the real binary for native apps, but
+// under Wine (osu!stable via osu-winello / Proton: D3D9 -> DXVK -> Vulkan) the
+// Unix process IS the Wine loader (wine-preloader), and the game's own module
+// name only shows up in /proc/self/comm ("osu!.exe") and argv[0]
+// ("D:\\osu!.exe"). Matching only /proc/self/exe's basename therefore never
+// found "osu!" in a Wine process; it does match all of Wine's other processes
+// (wineserver/winedevice), none of which create Vulkan devices, so checking
+// all three sources is safe.
+std::vector<std::string> getCurrentProcessNames() {
+    std::vector<std::string> names;
+
     char path[PATH_MAX];
     ssize_t len = readlink("/proc/self/exe", path, sizeof(path) - 1);
-    if (len <= 0) return {};
-    path[len] = '\0';
-    const char* base = std::strrchr(path, '/');
-    return base ? std::string(base + 1) : std::string(path);
+    if (len > 0) {
+        path[len] = '\0';
+        const char* base = std::strrchr(path, '/');
+        names.emplace_back(base ? base + 1 : path);
+    }
+
+    // comm is the task name: the PE module name for a Wine process (set by
+    // Wine via prctl), the binary name otherwise. Truncated to TASK_COMM_LEN
+    // (16 bytes incl. NUL) by the kernel, hence matching by fragment.
+    {
+        std::ifstream comm("/proc/self/comm");
+        std::string line;
+        if (std::getline(comm, line) && !line.empty()) names.push_back(line);
+    }
+
+    // cmdline: argv as passed at exec. argv[0] of a Wine game is a Windows
+    // path ("D:\\osu!.exe"), so also try just its basename.
+    {
+        std::ifstream cmdline("/proc/self/cmdline", std::ios::binary);
+        std::string arg;
+        while (std::getline(cmdline, arg, '\0')) {
+            if (arg.empty()) continue;
+            std::string::size_type slash = arg.find_last_of("\\/");
+            if (slash != std::string::npos && slash + 1 < arg.size())
+                names.push_back(arg.substr(slash + 1));
+            names.push_back(std::move(arg));
+        }
+    }
+
+    return names;
 }
 
 bool processMatchesTarget(const std::string& target) {
     if (target.empty()) return true;
-    std::string name = getCurrentProcessName();
-    return !name.empty() && name.find(target) != std::string::npos;
+    for (const auto& name : getCurrentProcessNames())
+        if (name.find(target) != std::string::npos) return true;
+    return false;
 }
 
 std::string readTargetProcessConfig() {
@@ -181,8 +220,26 @@ VKAPI_ATTR VkResult VKAPI_CALL wrap_CreateInstance(
     g_instances[*pInstance] = st;
 
     ensureCaptureInitialized();
-    if (g_capture && processMatchesTarget(g_captureTargetProcess)) {
+    bool isTarget = g_capture && processMatchesTarget(g_captureTargetProcess);
+    if (isTarget) {
         g_capture->onInstanceCreated(*pInstance);
+    } else {
+        // Publish "layer loaded here, but this process is not the target" so
+        // the OBS plugin's detected-apps list can show it (this is the answer
+        // to "is the layer enabled in the app at all?").
+        gmix::capture::LayerStatus::instance().set(
+            "not-target", g_captureTargetProcess, false);
+
+        // One line per Vulkan instance (not per present), so it's cheap, and
+        // it's the single most useful diagnostic when capture doesn't happen:
+        // it shows both what GMix thinks the process is called and what it
+        // was told to look for (e.g. Wine's "osu!.exe" vs target "osu!").
+        auto names = getCurrentProcessNames();
+        std::string joined;
+        for (const auto& n : names) { if (!joined.empty()) joined += ", "; joined += n; }
+        std::fprintf(stderr,
+                     "VkLayer_GMIX: no capture -- process names [%s], target '%s'\n",
+                     joined.c_str(), g_captureTargetProcess.c_str());
     }
 
     return VK_SUCCESS;
@@ -521,11 +578,23 @@ VKAPI_ATTR VkResult VKAPI_CALL wrap_QueuePresentKHR(
     VkQueue queue,
     const VkPresentInfoKHR* pPresentInfo)
 {
-    static int presentCount = 0;
-    if (presentCount++ % 60 == 0) {
-        FILE* log = fopen("/tmp/gmix_layer_debug.log", "a");
-        if (log) { fprintf(log, "wrap_QueuePresentKHR called (#%d)\n", presentCount); fclose(log); }
+    // Opt-in only (GMIX_LAYER_DEBUG=1): this runs inside the game's own present
+    // thread, so unconditionally opening/appending a file here is exactly the
+    // per-present disk I/O that used to cause in-game stutter (see
+    // etc/DEV_NOTES.md). Set once, read on every present.
+    static const bool debugLog = std::getenv("GMIX_LAYER_DEBUG") != nullptr;
+    if (debugLog) {
+        static int presentCount = 0;
+        if (presentCount++ % 60 == 0) {
+            FILE* log = fopen("/tmp/gmix_layer_debug.log", "a");
+            if (log) { fprintf(log, "wrap_QueuePresentKHR called (#%d)\n", presentCount); fclose(log); }
+        }
     }
+
+    // Liveness ping for the OBS plugin's detected-apps list (rate-limited to
+    // once a second inside LayerStatus; a no-op for processes that never
+    // published a status file).
+    gmix::capture::LayerStatus::instance().heartbeat();
 
     // Local mutable copy: onQueuePresent may rewrite the wait-semaphore
     // fields to chain the real present through its own injected GPU work

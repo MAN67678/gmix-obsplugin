@@ -1747,3 +1747,290 @@ ships more broadly — filed here instead of fixed immediately per user
 request ("will look at that later on").
 
 </details>
+
+## ADDED (2026-10-31): osu!stable via osu-winello (Wine + DXVK) — capture path
+
+Requested: run GMix against osu!stable installed by
+[osu-winello](https://github.com/NelloKudo/osu-winello) instead of
+osu!lazer. The good news is that no second capture backend is needed; the
+Wine path is the *same* Vulkan present, and nearly all of the work was
+diagnosis. What was actually verified on the target machine:
+
+- **osu!stable is already a Vulkan app in disguise.** osu-winello's prefix
+  has DXVK's `d3d9.dll` (PE) with `"*d3d9"="native"` in `user.reg`, so D3D9
+  is translated to Vulkan and presented through the host `libvulkan.so.1`
+  (`libvulkan_radeon.so` visible in the game process's maps). A Vulkan
+  implicit layer therefore applies exactly as it does to lazer.
+- **No 32-bit layer build is required.** `wine-osu` is a WoW64-only build
+  (`lib/wine/{x86_64-unix,i386-windows,x86_64-windows}`, no `i386-unix`), so
+  the 32-bit `osu!.exe` runs inside a 64-bit Unix process. The existing
+  `VkLayer_GMIX.so` (64-bit) gets loaded into it.
+- **Process matching had to change.** For the running game process,
+  `/proc/self/exe` → `.../wine-osu/lib/wine/x86_64-unix/wine-preloader`,
+  while `/proc/self/comm` → `osu!.exe` and `argv[0]` →
+  `D:\osu!.exe`. Matching only the exe basename could never find target
+  `osu!`. `processMatchesTarget()` now matches the fragment against the exe
+  basename, comm, and every `cmdline` entry (including a Windows-path
+  basename). Wine's other processes (`wineserver`, `winedevice.exe`,
+  `explorer.exe`) do load the layer too but never create a Vulkan device, so
+  the wider match does not misfire.
+- **No sandbox overrides are needed (unlike Flatpak lazer).** yawl runs the
+  game in Steam's pressure-vessel container, and the sniper runtime
+  re-exports the *host's* implicit layers into it: the container's
+  `/usr/lib/pressure-vessel/overrides/share/vulkan/implicit_layer.d/` gains a
+  rewritten `0-x86_64-linux-gnu.json` for `VK_LAYER_GMIX` (library_arch 64,
+  same `enable_environment`), with the `.so` bind-mounted read-only inside a
+  tmpfs at the manifest's `library_path`. The manifest's `ENABLE_GMIX`
+  gating still applies, which is why enablement is the only missing bit.
+- **The container shares the host's `$HOME`.** `~/.cache/gmix/socket`,
+  `~/.cache/gmix/frames.sock` and `~/.config/gmix/target_process` are the
+  same files on both sides (confirmed by writing the layer socket-address
+  file from inside the running container and reading it from the host), so
+  the existing rendezvous paths and SCM_RIGHTS dma-buf handoff work
+  unchanged.
+- **The layer really loads inside Wine.** With `ENABLE_GMIX=1` in the
+  launcher's environment, a Wine process in the container ran the layer and
+  printed the new per-instance diagnostic
+  `VkLayer_GMIX: no capture -- process names [wine-preloader, explorer.exe,
+  explorer.exe, C:\windows\system32\explorer.exe, desktop, /desktop],
+  target 'vulkaninfo'` — i.e. loader discovery, negotiation and the new name
+  matching all ran.
+
+Changes made:
+
+- `layer/layer_entry.cpp`: multi-source process-name matching (above) plus
+  the single `VkLayer_GMIX: no capture -- process names [...]` stderr line
+  per Vulkan instance. That line is the diagnostic to ask for when capture
+  doesn't start, since it shows both the names the layer saw and the target
+  it was given. Also gated `wrap_QueuePresentKHR`'s 1-in-60-present
+  `/tmp/gmix_layer_debug.log` write behind `GMIX_LAYER_DEBUG=1`: it was the
+  last unconditional disk I/O left on the game's present thread (the
+  2026-07-05 fix removed the every-present version; this residual one was
+  still ~16 writes/s at 1000 fps).
+- `config/gmix_config.ini`: new `[capture] wine_launcher` (e.g. `osu-wine`).
+- `config/gmix_launch.sh`: wine branch writes
+  `~/.local/share/osuconfig/configs/gmix.cfg` (`ENABLE_GMIX=1`,
+  `GMIX_TARGET_PROCESS=<target>`) — `osu-wine` sources every `*.cfg` there
+  under `set -a`, so this is the launcher's own persistent mechanism and it
+  survives osu-winello updates. Also warns when the prefix's `d3d9.dll`
+  doesn't look like DXVK (builtin d3d9 ⇒ OpenGL ⇒ nothing to hook).
+- README / PIPELINE.md: osu-winello as a first-class target, the DXVK
+  requirement, and the shared-`$HOME`/pressure-vessel topology.
+
+Known caveat: the cursor channel comes from lazer's in-process SDL3
+(`readCursorNormalized()`), which osu!stable doesn't have, so `cursorX/Y`
+arrive as the `<0` sentinel and the "Cursor path" blur mode has no samples
+in Wine. Default behaviour is unaffected: cursor blur width defaults to 0,
+and osu!stable renders its own cursor into the captured frame anyway.
+
+**Still to verify live** (this session's machine had the game already
+running without the layer, so it can only be checked after a relaunch):
+relaunch with `osu-wine`, confirm the OBS log shows the producer connect and
+that `vkQueuePresentKHR` capture + blend actually produce a blurred image.
+Points worth watching if it doesn't: DXVK's swapchain is created with an
+injected `VK_IMAGE_USAGE_TRANSFER_SRC_BIT` (the layer's
+`wrap_CreateSwapchainKHR` already does this whenever
+`vkGetPhysicalDeviceSurfaceCapabilitiesKHR` allows it), and the
+present-time semaphore chaining must survive Wine's thunking — if frames
+arrive but look torn/shuffled, that chaining is the first suspect (it was
+the cause of the same symptom on lazer).
+
+## ROOT CAUSE (2026-10-31, later): osu-winello capture never enabled — `source *.cfg` sources only the FIRST file
+
+Live symptom: osu!stable (osu-winello) launched after the layer + config were
+installed, OBS had the "GMix Motion Blur" source, and the preview stayed
+black. The layer was NOT in the game at all:
+
+    $ tr '\0' '\n' < /proc/<osu pid>/environ | grep -i gmix   # nothing
+    $ grep -c VkLayer_GMIX /proc/<osu pid>/maps              # 0
+
+But `~/.local/share/osuconfig/winello.log` DID list the written config file
+("Using configs: .../configs/gmix.cfg .../example.cfg"), which is what made
+this look like the layer was enabled but broken.
+
+Why: that "Using configs" line comes from `mapfile < <(find ...)` — it lists
+every `*.cfg` that EXISTS, not the ones actually applied. `osu-wine` enables
+them with:
+
+    source "$XDG_DATA_HOME/osuconfig/configs/"*.cfg 2>/dev/null
+
+and bash's `source` takes ONE file: the glob expands to
+`source example.cfg gmix.cfg`, so `gmix.cfg` is passed as `$1` and never
+read. Alphabetically `example.cfg` sorts first, so ANY extra config file
+sorts later and is silently ignored (this is an osu-winello launcher bug, not
+GMix-specific; nothing errors).
+
+Proof (same command in a clean shell):
+
+    $ bash -c 'set -a; source ~/.local/share/osuconfig/configs/*.cfg 2>/dev/null; set +a; echo "[$ENABLE_GMIX]"'
+    []
+
+Fix: `gmix_launch.sh` now writes **`00-gmix.cfg`** — sorting first — and that
+file re-sources the remaining `*.cfg` itself (still under osu-wine's
+`set -a`, so their variables stay exported). It also deletes the old
+`gmix.cfg` (only if it carries our marker comment) and VERIFIES the result by
+running osu-wine's exact `source` command in a subshell and checking that
+`ENABLE_GMIX=1` came out exported. Verified live: `[1] [osu!]`.
+
+## ADDED (2026-10-31): "which apps have the layer loaded?" — Properties dropdown
+
+Debugging the above by hand meant reading `/proc/<pid>/environ` and
+`/proc/<pid>/maps` from a terminal; the plugin cannot do that itself because
+Flatpak OBS runs in its own PID namespace (host PIDs are invisible), even
+though the Flatpak has `filesystems=host`.
+
+So the layer now publishes itself: `src/capture/LayerStatus.hpp` writes
+`~/.cache/gmix/layers/<pid>.status` (pid, comm, exe, state, target, matched)
+and rewrites it on state changes, deletes it on clean exit, and bumps mtime
+at most once a second (`heartbeat()` from the present hook — 1 utimensat/s,
+not per-present I/O). States: `not-target`, `waiting` (target, no consumer
+yet), `capturing` (connected to the OBS `frames.sock`). The file is replaced
+atomically (tmp + rename) so the reader never sees half a file.
+
+The plugin's Properties dialog adds:
+- **"Apps with the GMix layer loaded"** dropdown — one entry per status file,
+  target apps first, then freshest first, labelled with state and target
+  (`... NOT the capture target (target is 'osu!')`), `[stale - process gone?]`
+  when mtime is >10s old (crash/SIGKILL leftovers), and a disabled
+  "(none found)" entry when the directory is empty/missing.
+- **Refresh detected apps** button (returns true → OBS rebuilds properties).
+- A receiver status line (`OBS_TEXT_INFO`) from a new
+  `GmixEngine::producerConnected` atomic — proves the plugin's end, as
+  opposed to the layer's.
+- Picking an entry writes its `comm` into the "Capture target" setting (so
+  `osu!.exe` can be picked instead of typing it); like the target text field
+  itself, it only takes effect when the app next starts, since the layer
+  reads `~/.config/gmix/target_process` at `vkCreateInstance`. Uses the same
+  one-per-dialog-build auto-fire guard as the other modified callbacks.
+
+Note the layer's target is read from the file (currently `osu!`), not from
+`GMIX_TARGET_PROCESS`; the env var is only the manifest's on/off switch.
+
+Tests: `tests/test_layer_status.cpp` (ctest `layer_status`) covers the file
+contents, atomic state rewrite and the heartbeat mtime bump using a temp
+`$HOME`. End-to-end check without disturbing the running OBS: run a
+non-matching Vulkan process
+(`ENABLE_GMIX=1 GMIX_TARGET_PROCESS=x vulkaninfo`) and sample the status
+file while it lives — confirmed `state=not-target`, `matched=0`, and the
+file disappearing on exit.
+
+## TUNED (2026-10-31): present thread never blocks anywhere + 4500fps receive cap + bandwidth benchmark
+
+Audit of the game's own present thread (the one thing that can make the game
+lag from outside the game) surfaced exactly one blocking call left in it:
+
+- `sendHandshake()` (blocking send + ack read, bounded by the connection's
+  5ms SO_SNDTIMEO each way, ~10ms worst case) ran directly in
+  `maybeExportFrame()` -- i.e. ON the app's present thread -- on the first
+  export after every (re)connect. A hiccup in the game exactly when OBS
+  attached (or reconencted after OBS restart). It now runs on the layer's
+  connector thread: the present thread only publishes the swapchain size
+  into `pendingW_/H_` (no blocking at all) and returns; exports begin once
+  the handshake landed (first frame delayed by <= ~1 connector-loop second).
+  Consequences that had to follow:
+  - `sender_` is now a `std::shared_ptr` (the connector snapshots it so the
+    present thread can still drop a dead connection concurrently),
+  - `handshakeSent_` is `std::atomic<bool>` (written by the connector,
+    read by the present thread),
+  - the failing-handshake path resets the sender on the CONNECTOR thread,
+    reconnecting on its next ~1s cycle.
+
+Everything else on the present thread was already non-blocking: per-slot GPU
+work is submitted async (fences polled via `vkGetFenceStatus`, never
+`vkWaitForFences`), the frame send uses `MSG_DONTWAIT` (backpressure skips
+the frame instead of waiting), and the export throttle gates attempts.
+
+Rate cap: the game's own fps can be arbitrarily high (osu! stable at
+'unlimited' easily exceeds 4500), so both sides now hard-cap at ~4500fps
+(222.223us minimum between captures/sends):
+- producer: `kExportInterval` 200us -> 222.223us,
+- receiver (enforcement point, `recvFrame()` loop in gmix_source.cpp):
+  accepted frames must be >=222.223s apart... (>=222.223us apart); the clock
+  only advances on frames that are actually processed, so a burst after an
+  idle period is not throttled. Capped frames are closed unread (the
+  expensive import work is skipped entirely) and logged at most once per ~2s
+  with a count, like the overload path.
+Before this the producer exported up to ~5000fps and frames were only
+dropped when the blend fell behind (backlog); now the waste upstream is
+bounded and the receive rate is guaranteed.
+
+Zero-copy confirmation: audited the whole pipeline for CPU copies -- there
+are none on the live path (only the tiny cursor-path upload and the
+debug-only `readbackDst` map/memcpy). The producer does one GPU blit into a
+device-local exportable image, everything crosses IPC as dma-buf fd +
+opaque-fd timeline semaphore, and OBS imports via
+`gs_texture_create_from_dmabuf` once per ring slot. To make the property
+verification instead of trust, the plugin now logs once per producer
+connection: "gmix: producer connected (WxH) -- zero-copy dma-buf receive
+active" (after `dmaBufCapable()` gates it, so a non-capable setup bails
+before the line instead of silently degrading).
+
+GPU memory speed: added `tests/test_gpu_bandwidth.cpp` (ctest `gpu_bandwidth`)
+-- 60 alternating full-image device-to-device copies (2x 4096x4096 RGBA8
+device-local, ~15GiB traffic) on the blend's compute queue, reports GB/s and
+asserts a deliberately-low floor (>2GB/s) so a wrong device pick (llvmpipe
+fallback) fails instead of benchmarking nothing. Measured on the dev RX 480:
+121.8 GB/s (read+write), i.e. the 64MiB frame-size copies the pipeline makes
+are nowhere near memory-bound; the pipeline's real constraint remains the
+blend/dispatch cadence, not the frame handoff.
+
+## ROOT CAUSE #2 (2026-10-31 evening): GL-only game -> layer never sees a swapchain
+
+After the 00-gmix.cfg fix made `ENABLE_GMIX` reach the game, the layer did
+hook the game (instance/device created, socket connected, status file heart-
+beat ticking) yet OBS still received ZERO frames. winello.log held the
+smoking gun: `swapchain created` / `swapchain created` lines never appeared
+(wrap_CreateSwapchainKHR prints unconditionally) -- and exports require a
+swapchain (the blit source). Deeper: osu!stable renders through OpenGL (mesa
+libEGL/libGLX in the process maps, zero DXVK/zink driver image), and Wine
+does NOT translate GL to Vulkan. The VK instance/device observed earlier are
+enumeration probes; the game's actual presentation (GLX/DRI3 swap buffers)
+never touches Vulkan, so no present exists to hook.
+
+Fix: 00-gmix.cfg also exports `MESA_LOADER_DRIVER_OVERRIDE=zink` (mesa's
+GL-on-Vulkan). With it the same log immediately shows
+`recorded queue ... -> device ...`, `swapchain created ... extent=1920x1080`,
+the handshake lands and OBS logs `producer connected (1920x1080) -- zero-copy
+dma-buf receive active`; the plugin's own fps meter read producer ~600fps /
+consumer ~750fps. gmix_launch.sh now writes those lines into the template.
+
+Wine-context API notes that cost hours (record for the next time): winevulkan
+caches host proc pointers at device-create time via GDPA lookups (that is the
+ray-tracing/mesh-shader GDPA spam: winevulkan fills its thunk tables); stderr
+of wine children reaches winello.log; pressure-vessel scrubs env vars passed
+on the command line -> GMIX_* must be set inside the sourced 00-gmix.cfg
+(cfg-sourced vars DO survive, proven by GMIX_TARGET_PROCESS being present in
+/proc/<pid>/environ).
+
+## EXPORT GATE TELEMETRY (2026-10-31, debug aid)
+
+maybeExportFrame()'s early returns were all silent, which is exactly why
+"connected but zero frames" could not be chased before. Every gate now bumps
+a counter (expgate::telemetry in VulkanLayerCapture.cpp) and, at most once
+per second, the app's stderr gets one line: `GMIX export: ok=... noSender=...
+fenceBusy=... blitAvg=... blitMax=... n=...` (counters reset each print).
+The blit numbers are the PURE GPU cost of the inserted capture work: each
+ring-slot command buffer now records TWO GPU timestamps on the device's own
+clock -- one after the pre-blit barrier (transfer stage, just before
+vkCmdBlitImage) and the existing bottom-of-pipe one at the end -- queried on
+the slot-reuse fence poll (never blocking; wrap-aware diff for the
+timestampValidBits rollover). Measured on the RX 480 with Zink at ~450
+exports/s: blitAvg ~0.34ms, blitMax ~0.38ms. The user's perceived
+0.5ms -> 1-3ms latency delta on osu!'s performance panel is therefore mostly
+Zink rendering itself, not the capture; the chosen lever (user decision) is
+the capture-rate cap, see below.
+
+## FRAME RATE CAPS: 222223ns -> 500000ns (4500 -> 2000fps, 2026-10-31, user)
+
+Both sides now hard-cap at 2000fps: the producer's kExportInterval
+(VulkanLayerCapture.cpp, export throttle) and the receiver's
+kMinAcceptInterval (gmix_source.cpp receive cap, log text updated to
+"2000fps"). Caveat recorded for the user: the cap only throttles when the
+present rate EXCEEDS it; at ~450-600 present/s every frame is still captured
+and still pays the ~0.34ms blit, so lowering the cap below the present rate
+is the only lever that removes per-frame capture GPU cost from most frames.
+
+Stale status files: SIGKILL'd processes (timeout, crashes) leave
+~/.cache/gmix/layers/<pid>.status behind with a frozen mtime; the plugin
+already flags stale entries. Script-driven cleanup lives in the session
+notes; the LayerStatus destructor only ever removes its own file.

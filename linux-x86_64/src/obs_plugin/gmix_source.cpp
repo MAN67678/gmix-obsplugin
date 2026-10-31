@@ -37,6 +37,10 @@
 #include <unistd.h>
 #include <fstream>
 #include <filesystem>
+#include <ctime>
+#include <cstdio>
+#include <cstdlib>
+#include <sys/stat.h>
 
 OBS_DECLARE_MODULE()
 OBS_MODULE_USE_DEFAULT_LOCALE("obs-gmix-source", "en-US")
@@ -52,6 +56,8 @@ constexpr const char* kSettingCursorBlurStrength = "cursor_blur_strength";
 constexpr const char* kSettingCursorTrailFade    = "cursor_trail_fade";
 constexpr const char* kSettingBlurMode           = "blur_mode";
 constexpr const char* kSettingCaptureMode       = "capture_mode";
+constexpr const char* kSettingLayerApps         = "layer_apps";
+constexpr const char* kSettingLayerAppsRefresh  = "layer_apps_refresh";
 constexpr const char* kDefaultTarget      = "osu!";
 
 // The plugin used to expose a "Blur preset" (Flat/Linear/Cinematic/Heavy/
@@ -233,6 +239,20 @@ void receiverThreadFn(gmix::ipc::FrameReceiver& receiver, gmix::VulkanContext& v
     gmix::ipc::RecvFrame rf{};
     uint64_t droppedSinceLog = 0;
     auto lastDropLog = std::chrono::steady_clock::now() - std::chrono::seconds(10);
+
+    // Hard cap on the RECEIVE rate: frames arriving more often than one per
+    // kMinAcceptInterval are dropped closed/unread. Matches the producer's
+    // own export throttle (kExportInterval in VulkanLayerCapture.cpp), and is
+    // the actual enforcement point: whatever the producer does, no more than
+    // ~2000 frames/s are ever processed into the blend pipeline. Processed-,
+    // not wall-time-based: only frames that pass this gate advance the clock,
+    // so a burst after an idle period is not throttled.
+    static constexpr std::chrono::nanoseconds kMinAcceptInterval(500000); // 1/2000s
+    std::chrono::steady_clock::time_point lastAccept =
+        std::chrono::steady_clock::now() - kMinAcceptInterval;
+    uint64_t cappedSinceLog = 0;
+    auto lastCapLog = std::chrono::steady_clock::now() - std::chrono::seconds(10);
+
     while (receiver.recvFrame(rf)) {
         // Ticked here, before the drop-check below: this is every frame the
         // capture layer actually sent, i.e. the producer/game's real export
@@ -263,6 +283,26 @@ void receiverThreadFn(gmix::ipc::FrameReceiver& receiver, gmix::VulkanContext& v
             }
             continue;
         }
+
+        const auto capNow = std::chrono::steady_clock::now();
+        if (capNow - lastAccept < kMinAcceptInterval) {
+            // Too fast for the receive cap: close the fds, skip the (costly)
+            // import/descriptor work entirely, don't advance lastAccept.
+            if (rf.memFd >= 0) ::close(rf.memFd);
+            if (rf.semFd >= 0) ::close(rf.semFd);
+            ++cappedSinceLog;
+            if (capNow - lastCapLog >= std::chrono::seconds(2)) {
+                blog(LOG_WARNING,
+                     "gmix: receive cap (2000fps) active -- dropped %llu too-fast frame(s) "
+                     "in the last ~2s (producer=%.1ffps)",
+                     static_cast<unsigned long long>(cappedSinceLog),
+                     producerRate.fps());
+                cappedSinceLog = 0;
+                lastCapLog = capNow;
+            }
+            continue;
+        }
+
         auto img = pool.acquire(vk, rf.header.exportSlot, rf.memFd,
                                 rf.header.width, rf.header.height,
                                 static_cast<VkFormat>(rf.header.vkFormat),
@@ -270,6 +310,7 @@ void receiverThreadFn(gmix::ipc::FrameReceiver& receiver, gmix::VulkanContext& v
         auto sem = semPool.acquire(vk, rf.header.exportSlot, rf.semFd);
         auto frame = std::make_shared<gmix::ImportedFrame>();
         if (!frame->init(vk, img, std::move(sem), rf.header.semSignalValue)) continue;
+        lastAccept = capNow;   // frame accepted: only now does the cap clock advance
         q.push(std::move(frame), rf.header.width, rf.header.height,
                rf.header.timestampNs, rf.header.gpuTimestampNs,
                rf.header.cursorX, rf.header.cursorY);
@@ -332,6 +373,11 @@ struct GmixEngine {
     // block), written by gmixUpdate() whenever the OBS properties change.
     std::mutex        blendConfigMu;
     gmix::BlendConfig blendConfig;
+
+    // True between acceptProducer() and the producer disconnecting (or the
+    // engine stopping). Read by the properties dialog's status line only --
+    // diagnostics, never part of the render path.
+    std::atomic<bool> producerConnected{false};
 
     // producerRate : ticked in receiverThreadFn on every frame the CAPTURE
     //                LAYER actually sent over the socket (before any drop) --
@@ -434,6 +480,7 @@ void workerMain(GmixEngine* s) {
             if (s->stop.load()) return;
             continue;
         }
+        s->producerConnected.store(true, std::memory_order_relaxed);
 
         if (!s->blendReady) {
             s->blend = new gmix::BlendEngine(s->vk);
@@ -443,6 +490,18 @@ void workerMain(GmixEngine* s) {
             if (!s->blend->dmaBufCapable()) {
                 return;
             }
+            // One-time confirmation that the whole chain is zero-copy end to
+            // end: producer exports the presenting swapchain image as a
+            // dma-buf with a single GPU blit (no CPU copy anywhere), this
+            // consumer imports those memfds ONCE per ring slot via
+            // gs_texture_create_from_dmabuf, and the blend shader reads
+            // them straight in its compute dispatch. dmaBufCapable() above
+            // is the gate: if any leg were missing, the pipeline would have
+            // bailed out before reaching this line rather than falling
+            // back to a slower path silently.
+            blog(LOG_INFO,
+                 "gmix: producer connected (%ux%u) -- zero-copy dma-buf receive active",
+                 hs.frameW, hs.frameH);
             s->width = hs.frameW;
             s->height = hs.frameH;
             s->blendReady = true;
@@ -790,6 +849,7 @@ void workerMain(GmixEngine* s) {
 
         receiver.close();
         if (receiverThread.joinable()) receiverThread.join();
+        s->producerConnected.store(false, std::memory_order_relaxed);
         // If the producer disconnected mid-resize (awaitingSwap still true),
         // pendingTex[] is about to go out of scope on the next loop iteration
         // -- destroy any staged-but-never-swapped-in textures now, same leak
@@ -958,10 +1018,143 @@ bool gmixGpuIndexModified(void*, obs_properties_t*, obs_property_t*, obs_data_t*
     return false;   // no properties-layout change needed
 }
 
+// ── detected layer-enabled apps ─────────────────────────────────────────────
+// Every process that loads the GMix Vulkan layer publishes a tiny status file
+// (~/.cache/gmix/layers/<pid>.status, see src/capture/LayerStatus.hpp). This
+// is the ONLY way the plugin can know: Flatpak OBS runs in its own PID
+// namespace, so scanning /proc can never see the game's host process -- but
+// ~/.cache/gmix is shared between the two (it's where frames.sock lives), so
+// the layer's own report crosses the sandbox boundary. The list answers "is
+// the layer actually enabled in the game?", which is the first thing to check
+// when the source is black.
+struct DetectedLayerApp {
+    int pid = 0;
+    std::string comm, exe, state, target;
+    bool matched = false;
+    long ageSec = 0;
+};
+
+std::vector<DetectedLayerApp> scanLayerApps() {
+    std::vector<DetectedLayerApp> apps;
+    const char* home = std::getenv("HOME");
+    if (!home || !*home) return apps;
+    const std::string dir = std::string(home) + "/.cache/gmix/layers";
+
+    std::error_code ec;
+    std::filesystem::directory_iterator it(dir, ec), end;
+    if (ec) return apps;
+
+    const long now = static_cast<long>(std::time(nullptr));
+    for (; it != end; it.increment(ec)) {
+        if (ec) break;
+        const std::string name = it->path().filename().string();
+        if (name.size() <= 7 || name.compare(name.size() - 7, 7, ".status") != 0)
+            continue;
+
+        DetectedLayerApp a;
+        std::ifstream in(it->path());
+        std::string line;
+        while (std::getline(in, line)) {
+            const auto eq = line.find('=');
+            if (eq == std::string::npos) continue;
+            const std::string k = line.substr(0, eq), v = line.substr(eq + 1);
+            if      (k == "pid")     a.pid = std::atoi(v.c_str());
+            else if (k == "comm")    a.comm = v;
+            else if (k == "exe")     a.exe = v;
+            else if (k == "state")   a.state = v;
+            else if (k == "target")  a.target = v;
+            else if (k == "matched") a.matched = (v == "1");
+        }
+        if (a.pid <= 0 || a.comm.empty()) continue;
+
+        struct stat st {};
+        if (::stat(it->path().c_str(), &st) == 0)
+            a.ageSec = now - static_cast<long>(st.st_mtime);
+        if (a.ageSec < 0) a.ageSec = 0;
+        apps.push_back(std::move(a));
+    }
+
+    // Target apps first, then freshest first.
+    std::sort(apps.begin(), apps.end(),
+              [](const DetectedLayerApp& x, const DetectedLayerApp& y) {
+                  if (x.matched != y.matched) return x.matched;
+                  return x.ageSec < y.ageSec;
+              });
+    return apps;
+}
+
+std::string describeLayerApp(const DetectedLayerApp& a) {
+    std::string what;
+    if (a.state == "capturing") {
+        what = "capturing into OBS";
+    } else if (a.state == "waiting") {
+        what = "target, waiting for OBS to connect";
+    } else {
+        what = "layer loaded, NOT the capture target";
+        if (!a.target.empty()) what += " (target is '" + a.target + "')";
+    }
+    char buf[700];
+    std::snprintf(buf, sizeof(buf), "%s (pid %d) - %s%s", a.comm.c_str(), a.pid,
+                  what.c_str(), a.ageSec > 10 ? " [stale - process gone?]" : "");
+    return buf;
+}
+
+std::string receiverStatusLine() {
+    std::lock_guard<std::mutex> lk(gEngineMu);
+    if (!gEngine) return "OBS receiver: not started yet (add this source to a scene)";
+    if (gEngine->producerConnected.load(std::memory_order_relaxed))
+        return "OBS receiver: producer connected - frames are arriving";
+    return "OBS receiver: listening for a producer - (re)start the game with the layer enabled";
+}
+
+bool gGmixNextLayerAppsModifiedIsAutoFire = false;
+
+bool gmixLayerAppsModified(void*, obs_properties_t*, obs_property_t*, obs_data_t* settings) {
+    if (gGmixNextLayerAppsModifiedIsAutoFire) {
+        gGmixNextLayerAppsModifiedIsAutoFire = false;
+        return false;
+    }
+    const char* sel = obs_data_get_string(settings, kSettingLayerApps);
+    if (!sel || !*sel) return false;
+    obs_data_set_string(settings, kSettingTarget, sel);
+    blog(LOG_INFO, "gmix: capture target set to '%s' from the detected-apps list "
+                   "(the layer reads it when the app starts, so restart the app)",
+         sel);
+    return true;   // rebuild so the target text field shows the new value
+}
+
+bool gmixLayerAppsRefreshClicked(obs_properties_t*, obs_property_t*, void*) {
+    return true;   // returning true makes OBS rebuild the properties dialog
+}
+
 obs_properties_t* gmixGetProperties(void*) {
     obs_properties_t* props = obs_properties_create();
     obs_properties_add_text(props, kSettingTarget,
                             "Capture target (process name fragment)", OBS_TEXT_DEFAULT);
+
+    // Detected apps: informational, but picking one also writes its name into
+    // the capture target (a convenience; the layer only re-reads the target
+    // file on the next app start).
+    const std::vector<DetectedLayerApp> detected = scanLayerApps();
+    obs_property_t* apps = obs_properties_add_list(
+        props, kSettingLayerApps,
+        "Apps with the GMix layer loaded (pick one to use as capture target)",
+        OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_STRING);
+    if (detected.empty()) {
+        obs_property_list_add_string(
+            apps, "(none found - no app has loaded the GMix layer)", "");
+        obs_property_set_enabled(apps, false);
+    } else {
+        for (const auto& a : detected)
+            obs_property_list_add_string(apps, describeLayerApp(a).c_str(), a.comm.c_str());
+        obs_property_set_modified_callback2(apps, gmixLayerAppsModified, nullptr);
+        gGmixNextLayerAppsModifiedIsAutoFire = true;
+    }
+    obs_properties_add_button(props, kSettingLayerAppsRefresh,
+                              "Refresh detected apps", gmixLayerAppsRefreshClicked);
+    obs_properties_add_text(props, "gmix_receiver_status", receiverStatusLine().c_str(),
+                            OBS_TEXT_INFO);
+
     obs_property_t* gpuIndex = obs_properties_add_int(
         props, kSettingGpuIndex, "GPU index (-1 = auto)", -1, 15, 1);
     obs_property_set_modified_callback2(gpuIndex, gmixGpuIndexModified, nullptr);

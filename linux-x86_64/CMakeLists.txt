@@ -171,3 +171,17 @@ target_include_directories(test_ipc PRIVATE
     "${CMAKE_CURRENT_SOURCE_DIR}/tests")
 target_link_libraries(test_ipc PRIVATE gmix_core)
 add_test(NAME ipc COMMAND test_ipc)
+
+# Layer status file (the per-process "layer loaded here" report the OBS plugin
+# scans; header-only, no GPU).
+add_executable(test_layer_status tests/test_layer_status.cpp)
+target_include_directories(test_layer_status PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}/src")
+add_test(NAME layer_status COMMAND test_layer_status)
+
+# GPU memory bandwidth sanity benchmark (device-to-device copies through the
+# same compute queue the blend uses). Doubles as a measurement: prints GB/s to
+# ctest's stdout.
+add_executable(test_gpu_bandwidth tests/test_gpu_bandwidth.cpp)
+target_link_libraries(test_gpu_bandwidth PRIVATE gmix_core)
+add_test(NAME gpu_bandwidth COMMAND test_gpu_bandwidth)
