@@ -9,6 +9,7 @@
 #include <dlfcn.h>
 #include <unistd.h>
 #include "LayerIpc.hpp"
+#include "LayerStatus.hpp"
 #include "../ipc/frame_sender.hpp"
 #include "../ipc/frame_protocol.hpp"
 
@@ -113,7 +114,12 @@ constexpr VkFormat kExportFormat = VK_FORMAT_R8G8B8A8_UNORM;
 // 200us (=5000fps cap) is far above any real present rate, so every present is
 // captured and the rings + the consumer-side drop logic become the only
 // limiters on how many frames actually make it through.
-constexpr auto kExportInterval = std::chrono::microseconds(200); // ~5000fps cap (no 1ms aliasing)
+// Producer-side export throttle is also the producer rate cap: one capture
+// per >=222.223us, i.e. <= ~4500 exports/s -- matching the consumer's
+// receive cap (kMinAcceptInterval in the obs plugin's receiverThreadFn) so
+// the producer never floods frames the receiver would just cap away.
+// (Previously 200us/"~5000fps" back when the consumer had no cap.)
+constexpr auto kExportInterval = std::chrono::nanoseconds(500000); // 2000fps cap
 
 uint32_t findDeviceLocalMemoryType(PFN_vkGetPhysicalDeviceMemoryProperties getProps,
                                    VkPhysicalDevice phys, uint32_t typeBits) {
@@ -195,6 +201,9 @@ bool VulkanLayerCapture::onInstanceCreated(VkInstance instance) {
 
     connectorRunning_ = true;
     connectorThread_ = std::thread([this]() { connectorLoop(); });
+    // Visible in OBS's "apps with the GMix layer loaded" list even before the
+    // OBS source exists / connects.
+    LayerStatus::instance().set("waiting", targetProcess_, true);
     return true;
 }
 
@@ -307,7 +316,42 @@ void VulkanLayerCapture::connectorLoop() {
             if (s->connect(path)) {
                 std::lock_guard<std::mutex> lk(senderMu_);
                 sender_ = std::move(s);
-                handshakeSent_ = false;
+                handshakeSent_.store(false, std::memory_order_release);
+                LayerStatus::instance().set("capturing", targetProcess_, true);
+            } else {
+                LayerStatus::instance().set("waiting", targetProcess_, true);
+            }
+        }
+
+        // ── the handshake happens HERE, never on the present thread ────────
+        // sendHandshake() does a blocking send + ack read (bounded by the
+        // connection's 5ms SO_SNDTIMEO, ~10ms worst case); running that on
+        // the app's present thread used to be a hiccup in the game exactly
+        // whenever OBS attached. The present thread only publishes the
+        // frame size it wants (pendingW_/H_, set without blocking from
+        // the swapchain info); this thread round-trips the handshake and
+        // only then do exports on the present thread begin.
+        std::shared_ptr<ipc::FrameSender> handshaker;
+        {
+            std::lock_guard<std::mutex> lk(senderMu_);
+            handshaker = sender_;   // keeps it alive through the blocking call
+        }
+        if (handshaker && handshaker->isConnected() &&
+            !handshakeSent_.load(std::memory_order_acquire)) {
+            uint32_t w = 0, h = 0;
+            {
+                std::lock_guard<std::mutex> lk(pendingMu_);
+                if (pendingHandshake_) { w = pendingW_; h = pendingH_; }
+            }
+            if (w != 0 && h != 0) {
+                if (handshaker->sendHandshake(w, h, static_cast<uint32_t>(kExportFormat))) {
+                    handshakeSent_.store(true, std::memory_order_release);
+                } else {
+                    // Dead/broken connection: drop it; the next loop
+                    // iteration reconnects and retries the handshake.
+                    std::lock_guard<std::mutex> lk(senderMu_);
+                    if (sender_ == handshaker) sender_.reset();
+                }
             }
         }
         for (int i = 0; i < 10 && connectorRunning_; ++i)
@@ -458,6 +502,95 @@ void VulkanLayerCapture::destroyExportResources() {
     }
 }
 
+// ── export gate telemetry (debug aid; delete when the capture reaches v1.0) ──
+// Every early return in maybeExportFrame() historically vanished without a
+// trace, which made "connected but zero frames in OBS" impossible to chase
+// (exactly the osu!stable-at-4500fps deadlock seen on 2026-10-31: handshake
+// landed, one frame crossed, then all exports stopped for unknown reasons).
+// Gate counters fire on the app's present thread; logging stays on a 1/s
+// rate-limited line in the app's own stderr (winello.log under wine).
+namespace expgate {
+struct telemetry {
+    enum Label { OK, WAIT_HS, NO_SENDER, NO_SWAP, BAD_FORMAT, NO_QF,
+                 IMG_FAIL, SEM_FAIL, POOL_FAIL, RING_FAIL, FENCE_BUSY,
+                 SUBMIT_FAIL, FD_FAIL, NLABELS };
+    static constexpr const char* kNames[NLABELS] = {
+        "ok", "waitingFS", "noSender", "noSwapInfo", "badFormat", "noQF",
+        "exportImgFail", "semFail", "cmdPoolFail", "ringAllocFail",
+        "fenceBusy", "submitFail", "fdFail" };
+    static void mark(Label l) {
+        counters_[l].fetch_add(1, std::memory_order_relaxed);
+        maybePrint();
+    }
+    static void maybePrint() {
+        auto now = std::chrono::steady_clock::now();
+        auto last = lastPrint_.load(std::memory_order_relaxed);
+        if (now.time_since_epoch().count() - last <
+            std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+                std::chrono::seconds(1)).count())
+            return;
+        // Race-prone CAS on the clock; losers stay quiet. No mutex on the hot
+        // path: printing from inside the present hook happens once a second.
+        if (!lastPrint_.compare_exchange_strong(last, now.time_since_epoch().count(),
+                                                std::memory_order_relaxed))
+            return;
+        std::string line = "GMIX export:";
+        bool any = false;
+        for (int i = 0; i < NLABELS; ++i) {
+            uint64_t v = counters_[i].exchange(0, std::memory_order_relaxed);
+            if (v != 0) {
+                char buf[64];
+                std::snprintf(buf, sizeof(buf), " %s=%llu", kNames[i],
+                              static_cast<unsigned long long>(v));
+                line += buf;
+                any = true;
+            }
+        }
+        // GPU blit duration (see maybeExportFrame): two per-slot GPU
+        // timestamps (pre-blit barrier + bottom-of-pipe) diffed on the
+        // device's own clock and scaled by its timestamp period. This is the
+        // per-frame GPU time the capture inserts into the frame's critical
+        // path; if it is small, the layer is innocent and the remaining
+        // slowdown comes from Zink rendering itself.
+        uint64_t bc = blitCnt_.exchange(0, std::memory_order_relaxed);
+        if (bc) {
+            uint64_t bs = blitSumNs_.exchange(0, std::memory_order_relaxed);
+            uint64_t bx = blitMaxNs_.exchange(0, std::memory_order_relaxed);
+            char bbuf[128];
+            std::snprintf(bbuf, sizeof(bbuf),
+                          " blitAvg=%.0fus blitMax=%.0fus n=%llu",
+                          static_cast<double>(bs) / bc / 1000.0,
+                          static_cast<double>(bx) / 1000.0,
+                          static_cast<unsigned long long>(bc));
+            line += bbuf;
+            any = true;
+        }
+        if (any) std::fprintf(stderr, "%s\n", line.c_str());
+    }
+    static void recordGpuBlitNs(uint64_t ns) {
+        if (!ns) return;
+        blitSumNs_.fetch_add(ns, std::memory_order_relaxed);
+        blitCnt_.fetch_add(1, std::memory_order_relaxed);
+        uint64_t maxv = blitMaxNs_.load(std::memory_order_relaxed);
+        while (ns > maxv &&
+               !blitMaxNs_.compare_exchange_weak(maxv, ns, std::memory_order_relaxed)) {}
+    }
+    static std::atomic<uint64_t> counters_[NLABELS];
+    static std::atomic<uint64_t> lastPrint_;
+    static std::atomic<uint64_t> blitSumNs_;
+    static std::atomic<uint64_t> blitCnt_;
+    static std::atomic<uint64_t> blitMaxNs_;
+};
+std::atomic<uint64_t> telemetry::counters_[telemetry::NLABELS] = {};
+std::atomic<uint64_t> telemetry::lastPrint_{0};
+std::atomic<uint64_t> telemetry::blitSumNs_{0};
+std::atomic<uint64_t> telemetry::blitCnt_{0};
+std::atomic<uint64_t> telemetry::blitMaxNs_{0};
+}
+
+using ExportTelemetry = expgate::telemetry;
+#define GMXMARK(lbl) ExportTelemetry::mark(ExportTelemetry::lbl)
+
 void VulkanLayerCapture::maybeExportFrame(VkQueue queue, VkPresentInfoKHR* pPresentInfo) {
     if (!pPresentInfo || pPresentInfo->swapchainCount == 0) return;
 
@@ -481,7 +614,7 @@ void VulkanLayerCapture::maybeExportFrame(VkQueue queue, VkPresentInfoKHR* pPres
         std::lock_guard<std::mutex> lk(senderMu_);
         if (sender_ && sender_->isConnected()) sender = sender_.get();
     }
-    if (!sender) return;
+    if (!sender) { GMXMARK(NO_SENDER); return; }
 
     VkSwapchainKHR swapchain = pPresentInfo->pSwapchains[0];
     uint32_t imageIndex = pPresentInfo->pImageIndices[0];
@@ -490,20 +623,37 @@ void VulkanLayerCapture::maybeExportFrame(VkQueue queue, VkPresentInfoKHR* pPres
     {
         std::lock_guard<std::mutex> lk(swapMu_);
         auto it = swapchains_.find(swapchain);
-        if (it == swapchains_.end() || imageIndex >= it->second.images.size()) return;
+        if (it == swapchains_.end() || imageIndex >= it->second.images.size()) { GMXMARK(NO_SWAP); return; }
         info = it->second; // copy: small vector of VkImage handles
     }
-    if (!isSupportedExportFormat(info.format)) return;
+    if (!isSupportedExportFormat(info.format)) { GMXMARK(BAD_FORMAT); return; }
+
+    // Handshake alive check BEFORE any export work: sendHandshake() does a
+    // blocking send + ack read (bounded by the connection's 5ms SO_SNDTIMEO,
+    // ~10ms worst case) and used to run RIGHT HERE on the app's present
+    // thread after every (re)connect -- a hiccup in the game exactly when
+    // OBS attached. It now happens on the connector thread (see
+    // connectorLoop); this thread only publishes the swapchain size (zero
+    // blocking) and skips exporting until the handshake has landed, at
+    // which point captures start with no extra present-thread work at all.
+    if (!handshakeSent_.load(std::memory_order_acquire)) {
+        std::lock_guard<std::mutex> lk(pendingMu_);
+        pendingW_ = info.extent.width;
+        pendingH_ = info.extent.height;
+        pendingHandshake_ = true;
+        GMXMARK(WAIT_HS);
+        return;
+    }
 
     auto qfIt = queueFamilies_.find(queue);
-    if (qfIt == queueFamilies_.end()) return;
+    if (qfIt == queueFamilies_.end()) { GMXMARK(NO_QF); return; }
     uint32_t queueFamily = qfIt->second;
 
-    if (!ensureExportImage(info.extent.width, info.extent.height)) return;
-    if (!ensureExportSemaphores()) return;
+    if (!ensureExportImage(info.extent.width, info.extent.height)) { GMXMARK(IMG_FAIL); return; }
+    if (!ensureExportSemaphores()) { GMXMARK(SEM_FAIL); return; }
 
     VkCommandPool pool = ensureCmdPool(queueFamily);
-    if (pool == VK_NULL_HANDLE) return;
+    if (pool == VK_NULL_HANDLE) { GMXMARK(POOL_FAIL); return; }
 
     // Lazily (re)create the ring's command buffers/fences against this pool.
     if (ringPoolFamily_ != queueFamily) {
@@ -517,14 +667,17 @@ void VulkanLayerCapture::maybeExportFrame(VkQueue queue, VkPresentInfoKHR* pPres
         cai.commandPool = pool;
         cai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
         cai.commandBufferCount = kRingSize;
-        if (vkAllocateCommandBuffers(device_, &cai, ringCmd_) != VK_SUCCESS) return;
+        if (vkAllocateCommandBuffers(device_, &cai, ringCmd_) != VK_SUCCESS) { GMXMARK(RING_FAIL); return; }
         VkFenceCreateInfo fci{};
         fci.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
         VkSemaphoreCreateInfo binSci{};
         binSci.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
         for (int i = 0; i < kRingSize; ++i) {
-            if (vkCreateFence(device_, &fci, nullptr, &ringFence_[i]) != VK_SUCCESS) return;
-            if (vkCreateSemaphore(device_, &binSci, nullptr, &ringPresentChainSem_[i]) != VK_SUCCESS) return;
+            if (vkCreateFence(device_, &fci, nullptr, &ringFence_[i]) != VK_SUCCESS ||
+                vkCreateSemaphore(device_, &binSci, nullptr, &ringPresentChainSem_[i]) != VK_SUCCESS) {
+                GMXMARK(RING_FAIL);
+                return;
+            }
         }
 
         // ── GPU timestamp support for THIS present queue family ──────────────
@@ -554,7 +707,7 @@ void VulkanLayerCapture::maybeExportFrame(VkQueue queue, VkPresentInfoKHR* pPres
                 VkQueryPoolCreateInfo qpci{};
                 qpci.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO;
                 qpci.queryType = VK_QUERY_TYPE_TIMESTAMP;
-                qpci.queryCount = kRingSize;
+                qpci.queryCount = kRingSize * 2;
                 if (vkCreateQueryPool(device_, &qpci, nullptr, &tsQueryPool_) == VK_SUCCESS)
                     timestampsSupported_ = true;
             }
@@ -571,7 +724,7 @@ void VulkanLayerCapture::maybeExportFrame(VkQueue queue, VkPresentInfoKHR* pPres
         // finished yet, skip this present's export entirely rather than
         // ever waiting on the present thread.
         VkResult fr = vkGetFenceStatus(device_, ringFence_[slot]);
-        if (fr != VK_SUCCESS) return;
+        if (fr != VK_SUCCESS) { GMXMARK(FENCE_BUSY); return; }
         // The same signaled fence also means this slot's timestamp query (from
         // its PREVIOUS capture) is now resolved, so we can read it back without
         // blocking. That GPU time belongs to an earlier frame, but the consumer
@@ -579,13 +732,36 @@ void VulkanLayerCapture::maybeExportFrame(VkQueue queue, VkPresentInfoKHR* pPres
         // capture-rate estimate, and those deltas are the true inter-frame GPU
         // intervals regardless of the constant ring-length offset.
         if (timestampsSupported_ && tsQueryPool_ != VK_NULL_HANDLE) {
-            uint64_t ticks = 0;
-            if (vkGetQueryPoolResults(device_, tsQueryPool_, static_cast<uint32_t>(slot), 1,
-                                      sizeof(ticks), &ticks, sizeof(ticks),
+            uint64_t t2[2] = {0, 0};
+            if (vkGetQueryPoolResults(device_, tsQueryPool_, 2 * static_cast<uint32_t>(slot), 2,
+                                      sizeof(t2), &t2, sizeof(uint64_t),
                                       VK_QUERY_RESULT_64_BIT) == VK_SUCCESS) {
-                if (timestampValidBits_ < 64)
-                    ticks &= (uint64_t(1) << timestampValidBits_) - 1;
-                gpuTsToSend = static_cast<uint64_t>(static_cast<double>(ticks) * timestampPeriodNs_);
+                // Masks are per-value; the wrap-aware DIFF must be taken in
+                // the full tick domain (delta can legitimately exceed the
+                // truncated bits when the counter rolls over between the two
+                // reads).
+                uint64_t period = timestampValidBits_ < 64
+                    ? (uint64_t(1) << timestampValidBits_)
+                    : 0;   // 0 = 64-bit clock, no wrap possible
+                uint64_t tickDelta;
+                if (t2[1] >= t2[0])
+                    tickDelta = t2[1] - t2[0];
+                else if (period > 0)
+                    tickDelta = period - t2[0] + t2[1];
+                else
+                    tickDelta = 0;
+                // Capture-time GPU clock for the consumer's capture-rate
+                // estimate: the slot's END timestamp converted via the device
+                // period, same as the single-timestamp scheme this replaces
+                // (successive deltas = true inter-frame GPU intervals).
+                gpuTsToSend = static_cast<uint64_t>(
+                    static_cast<double>(t2[1]) * timestampPeriodNs_);
+                // Pure GPU cost of the inserted capture work: bottom-of-pipe
+                // (end, after blit + restore barrier) minus just-before-the
+                // -blit, both on the device's own clock. Fence signaled =
+                // both queries resolved, so the readback never blocks.
+                ExportTelemetry::recordGpuBlitNs(
+                    static_cast<uint64_t>(static_cast<double>(tickDelta) * timestampPeriodNs_));
             }
         }
     }
@@ -612,7 +788,7 @@ void VulkanLayerCapture::maybeExportFrame(VkQueue queue, VkPresentInfoKHR* pPres
     // Reset this slot's timestamp query before (re)writing it. Queries must be
     // reset before each use; doing it here (outside any render pass) is valid.
     if (timestampsSupported_ && tsQueryPool_ != VK_NULL_HANDLE)
-        vkCmdResetQueryPool(cmd, tsQueryPool_, static_cast<uint32_t>(slot), 1);
+        vkCmdResetQueryPool(cmd, tsQueryPool_, 2 * static_cast<uint32_t>(slot), 2);
 
     VkImageMemoryBarrier toSrc{};
     toSrc.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
@@ -639,6 +815,12 @@ void VulkanLayerCapture::maybeExportFrame(VkQueue queue, VkPresentInfoKHR* pPres
     VkImageMemoryBarrier preCopy[2] = { toSrc, dstToTransfer };
     vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
                          0, 0, nullptr, 0, nullptr, 2, preCopy);
+    // START of the capture's inserted GPU work (the pre-blit barrier just
+    // passed; the blit follows in submission order). Diffed against the
+    // bottom-of-pipe timestamp at the end -> blitAvg/blitMax telemetry.
+    if (timestampsSupported_ && tsQueryPool_ != VK_NULL_HANDLE)
+        vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, tsQueryPool_,
+                            2 * static_cast<uint32_t>(slot));
 
     // Blit, not copy: the real swapchain format is very likely
     // VK_FORMAT_B8G8R8A8_* while exportImage_ is fixed at R8G8B8A8_UNORM
@@ -688,7 +870,7 @@ void VulkanLayerCapture::maybeExportFrame(VkQueue queue, VkPresentInfoKHR* pPres
     // commands (the blit + restoring barriers) have completed on the GPU.
     if (timestampsSupported_ && tsQueryPool_ != VK_NULL_HANDLE)
         vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
-                            tsQueryPool_, static_cast<uint32_t>(slot));
+                            tsQueryPool_, 2 * static_cast<uint32_t>(slot) + 1);
 
     vkEndCommandBuffer(cmd);
 
@@ -747,6 +929,7 @@ void VulkanLayerCapture::maybeExportFrame(VkQueue queue, VkPresentInfoKHR* pPres
     // PRESENT_SRC_KHR has actually finished executing -- that race is what
     // produced the tiled/shuffled-block corruption seen before this fix.
     if (vkQueueSubmit(queue, 1, &si, ringFence_[slot]) != VK_SUCCESS) {
+        GMXMARK(SUBMIT_FAIL);
         return;   // persistent per-slot semaphore is reused; nothing to destroy
     }
     ringValid_[slot] = true;
@@ -776,50 +959,49 @@ void VulkanLayerCapture::maybeExportFrame(VkQueue queue, VkPresentInfoKHR* pPres
     // has dup'd it across to the consumer.
 
     if (memFd < 0 || semFd < 0) {
+        GMXMARK(FD_FAIL);
         if (memFd >= 0) ::close(memFd);
         if (semFd >= 0) ::close(semFd);
         return;
     }
 
-    bool ok = true;
-    if (!handshakeSent_) {
-        ok = sender->sendHandshake(exportW_, exportH_, static_cast<uint32_t>(kExportFormat));
-        if (ok) handshakeSent_ = true;
-    }
-    if (ok) {
-        ipc::FrameHeader hdr{};
-        hdr.magic = ipc::kMagic;
-        hdr.width = exportW_;
-        hdr.height = exportH_;
-        hdr.vkFormat = static_cast<uint32_t>(kExportFormat);
-        hdr.exportSlot = static_cast<uint32_t>(eslot);
-        hdr.semSignalValue = sigVal;
-        hdr.frameIndex = frameIndex_;
-        hdr.timestampNs = static_cast<uint64_t>(
-            std::chrono::duration_cast<std::chrono::nanoseconds>(now.time_since_epoch()).count());
-        hdr.rowPitch = exportRowPitch_;
-        hdr.gpuTimestampNs = gpuTsToSend;
-        // True cursor position for THIS frame's present (see readCursorNormalized
-        // + the cursorX/Y field docs in frame_protocol.hpp). <0 sentinel when
-        // unavailable so the consumer can skip it when reconstructing the path.
-        float cnx = -1.f, cny = -1.f;
-        readCursorNormalized(cnx, cny);
-        hdr.cursorX = cnx;
-        hdr.cursorY = cny;
-        // Skipped (receiver backpressure) is NOT a connection failure --
-        // only Failed means the connection is actually dead. Treating
-        // Skipped as ok==true leaves the connection untouched below; the
-        // frame's own fds are already closed inside sendFrame() either way.
-        ok = sender->sendFrame(hdr, memFd, semFd) != ipc::FrameSender::SendResult::Failed;
-    } else {
-        ::close(memFd);
-        ::close(semFd);
-    }
+    // Handshake already happened on the connector thread (handshakeSent_ was
+    // checked at the top of this function) -- this is the plain frame send.
+    ipc::FrameHeader hdr{};
+    hdr.magic = ipc::kMagic;
+    hdr.width = exportW_;
+    hdr.height = exportH_;
+    hdr.vkFormat = static_cast<uint32_t>(kExportFormat);
+    hdr.exportSlot = static_cast<uint32_t>(eslot);
+    hdr.semSignalValue = sigVal;
+    hdr.frameIndex = frameIndex_;
+    hdr.timestampNs = static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(now.time_since_epoch()).count());
+    hdr.rowPitch = exportRowPitch_;
+    hdr.gpuTimestampNs = gpuTsToSend;
+    // True cursor position for THIS frame's present (see readCursorNormalized
+    // + the cursorX/Y field docs in frame_protocol.hpp). <0 sentinel when
+    // unavailable so the consumer can skip it when reconstructing the path.
+    float cnx = -1.f, cny = -1.f;
+    readCursorNormalized(cnx, cny);
+    hdr.cursorX = cnx;
+    hdr.cursorY = cny;
+
+    // sendFrame closes memFd/semFd itself on both success and skip (the
+    // kernel dup'd the fd handles into the consumer's fd table). Only a hard
+    // failure (dead connection) comes back here. Skipped (receiver
+    // backpressure) is NOT a connection failure -- only Failed drops the
+    // connection for the connector thread to rebuild.
+    const bool ok =
+        sender->sendFrame(hdr, memFd, semFd) != ipc::FrameSender::SendResult::Failed;
 
     if (!ok) {
+        GMXMARK(SUBMIT_FAIL);
         // Drop the connection -- the connector thread will reconnect.
         std::lock_guard<std::mutex> lk(senderMu_);
         if (sender_.get() == sender) sender_.reset();
+    } else {
+        GMXMARK(OK);
     }
 }
 

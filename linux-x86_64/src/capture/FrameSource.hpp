@@ -216,8 +216,31 @@ private:
     std::chrono::steady_clock::time_point lastExportAttempt_{};
 
     std::mutex senderMu_;
-    std::unique_ptr<gmix::ipc::FrameSender> sender_;
-    bool handshakeSent_ = false;
+    // shared_ptr, not unique_ptr: the connector thread needs to call
+    // sendHandshake() (a blocking send/ack round-trip, see connectorLoop)
+    // while the present thread may concurrently drop a dead connection
+    // (sender_.reset() in maybeExportFrame). A shared_ptr snapshot keeps the
+    // sender alive under the connector thread even as the member is reset.
+    std::shared_ptr<gmix::ipc::FrameSender> sender_;
+    // Set by the CONNECTOR thread (it owns the blocking handshake), checked
+    // on the present thread -- hence atomic, not a plain bool.
+    std::atomic<bool> handshakeSent_{false};
+
+    // ── handshake offload (present thread must never block) ─────────────────
+    // sendHandshake() does a blocking send + ack read (bounded by the
+    // connection's 5ms SO_SNDTIMEO, ~10ms worst case). It used to run directly
+    // on the app's present thread on the first export after every
+    // (re)connect; it now runs on the connector thread, which needs only the
+    // frame size -- so the present thread just publishes it here (known the
+    // moment the swapchain is, still without blocking) and the connector
+    // round-trips the handshake from its own thread. Cleared when the size
+    // becomes stale? Never: on reconnect the same size is still right, and
+    // the handshake gate re-arms via handshakeSent_ anyway.
+    std::mutex pendingMu_;
+    bool pendingHandshake_ = false;
+    uint32_t pendingW_ = 0;
+    uint32_t pendingH_ = 0;
+
     std::thread connectorThread_;
     std::atomic<bool> connectorRunning_{false};
 };

@@ -1748,124 +1748,289 @@ request ("will look at that later on").
 
 </details>
 
-## ADDED (2026-08-06): Cursor trail quality overhaul + bloom/glow pass
+## ADDED (2026-10-31): osu!stable via osu-winello (Wine + DXVK) — capture path
 
-Five shader/engine fixes implemented to clean up the cursor trail, inspired by danser-go's clean cursor blur approach:
+Requested: run GMix against osu!stable installed by
+[osu-winello](https://github.com/NelloKudo/osu-winello) instead of
+osu!lazer. The good news is that no second capture backend is needed; the
+Wine path is the *same* Vulkan present, and nearly all of the work was
+diagnosis. What was actually verified on the target machine:
 
-### 1. Better rest blur kernel (`shaders/cursor_path_blur.comp:52-66`)
-- Replaced hardcoded 2-ring kernel (4/2/1 weights at o1, o2 offsets) with proper Gaussian-weighted 2D kernel
-- `sigma = blurWidth * 0.15`, radius = ceil(2.5*sigma), clamped 1..16
-- Center-weighted, preserves cursor core brightness, no dark hollow artifacts
+- **osu!stable is already a Vulkan app in disguise.** osu-winello's prefix
+  has DXVK's `d3d9.dll` (PE) with `"*d3d9"="native"` in `user.reg`, so D3D9
+  is translated to Vulkan and presented through the host `libvulkan.so.1`
+  (`libvulkan_radeon.so` visible in the game process's maps). A Vulkan
+  implicit layer therefore applies exactly as it does to lazer.
+- **No 32-bit layer build is required.** `wine-osu` is a WoW64-only build
+  (`lib/wine/{x86_64-unix,i386-windows,x86_64-windows}`, no `i386-unix`), so
+  the 32-bit `osu!.exe` runs inside a 64-bit Unix process. The existing
+  `VkLayer_GMIX.so` (64-bit) gets loaded into it.
+- **Process matching had to change.** For the running game process,
+  `/proc/self/exe` → `.../wine-osu/lib/wine/x86_64-unix/wine-preloader`,
+  while `/proc/self/comm` → `osu!.exe` and `argv[0]` →
+  `D:\osu!.exe`. Matching only the exe basename could never find target
+  `osu!`. `processMatchesTarget()` now matches the fragment against the exe
+  basename, comm, and every `cmdline` entry (including a Windows-path
+  basename). Wine's other processes (`wineserver`, `winedevice.exe`,
+  `explorer.exe`) do load the layer too but never create a Vulkan device, so
+  the wider match does not misfire.
+- **No sandbox overrides are needed (unlike Flatpak lazer).** yawl runs the
+  game in Steam's pressure-vessel container, and the sniper runtime
+  re-exports the *host's* implicit layers into it: the container's
+  `/usr/lib/pressure-vessel/overrides/share/vulkan/implicit_layer.d/` gains a
+  rewritten `0-x86_64-linux-gnu.json` for `VK_LAYER_GMIX` (library_arch 64,
+  same `enable_environment`), with the `.so` bind-mounted read-only inside a
+  tmpfs at the manifest's `library_path`. The manifest's `ENABLE_GMIX`
+  gating still applies, which is why enablement is the only missing bit.
+- **The container shares the host's `$HOME`.** `~/.cache/gmix/socket`,
+  `~/.cache/gmix/frames.sock` and `~/.config/gmix/target_process` are the
+  same files on both sides (confirmed by writing the layer socket-address
+  file from inside the running container and reading it from the host), so
+  the existing rendezvous paths and SCM_RIGHTS dma-buf handoff work
+  unchanged.
+- **The layer really loads inside Wine.** With `ENABLE_GMIX=1` in the
+  launcher's environment, a Wine process in the container ran the layer and
+  printed the new per-instance diagnostic
+  `VkLayer_GMIX: no capture -- process names [wine-preloader, explorer.exe,
+  explorer.exe, C:\windows\system32\explorer.exe, desktop, /desktop],
+  target 'vulkaninfo'` — i.e. loader discovery, negotiation and the new name
+  matching all ran.
 
-### 2. Smoother rest→motion crossfade (`shaders/cursor_path_blur.comp:200`)
-- Changed `clamp(bestSegLen / 4.0, 0.0, 1.0)` → `smoothstep(0.5, 3.0, bestSegLen)`
-- Perceptually linear transition, no pop at motion threshold
+Changes made:
 
-### 3. Softer edge falloff (`shaders/cursor_path_blur.comp:157-159`)
-- Linear `edge = 1.0 - perp` → `smoothFalloff(perp, 0.7, 1.0)` using smoothstep
-- Eliminates harsh cutoff at tube boundary
+- `layer/layer_entry.cpp`: multi-source process-name matching (above) plus
+  the single `VkLayer_GMIX: no capture -- process names [...]` stderr line
+  per Vulkan instance. That line is the diagnostic to ask for when capture
+  doesn't start, since it shows both the names the layer saw and the target
+  it was given. Also gated `wrap_QueuePresentKHR`'s 1-in-60-present
+  `/tmp/gmix_layer_debug.log` write behind `GMIX_LAYER_DEBUG=1`: it was the
+  last unconditional disk I/O left on the game's present thread (the
+  2026-07-05 fix removed the every-present version; this residual one was
+  still ~16 writes/s at 1000 fps).
+- `config/gmix_config.ini`: new `[capture] wine_launcher` (e.g. `osu-wine`).
+- `config/gmix_launch.sh`: wine branch writes
+  `~/.local/share/osuconfig/configs/gmix.cfg` (`ENABLE_GMIX=1`,
+  `GMIX_TARGET_PROCESS=<target>`) — `osu-wine` sources every `*.cfg` there
+  under `set -a`, so this is the launcher's own persistent mechanism and it
+  survives osu-winello updates. Also warns when the prefix's `d3d9.dll`
+  doesn't look like DXVK (builtin d3d9 ⇒ OpenGL ⇒ nothing to hook).
+- README / PIPELINE.md: osu-winello as a first-class target, the DXVK
+  requirement, and the shared-`$HOME`/pressure-vessel topology.
 
-### 4. Improved comet envelope (`shaders/cursor_path_blur.comp:203-212`)
-- Head highlight: `1.0 + 0.3 * m * (1.0 - pathPos)` — boost at cursor head
-- Tail fade: `mix(1.0, 0.3, smoothstep(0.2, 0.8, pathPos))` — smooth fade to 30% at tail
-- At rest (m=0): symmetric halo (env=1); moving: bright head, fading tail
-- Fixes "blur only covers the front" artifact on near-still paths
+Known caveat: the cursor channel comes from lazer's in-process SDL3
+(`readCursorNormalized()`), which osu!stable doesn't have, so `cursorX/Y`
+arrive as the `<0` sentinel and the "Cursor path" blur mode has no samples
+in Wine. Default behaviour is unaffected: cursor blur width defaults to 0,
+and osu!stable renders its own cursor into the captured frame anyway.
 
-### 5. Bloom/glow post-process pass (`shaders/cursor_bloom.comp` + `blend_engine.cpp`)
-- New 3-pass compute pipeline: bright-filter (luma > threshold) → horizontal Gaussian → vertical Gaussian → additive combine
-- Separable blur: configurable `threshold` (0..1), `strength` (0..5), `radius` (0..32px), `sigma` (0.5..16)
-- Runs entirely on GPU in same command buffer (no host round-trip)
-- Added `BloomParams` to `BlendConfig.hpp` and OBS UI properties:
-  - `bloom_enabled` (bool, default true)
-  - `bloom_threshold` (float, default 0.8)
-  - `bloom_strength` (float, default 1.0)
-  - `bloom_radius` (float, default 8.0)
-  - `bloom_sigma` (float, default 4.0)
+**Still to verify live** (this session's machine had the game already
+running without the layer, so it can only be checked after a relaunch):
+relaunch with `osu-wine`, confirm the OBS log shows the producer connect and
+that `vkQueuePresentKHR` capture + blend actually produce a blurred image.
+Points worth watching if it doesn't: DXVK's swapchain is created with an
+injected `VK_IMAGE_USAGE_TRANSFER_SRC_BIT` (the layer's
+`wrap_CreateSwapchainKHR` already does this whenever
+`vkGetPhysicalDeviceSurfaceCapabilitiesKHR` allows it), and the
+present-time semaphore chaining must survive Wine's thunking — if frames
+arrive but look torn/shuffled, that chaining is the first suspect (it was
+the cause of the same symptom on lazer).
 
-### Integration
-- All 5 fixes compile and pass existing tests (`blend_engine`, `ipc`)
-- Plugin installed to `~/.var/app/com.obsproject.Studio/config/obs-studio/plugins/obs-gmix-source/`
-- Requires OBS restart to pick up new SPIR-V and UI properties
+## ROOT CAUSE (2026-10-31, later): osu-winello capture never enabled — `source *.cfg` sources only the FIRST file
 
-### Testing notes
-- Cursor trail at standstill: soft Gaussian halo, no dark center
-- Low-speed motion: smooth transition from rest blur to directional smear
-- High-speed motion: continuous streak with bright head, fading comet tail
-- Bloom adds natural glow on bright cursor cores, configurable per content
+Live symptom: osu!stable (osu-winello) launched after the layer + config were
+installed, OBS had the "GMix Motion Blur" source, and the preview stayed
+black. The layer was NOT in the game at all:
 
+    $ tr '\0' '\n' < /proc/<osu pid>/environ | grep -i gmix   # nothing
+    $ grep -c VkLayer_GMIX /proc/<osu pid>/maps              # 0
 
-## ADDED (2026-08-06, continued): Shutter timing fix + rest→motion smoothness
+But `~/.local/share/osuconfig/winello.log` DID list the written config file
+("Using configs: .../configs/gmix.cfg .../example.cfg"), which is what made
+this look like the layer was enabled but broken.
 
-### 6. Adaptive shutter window using actual capture rate (`gmix_source.cpp:661-675`)
-- **Problem**: Fixed 1/60s shutter window tied to OBS output interval caused inconsistent blur amount when game FPS varied (e.g., 60fps vs 240fps vs 360fps)
-- **Fix**: Use `producerRate.fps()` (actual capture rate from game) to compute shutter window targeting 1/60s of real motion time:
-  - At 240fps game → 4 frames blended per output frame
-  - At 60fps game → 1 frame blended per output frame  
-  - At 360fps game → 6 frames blended per output frame
-- Falls back to OBS configured interval if producer rate unknown
-- Result: consistent blur amount regardless of game framerate
+Why: that "Using configs" line comes from `mapfile < <(find ...)` — it lists
+every `*.cfg` that EXISTS, not the ones actually applied. `osu-wine` enables
+them with:
 
-### 7. Smoothed cursor velocity for rest→motion crossfade (`cursor_path_blur.comp:149-162`)
-- **Problem**: Crossfade factor `m` used per-segment length `bestSegLen`, which jittered at low cursor speeds (individual segments tiny and noisy)
-- **Fix**: Compute average cursor velocity over last up to 8 path segments:
-  ```glsl
-  vec2 avgVel = vec2(0.0);
-  for (uint i = 0; i < min(8, pointCount-1); ++i)
-      avgVel += path.pts[i] - path.pts[i+1];
-  avgVel /= samples;
-  float cursorSpeed = length(avgVel);
-  ```
-- Crossfade now uses `smoothstep(0.5, 3.0, cursorSpeed)` instead of `bestSegLen`
-- Directional smear still uses `bestSegLen` (actual segment length for tap count)
-- Comet envelope automatically uses smoothed `m` factor
-- Result: stable rest→motion transition even at creeping cursor speeds, no flickering
+    source "$XDG_DATA_HOME/osuconfig/configs/"*.cfg 2>/dev/null
 
+and bash's `source` takes ONE file: the glob expands to
+`source example.cfg gmix.cfg`, so `gmix.cfg` is passed as `$1` and never
+read. Alphabetically `example.cfg` sorts first, so ANY extra config file
+sorts later and is silently ignored (this is an osu-winello launcher bug, not
+GMix-specific; nothing errors).
 
-## ADDED (2026-08-06, continued): Continuous cursor streak fixes
+Proof (same command in a clean shell):
 
-### 8. Continuous cursor path - interpolate unavailable positions (`gmix_source.cpp:701-740`)
-- **Problem**: Frames with `cursorX < 0` (no window focus) were skipped entirely, creating gaps in the cursor path polyline that showed as discrete blur blobs instead of one smooth streak
-- **Fix**: Two-pass reconstruction:
-  1. Collect all positions, marking unavailable as NaN
-  2. Interpolate unavailable positions from nearest available neighbors (linear interpolation between prev/next, or hold nearest, or center fallback)
-- Result: Contiguous polyline even when cursor briefly leaves window
+    $ bash -c 'set -a; source ~/.local/share/osuconfig/configs/*.cfg 2>/dev/null; set +a; echo "[$ENABLE_GMIX]"'
+    []
 
-### 9. Full-path smear instead of per-segment (`shaders/cursor_path_blur.comp`)
-- **Problem**: Shader found nearest segment and smeared only along that segment's tangent. A 10-frame fast move with 5 captured frames created 5 discrete "blobs" each with faded tail, instead of one continuous streak
-- **Fix**: Rewrite smear to sample the ENTIRE path polyline at regular intervals:
-  - Compute total path length
-  - Sample at `pathSamples = clamp(totalPathLen * 0.5, 8, 64)` positions along full path
-  - For each sample, weight by inverse distance to pixel (quadratic falloff)
-  - Blend all samples together → one continuous streak
-- Crossfade still uses smoothed cursor speed (avg over 8 segments)
-- Comet envelope uses pathPos along full path (0=head, 1=tail)
+Fix: `gmix_launch.sh` now writes **`00-gmix.cfg`** — sorting first — and that
+file re-sources the remaining `*.cfg` itself (still under osu-wine's
+`set -a`, so their variables stay exported). It also deletes the old
+`gmix.cfg` (only if it carries our marker comment) and VERIFIES the result by
+running osu-wine's exact `source` command in a subshell and checking that
+`ENABLE_GMIX=1` came out exported. Verified live: `[1] [osu!]`.
 
-### 10. Extended shutter window margin (`gmix_source.cpp:671`)
-- **Problem**: 1/60s (16.67ms) window sometimes cut off the start/end of fast cursor movements due to frame timing variance
-- **Fix**: Use 1.2x margin → 20ms window (1/50s equivalent)
-- Captures full movement even when frame timestamps don't perfectly align with 1/60s grid
+## ADDED (2026-10-31): "which apps have the layer loaded?" — Properties dropdown
 
+Debugging the above by hand meant reading `/proc/<pid>/environ` and
+`/proc/<pid>/maps` from a terminal; the plugin cannot do that itself because
+Flatpak OBS runs in its own PID namespace (host PIDs are invisible), even
+though the Flatpak has `filesystems=host`.
 
-## ADDED (2026-08-06, continued): Dense cursor path using ALL capture frames
+So the layer now publishes itself: `src/capture/LayerStatus.hpp` writes
+`~/.cache/gmix/layers/<pid>.status` (pid, comm, exe, state, target, matched)
+and rewrites it on state changes, deletes it on clean exit, and bumps mtime
+at most once a second (`heartbeat()` from the present hook — 1 utimensat/s,
+not per-present I/O). States: `not-target`, `waiting` (target, no consumer
+yet), `capturing` (connected to the OBS `frames.sock`). The file is replaced
+atomically (tmp + rename) so the reader never sees half a file.
 
-### 11. Cursor path uses ALL frames in shutter window, not just blended frames (`gmix_source.cpp:704-767`)
-- **Problem**: Cursor path only used `n` frames (capped by `maxBlendFrames`, default 64), but at high capture rates (240fps, 360fps) there are 4-6x more frames in the 1/60s shutter window than blended frames. This meant the polyline was undersampled relative to the actual cursor trajectory.
-- **Fix**: Build cursor path from `pathFrameCount` = ALL frames in shutter window (not capped), while blended frames remain capped by `maxBlendFrames`. At 240fps game with 1/60s window: 4 path points per blended frame. At 360fps: 6 path points per blended frame.
-- The interpolation logic already handled unavailable positions; now it just runs on the denser frame set.
-- Result: Much denser, smoother polyline that matches the actual cursor motion at sub-frame granularity.
+The plugin's Properties dialog adds:
+- **"Apps with the GMix layer loaded"** dropdown — one entry per status file,
+  target apps first, then freshest first, labelled with state and target
+  (`... NOT the capture target (target is 'osu!')`), `[stale - process gone?]`
+  when mtime is >10s old (crash/SIGKILL leftovers), and a disabled
+  "(none found)" entry when the directory is empty/missing.
+- **Refresh detected apps** button (returns true → OBS rebuilds properties).
+- A receiver status line (`OBS_TEXT_INFO`) from a new
+  `GmixEngine::producerConnected` atomic — proves the plugin's end, as
+  opposed to the layer's.
+- Picking an entry writes its `comm` into the "Capture target" setting (so
+  `osu!.exe` can be picked instead of typing it); like the target text field
+  itself, it only takes effect when the app next starts, since the layer
+  reads `~/.config/gmix/target_process` at `vkCreateInstance`. Uses the same
+  one-per-dialog-build auto-fire guard as the other modified callbacks.
 
+Note the layer's target is read from the file (currently `osu!`), not from
+`GMIX_TARGET_PROCESS`; the env var is only the manifest's on/off switch.
 
-## ADDED (2026-08-06, continued): True temporal average blur (no smoothstep/crossfade)
+Tests: `tests/test_layer_status.cpp` (ctest `layer_status`) covers the file
+contents, atomic state rewrite and the heartbeat mtime bump using a temp
+`$HOME`. End-to-end check without disturbing the running OBS: run a
+non-matching Vulkan process
+(`ENABLE_GMIX=1 GMIX_TARGET_PROCESS=x vulkaninfo`) and sample the status
+file while it lives — confirmed `state=not-target`, `matched=0`, and the
+file disappearing on exit.
 
-### 12. True temporal average along full path (`shaders/cursor_path_blur.comp`)
-- **Problem**: Previous shader used smoothstep crossfade (rest↔smear), comet envelope, and artificial head/tail fade. This created unnatural transitions and didn't match real motion blur physics.
-- **Fix**: Rewrote as a PURE temporal average:
-  - Sample ALL path points equally (not regular intervals)
-  - Weight only by perpendicular distance to path (quadratic falloff)
-  - Average all samples together → `blurred = sum(sample * weight) / sum(weight)`
-  - Where cursor lingers (dense points): more samples overlap → naturally BRIGHTER/denser
-  - Where cursor moves fast (sparse points): fewer samples → naturally DIMMER
-  - NO crossfade, NO comet envelope, NO smoothstep thresholds
-  - Simple mix with original: `mix(orig, blurred, blurStrength * edge)`
-- Result: Clean, physically-correct motion blur. The trail brightness naturally follows frame density (cursor dwell time) with zero artificial parameters.
+## TUNED (2026-10-31): present thread never blocks anywhere + 4500fps receive cap + bandwidth benchmark
 
+Audit of the game's own present thread (the one thing that can make the game
+lag from outside the game) surfaced exactly one blocking call left in it:
+
+- `sendHandshake()` (blocking send + ack read, bounded by the connection's
+  5ms SO_SNDTIMEO each way, ~10ms worst case) ran directly in
+  `maybeExportFrame()` -- i.e. ON the app's present thread -- on the first
+  export after every (re)connect. A hiccup in the game exactly when OBS
+  attached (or reconencted after OBS restart). It now runs on the layer's
+  connector thread: the present thread only publishes the swapchain size
+  into `pendingW_/H_` (no blocking at all) and returns; exports begin once
+  the handshake landed (first frame delayed by <= ~1 connector-loop second).
+  Consequences that had to follow:
+  - `sender_` is now a `std::shared_ptr` (the connector snapshots it so the
+    present thread can still drop a dead connection concurrently),
+  - `handshakeSent_` is `std::atomic<bool>` (written by the connector,
+    read by the present thread),
+  - the failing-handshake path resets the sender on the CONNECTOR thread,
+    reconnecting on its next ~1s cycle.
+
+Everything else on the present thread was already non-blocking: per-slot GPU
+work is submitted async (fences polled via `vkGetFenceStatus`, never
+`vkWaitForFences`), the frame send uses `MSG_DONTWAIT` (backpressure skips
+the frame instead of waiting), and the export throttle gates attempts.
+
+Rate cap: the game's own fps can be arbitrarily high (osu! stable at
+'unlimited' easily exceeds 4500), so both sides now hard-cap at ~4500fps
+(222.223us minimum between captures/sends):
+- producer: `kExportInterval` 200us -> 222.223us,
+- receiver (enforcement point, `recvFrame()` loop in gmix_source.cpp):
+  accepted frames must be >=222.223s apart... (>=222.223us apart); the clock
+  only advances on frames that are actually processed, so a burst after an
+  idle period is not throttled. Capped frames are closed unread (the
+  expensive import work is skipped entirely) and logged at most once per ~2s
+  with a count, like the overload path.
+Before this the producer exported up to ~5000fps and frames were only
+dropped when the blend fell behind (backlog); now the waste upstream is
+bounded and the receive rate is guaranteed.
+
+Zero-copy confirmation: audited the whole pipeline for CPU copies -- there
+are none on the live path (only the tiny cursor-path upload and the
+debug-only `readbackDst` map/memcpy). The producer does one GPU blit into a
+device-local exportable image, everything crosses IPC as dma-buf fd +
+opaque-fd timeline semaphore, and OBS imports via
+`gs_texture_create_from_dmabuf` once per ring slot. To make the property
+verification instead of trust, the plugin now logs once per producer
+connection: "gmix: producer connected (WxH) -- zero-copy dma-buf receive
+active" (after `dmaBufCapable()` gates it, so a non-capable setup bails
+before the line instead of silently degrading).
+
+GPU memory speed: added `tests/test_gpu_bandwidth.cpp` (ctest `gpu_bandwidth`)
+-- 60 alternating full-image device-to-device copies (2x 4096x4096 RGBA8
+device-local, ~15GiB traffic) on the blend's compute queue, reports GB/s and
+asserts a deliberately-low floor (>2GB/s) so a wrong device pick (llvmpipe
+fallback) fails instead of benchmarking nothing. Measured on the dev RX 480:
+121.8 GB/s (read+write), i.e. the 64MiB frame-size copies the pipeline makes
+are nowhere near memory-bound; the pipeline's real constraint remains the
+blend/dispatch cadence, not the frame handoff.
+
+## ROOT CAUSE #2 (2026-10-31 evening): GL-only game -> layer never sees a swapchain
+
+After the 00-gmix.cfg fix made `ENABLE_GMIX` reach the game, the layer did
+hook the game (instance/device created, socket connected, status file heart-
+beat ticking) yet OBS still received ZERO frames. winello.log held the
+smoking gun: `swapchain created` / `swapchain created` lines never appeared
+(wrap_CreateSwapchainKHR prints unconditionally) -- and exports require a
+swapchain (the blit source). Deeper: osu!stable renders through OpenGL (mesa
+libEGL/libGLX in the process maps, zero DXVK/zink driver image), and Wine
+does NOT translate GL to Vulkan. The VK instance/device observed earlier are
+enumeration probes; the game's actual presentation (GLX/DRI3 swap buffers)
+never touches Vulkan, so no present exists to hook.
+
+Fix: 00-gmix.cfg also exports `MESA_LOADER_DRIVER_OVERRIDE=zink` (mesa's
+GL-on-Vulkan). With it the same log immediately shows
+`recorded queue ... -> device ...`, `swapchain created ... extent=1920x1080`,
+the handshake lands and OBS logs `producer connected (1920x1080) -- zero-copy
+dma-buf receive active`; the plugin's own fps meter read producer ~600fps /
+consumer ~750fps. gmix_launch.sh now writes those lines into the template.
+
+Wine-context API notes that cost hours (record for the next time): winevulkan
+caches host proc pointers at device-create time via GDPA lookups (that is the
+ray-tracing/mesh-shader GDPA spam: winevulkan fills its thunk tables); stderr
+of wine children reaches winello.log; pressure-vessel scrubs env vars passed
+on the command line -> GMIX_* must be set inside the sourced 00-gmix.cfg
+(cfg-sourced vars DO survive, proven by GMIX_TARGET_PROCESS being present in
+/proc/<pid>/environ).
+
+## EXPORT GATE TELEMETRY (2026-10-31, debug aid)
+
+maybeExportFrame()'s early returns were all silent, which is exactly why
+"connected but zero frames" could not be chased before. Every gate now bumps
+a counter (expgate::telemetry in VulkanLayerCapture.cpp) and, at most once
+per second, the app's stderr gets one line: `GMIX export: ok=... noSender=...
+fenceBusy=... blitAvg=... blitMax=... n=...` (counters reset each print).
+The blit numbers are the PURE GPU cost of the inserted capture work: each
+ring-slot command buffer now records TWO GPU timestamps on the device's own
+clock -- one after the pre-blit barrier (transfer stage, just before
+vkCmdBlitImage) and the existing bottom-of-pipe one at the end -- queried on
+the slot-reuse fence poll (never blocking; wrap-aware diff for the
+timestampValidBits rollover). Measured on the RX 480 with Zink at ~450
+exports/s: blitAvg ~0.34ms, blitMax ~0.38ms. The user's perceived
+0.5ms -> 1-3ms latency delta on osu!'s performance panel is therefore mostly
+Zink rendering itself, not the capture; the chosen lever (user decision) is
+the capture-rate cap, see below.
+
+## FRAME RATE CAPS: 222223ns -> 500000ns (4500 -> 2000fps, 2026-10-31, user)
+
+Both sides now hard-cap at 2000fps: the producer's kExportInterval
+(VulkanLayerCapture.cpp, export throttle) and the receiver's
+kMinAcceptInterval (gmix_source.cpp receive cap, log text updated to
+"2000fps"). Caveat recorded for the user: the cap only throttles when the
+present rate EXCEEDS it; at ~450-600 present/s every frame is still captured
+and still pays the ~0.34ms blit, so lowering the cap below the present rate
+is the only lever that removes per-frame capture GPU cost from most frames.
+
+Stale status files: SIGKILL'd processes (timeout, crashes) leave
+~/.cache/gmix/layers/<pid>.status behind with a frozen mtime; the plugin
+already flags stale entries. Script-driven cleanup lives in the session
+notes; the LayerStatus destructor only ever removes its own file.

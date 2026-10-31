@@ -1,25 +1,16 @@
 #version 450 core
-#extension GL_EXT_scalar_block_layout : enable
+// Polyline blur — create a smooth cursor trail along the true path.
+// Only affects pixels near the cursor path (within cursor radius).
+// For each pixel P: d = distance to polyline, apply blur only if within cursor tube.
+// Preserves cursor size while smoothing along the movement direction.
 
-// ─────────────────────────────────────────────────────────────────────────────
-// GMix cursor-path motion blur — LOCALIZED cursor trail only.
-// 
-// Applies a directional streak ONLY within `blurWidth` of the cursor's true
-// path through the shutter window. Outside that radius: pure passthrough of
-// the pass-1 (optical flow) result — no mixing, no falloff, no bloom here.
-// 
-// The streak is ADDITIVE: it adds a brightened trail on top of the optical-
-// flow-blended frame, simulating a glowing cursor motion trail.
-// ─────────────────────────────────────────────────────────────────────────────
-
-#define MAX_PTS 64   // must match kMaxBlendFrames
+#define MAX_PTS 64
 
 layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
 
-layout(set = 0, binding = 0, rgba8) readonly  uniform image2D blendSrc; // pass-1 result (optical flow)
-layout(set = 0, binding = 1, rgba8) writeonly uniform image2D dstImage; // final output
+layout(set = 0, binding = 0, rgba8) readonly uniform image2D blendSrc;
+layout(set = 0, binding = 1, rgba8) writeonly uniform image2D dstImage;
 
-// Cursor path in blend-buffer pixels, newest first, pointCount entries valid.
 layout(std430, set = 0, binding = 2) readonly buffer Path {
     vec2 pts[MAX_PTS];
 } path;
@@ -27,137 +18,138 @@ layout(std430, set = 0, binding = 2) readonly buffer Path {
 layout(push_constant) uniform PC {
     uint  frameW;
     uint  frameH;
-    uint  pointCount;    // valid entries in path.pts (0..MAX_PTS)
-    float blurWidth;     // half-thickness of the streak in px (~cursor radius)
-    float blurStrength;  // streak intensity (0..3, >1 = glow boost)
-    float trailFade;     // extra fade px beyond blurWidth for smoother edge
-    float trailFadeIn;   // fade-in factor (0..1, CPU computes from trailFadeInTime)
-    float bboxMinX;      // cursor-tube bounding box (path extent + margin)
-    float bboxMinY;      // pixels outside it skip ALL path math
+    uint  pointCount;
+    float blurWidth;     // half-thickness from centerline (px) ~ cursor radius
+    float blurStrength;  // 0..3
+    float trailFade;     // soft edge beyond width (px)
+    uint  splineSubdiv;  // compat, unused
+    float bboxMinX;
+    float bboxMinY;
     float bboxMaxX;
     float bboxMaxY;
 } pc;
 
-vec4 loadClamped(ivec2 p, ivec2 sz) {
-    return imageLoad(blendSrc, clamp(p, ivec2(0), sz - ivec2(1)));
+vec3 ldc(ivec2 p, ivec2 sz) {
+    return imageLoad(blendSrc, clamp(p, ivec2(0), sz - ivec2(1))).rgb;
 }
 
-float luma(vec3 c) { return dot(c, vec3(0.299, 0.587, 0.114)); }
-
-void main()
-{
+void main() {
     uvec2 gid = gl_GlobalInvocationID.xy;
     if (gid.x >= pc.frameW || gid.y >= pc.frameH) return;
-
     ivec2 sz = ivec2(pc.frameW, pc.frameH);
-    ivec2 P  = ivec2(gid);
-    vec4  base = loadClamped(P, sz);  // pass-1 optical flow result
-
-    // Feature off / nothing to trace: pure passthrough.
-    if (pc.pointCount < 2u || pc.blurWidth <= 0.0f || pc.blurStrength <= 0.0f) {
-        imageStore(dstImage, P, base);
+    ivec2 P = ivec2(gid);
+    vec4 orig = imageLoad(blendSrc, P);
+    if (pc.pointCount < 2u || pc.blurWidth <= 0.0 || pc.blurStrength <= 0.0) {
+        imageStore(dstImage, P, orig);
         return;
     }
-
-    vec2 fp = vec2(P) + 0.5f;
-
-    // Outside the path bounding box: pure passthrough (early exit).
-    if (fp.x < pc.bboxMinX || fp.x > pc.bboxMaxX ||
-        fp.y < pc.bboxMinY || fp.y > pc.bboxMaxY) {
-        imageStore(dstImage, P, base);
+    vec2 fp = vec2(P) + 0.5;
+    if (fp.x < pc.bboxMinX || fp.x > pc.bboxMaxX || fp.y < pc.bboxMinY || fp.y > pc.bboxMaxY) {
+        imageStore(dstImage, P, orig);
         return;
     }
+    uint n = pc.pointCount;
+    float segLens[MAX_PTS];
+    float prefix[MAX_PTS+1];
+    prefix[0]=0.0;
+    float totalLen=0.0;
+    for (uint i=0u; i+1u<n; ++i){ float L=distance(path.pts[i], path.pts[i+1u]); segLens[i]=L; totalLen+=L; prefix[i+1]=totalLen; }
+    if (totalLen < 1e-6) totalLen=1.0;
 
-    // ── Find perpendicular distance to full path polyline ──
-    float bestDist = 1e9f;
-    float totalPathLen = 0.0f;
+    float bestDist=1e9;
+    vec2 bestProj=vec2(0.0);
+    vec2 bestTan=vec2(0.0);
+    float bestSegLen=0.0;
+    float bestParam=0.0; // 0 tail .. 1 head (along totalLen)
+    uint bestI=0u;
 
-    // Total path length
-    for (uint i = 0u; i + 1u < pc.pointCount; ++i) {
-        totalPathLen += length(path.pts[i + 1u] - path.pts[i]);
-    }
-
-    // Nearest point on path polyline
-    float accumulatedLen = 0.0f;
-    for (uint i = 0u; i + 1u < pc.pointCount; ++i) {
-        vec2 a = path.pts[i];
-        vec2 b = path.pts[i + 1u];
-        vec2 ab = b - a;
-        float len2 = dot(ab, ab);
-        if (len2 < 1e-6f) continue;
-        float t = clamp(dot(fp - a, ab) / len2, 0.0f, 1.0f);
-        vec2 proj = a + t * ab;
-        float d = distance(fp, proj);
-        if (d < bestDist) bestDist = d;
-        accumulatedLen += length(ab);
-    }
-
-    // Head cap (extend slightly beyond first point)
-    if (pc.pointCount >= 2u) {
-        vec2 hd = path.pts[0] - path.pts[1];
-        float hl = length(hd);
-        if (hl > 1e-3f) {
-            vec2 dir = hd / hl;
-            vec2 a = path.pts[0];
-            vec2 b = a + dir * clamp(hl * 4.0f, 0.0f, pc.blurWidth);
-            vec2 ab = b - a;
-            float len2 = dot(ab, ab);
-            if (len2 > 1e-6f) {
-                float t = clamp(dot(fp - a, ab) / len2, 0.0f, 1.0f);
-                float d = distance(fp, a + t * ab);
-                if (d < bestDist) bestDist = d;
-            }
+    for (uint i=0u; i+1u<n; ++i){
+        vec2 a=path.pts[i]; vec2 b=path.pts[i+1u];
+        vec2 ab=b-a; float len2=dot(ab,ab); if(len2<1e-8) continue;
+        float t=clamp(dot(fp - a, ab)/len2, 0.0, 1.0);
+        vec2 proj=a + t*ab;
+        float d=distance(fp, proj);
+        if(d < bestDist){
+            bestDist=d;
+            bestProj=proj;
+            float segL=segLens[i];
+            bestSegLen=segL;
+            // param along total length: tail=0 ... head=1 . Since pts[0]=head, pts[n-1]=tail,
+            // prefix[0]=0 at head segment start, increasing toward tail. So head param = 1, tail=0.
+            // prefix[i] is distance from head to start of segment i.
+            float along = prefix[i] + t*segL;
+            bestParam = 1.0 - along / totalLen; // 1 at head, 0 at tail
+            float L=sqrt(len2);
+            bestTan = (L>1e-5)? (ab / L) : vec2(0.0);
+            bestI=i;
         }
     }
 
-    // HARD CUTOFF at blurWidth + trailFade: outside = pure passthrough.
-    float maxDist = pc.blurWidth + pc.trailFade;
-    if (bestDist > maxDist) {
-        imageStore(dstImage, P, base);
-        return;
-    }
-
-    // ── Inside cursor trail: ADDITIVE streak over optical flow base ──
-    // Weight by perpendicular distance with smooth falloff.
-    float perpWeight;
-    if (bestDist <= pc.blurWidth) {
-        // Full strength within blurWidth
-        perpWeight = 1.0f - (bestDist / pc.blurWidth);
-        perpWeight *= perpWeight;  // quadratic for softer core
-    } else {
-        // Fade out in trailFade region beyond blurWidth
-        float fadeT = (bestDist - pc.blurWidth) / pc.trailFade;
-        perpWeight = (1.0f - fadeT) * (1.0f - fadeT);  // quadratic fade
-    }
-
-    // Sample the base color at the nearest path point (cursor position).
-    // This creates a streak that follows the cursor's exact sampled positions.
-    vec3 streakColor = vec3(0.0f);
-    float streakWeight = 0.0f;
-
-    for (uint i = 0u; i < pc.pointCount; ++i) {
-        vec2 samplePos = path.pts[i];
-        float d = distance(fp, samplePos);
-        if (d > pc.blurWidth) continue;  // only nearby path points contribute
-        float w = 1.0f - d / pc.blurWidth;
-        w *= w;
-        streakColor += loadClamped(P + ivec2(round(samplePos - fp)), sz).rgb * w;
-        streakWeight += w;
-    }
-
-    vec3 streak = (streakWeight > 0.0f) ? (streakColor / streakWeight) : base.rgb;
-
-    // Additive blend: base + streak * strength
-    // blurStrength 0..1: subtle trail. >1: glow boost (additive).
-    float strength = clamp(pc.blurStrength, 0.0f, 3.0f);
+    // CRITICAL FIX: Only affect pixels within the cursor tube (blurWidth + trailFade)
+    // This prevents smearing everything and keeps the effect constrained to cursor size
+    float outer = pc.blurWidth + max(pc.trailFade, 0.0);
+    float inner = max(pc.blurWidth - 1.5, 0.0); // softer inner edge
+    float wCross = 1.0 - smoothstep(inner, outer, bestDist);
     
-    // Apply fade-in factor (CPU computes from trailFadeInTime)
-    strength *= pc.trailFadeIn;
+    // Early exit for pixels far from the path - preserves original image
+    if(wCross <= 0.01){ imageStore(dstImage, P, orig); return; }
 
-    vec3 result = base.rgb + streak * perpWeight * strength;
+    // Calculate speed-based weighting for natural motion blur
+    float speed = totalLen / float(max(n-1u,1u));
+    float moving = clamp(speed / 3.0, 0.0, 1.0);
+    
+    // wAlong: head 1.0, tail fades out, only when moving
+    float wAlong = mix(1.0, mix(0.3, 1.0, bestParam), moving);
+    
+    // Blend strength gated by distance from path and movement
+    float amt = wCross * wAlong * clamp(pc.blurStrength, 0.0, 3.0);
+    if(amt <= 0.01){ imageStore(dstImage, P, orig); return; }
 
-    // Clamp to prevent over-brightening static areas
-    result = min(result, vec3(1.0f));
+    // Small isotropic blur for stationary/slow regions (preserves cursor detail)
+    vec3 still;
+    {
+        float base = max(pc.blurWidth * 0.12, 0.8);
+        int o1=int(round(base+0.5));
+        int o2=int(round(base*1.8+0.5));
+        vec3 s3=orig.rgb*4.0;
+        s3 += 2.0*(ldc(P+ivec2(o1,0),sz)+ldc(P+ivec2(-o1,0),sz)+ldc(P+ivec2(0,o1),sz)+ldc(P+ivec2(0,-o1),sz));
+        s3 += (ldc(P+ivec2(o2,o2),sz)+ldc(P+ivec2(-o2,o2),sz)+ldc(P+ivec2(o2,-o2),sz)+ldc(P+ivec2(-o2,-o2),sz));
+        still=s3/16.0;
+    }
+    
+    // Directional smear ALONG the path tangent ONLY (not perpendicular)
+    // This creates smooth trail without widening the cursor
+    vec3 smear = still;
+    if(bestSegLen >= 0.5 && dot(bestTan,bestTan)>1e-6){
+        // Limit smear length based on actual movement between points
+        float halfLen = min(bestSegLen * 0.35, 12.0); // reduced from 0.5 to 0.35
+        int taps = int(clamp(halfLen * 1.5, 2.0, 16.0));
+        vec3 acc=vec3(0.0);
+        float wsum=0.0;
+        
+        // Gaussian-weighted sampling along path direction
+        for(int s=-taps; s<=taps; ++s){
+            float u=float(s)/float(max(taps,1));
+            float gaussian = exp(-2.5 * u * u); // tighter gaussian weight
+            vec2 off=bestTan * (halfLen * u);
+            // Sample at projection + offset along tangent
+            ivec2 sp = ivec2(bestProj + off + 0.5);
+            acc += ldc(sp, sz) * gaussian;
+            wsum += gaussian;
+        }
+        smear = wsum>0.0? acc / wsum : still;
+    }
+    
+    // Motion-gated blending: more smear when moving fast
+    float m = clamp(bestSegLen / 3.0, 0.0, 1.0);
+    vec3 blurred = mix(still, smear, m);
 
-    imageStore(dstImage, P, vec4(result, 1.0f));
+    // Gentle brightness boost for high-strength values (glow effect)
+    float over = max(amt - 1.5, 0.0);
+    vec3 bcol = blurred * (1.0 + 0.25 * over);
+    
+    // Final blend: mix original with blurred based on calculated amount
+    vec4 outc = mix(orig, vec4(bcol, 1.0), min(amt, 1.0));
+    outc.a=1.0;
+    imageStore(dstImage, P, outc);
 }

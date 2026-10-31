@@ -36,8 +36,8 @@ struct alignas(4) CursorPC {
     uint32_t pointCount;
     float    blurWidth;
     float    blurStrength;
-    float    trailFade;  // extra fade px beyond blurWidth
-    float    trailFadeIn;  // fade-in factor 0..1 (CPU computes from trailFadeInTime)
+    float    trailFade;  // extra fade px beyond blurWidth for smoother edge
+    uint32_t splineSubdiv;  // Catmull-Rom subdivisions per segment (1 = linear, 4+ = smooth)
     // Bounding box of the cursor tube (path extent + margin), in pixels.
     // Pixels outside it early-out BEFORE the per-pixel nearest-segment scan --
     // without this, every pixel of the full frame paid the whole path loop
@@ -110,10 +110,6 @@ void BlendEngine::destroyAll() {
     // cmd_ is freed implicitly with its pool.
     cmd_ = VK_NULL_HANDLE;
     blendInFlight_ = false;
-    cursorFade_ = 0.0f;
-    trailFadeIn_ = 1.0f;
-    lastValidCursorTime_ = 0.0;
-    lastTrailStartTime_ = 0.0;
     if (cmdPool_)       { vkDestroyCommandPool(dev, cmdPool_, nullptr); cmdPool_ = VK_NULL_HANDLE; }
     destroyTransient();
     initialized_ = false;
@@ -141,16 +137,15 @@ void BlendEngine::destroyTransient() {
     dsLayout2_   = VK_NULL_HANDLE;
     descPool2_   = VK_NULL_HANDLE;
     descSet2_    = VK_NULL_HANDLE;
-    // Pass 3 (bloom) transient objects.
-    if (pipeline3_)   vkDestroyPipeline(dev, pipeline3_, nullptr);
-    if (pipeLayout3_) vkDestroyPipelineLayout(dev, pipeLayout3_, nullptr);
-    if (dsLayout3_)   vkDestroyDescriptorSetLayout(dev, dsLayout3_, nullptr);
-    if (descPool3_)   vkDestroyDescriptorPool(dev, descPool3_, nullptr);
-    pipeline3_   = VK_NULL_HANDLE;
-    pipeLayout3_ = VK_NULL_HANDLE;
-    dsLayout3_   = VK_NULL_HANDLE;
-    descPool3_   = VK_NULL_HANDLE;
-    descSet3_    = VK_NULL_HANDLE;
+    if (pipelineP_)   vkDestroyPipeline(dev, pipelineP_, nullptr);
+    if (pipeLayoutP_) vkDestroyPipelineLayout(dev, pipeLayoutP_, nullptr);
+    if (dsLayoutP_)   vkDestroyDescriptorSetLayout(dev, dsLayoutP_, nullptr);
+    if (descPoolP_)   vkDestroyDescriptorPool(dev, descPoolP_, nullptr);
+    pipelineP_   = VK_NULL_HANDLE;
+    pipeLayoutP_ = VK_NULL_HANDLE;
+    dsLayoutP_   = VK_NULL_HANDLE;
+    descPoolP_   = VK_NULL_HANDLE;
+    descSetP_    = VK_NULL_HANDLE;
 }
 
 bool BlendEngine::init(uint32_t w, uint32_t h, uint32_t dstBufferCount) {
@@ -209,7 +204,7 @@ bool BlendEngine::init(uint32_t w, uint32_t h, uint32_t dstBufferCount) {
     if (!createPipeline())    return false;
     if (!createIntermediateImage()) return false;
     if (!createCursorPass())  return false;
-    if (!createBloomPass())   return false;
+    if (!createPassthrough()) return false;
 
     initialized_ = true;
     return true;
@@ -690,62 +685,71 @@ bool BlendEngine::createCursorPass() {
     return true;
 }
 
-// ─── Pass 3: cursor bloom/glow (cursor_bloom.comp) ───────────────────────────
-// Single-pass bright boost within cursor trail bounding box (no intermediate images).
-bool BlendEngine::createBloomPass() {
+bool BlendEngine::createPassthrough() {
     VkDevice dev = vk_.device();
 
-    // Descriptor set layout: 0=src (read), 1=dst (write), both storage images.
-    // We use the SAME image for src and dst (in-place), so only 1 descriptor needed.
     VkDescriptorSetLayoutBinding b[2]{};
-    b[0].binding = 0; b[0].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
-    b[0].descriptorCount = 1; b[0].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
-    b[1].binding = 1; b[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
-    b[1].descriptorCount = 1; b[1].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+    b[0].binding = 0;
+    b[0].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+    b[0].descriptorCount = 1;
+    b[0].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+    b[1].binding = 1;
+    b[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+    b[1].descriptorCount = 1;
+    b[1].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
 
     VkDescriptorSetLayoutCreateInfo lci{};
     lci.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
     lci.bindingCount = 2;
     lci.pBindings = b;
-    if (vkCreateDescriptorSetLayout(dev, &lci, nullptr, &dsLayout3_) != VK_SUCCESS) {
-        std::fprintf(stderr, "gmix: blend: bloom dsLayout failed\n");
+    if (vkCreateDescriptorSetLayout(dev, &lci, nullptr, &dsLayoutP_) != VK_SUCCESS) {
+        std::fprintf(stderr, "gmix: blend: passthrough dsLayout failed\n");
         return false;
     }
 
-    VkDescriptorPoolSize ps[1]{};
-    ps[0].type = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE; ps[0].descriptorCount = 2;
+    VkDescriptorPoolSize ps{};
+    ps.type = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+    ps.descriptorCount = 2;
+
     VkDescriptorPoolCreateInfo ppi{};
     ppi.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
     ppi.maxSets = 1;
     ppi.poolSizeCount = 1;
-    ppi.pPoolSizes = ps;
-    if (vkCreateDescriptorPool(dev, &ppi, nullptr, &descPool3_) != VK_SUCCESS) return false;
+    ppi.pPoolSizes = &ps;
+    if (vkCreateDescriptorPool(dev, &ppi, nullptr, &descPoolP_) != VK_SUCCESS) {
+        std::fprintf(stderr, "gmix: blend: passthrough descPool failed\n");
+        return false;
+    }
 
     VkDescriptorSetAllocateInfo ai{};
     ai.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
-    ai.descriptorPool = descPool3_;
+    ai.descriptorPool = descPoolP_;
     ai.descriptorSetCount = 1;
-    ai.pSetLayouts = &dsLayout3_;
-    if (vkAllocateDescriptorSets(dev, &ai, &descSet3_) != VK_SUCCESS) return false;
+    ai.pSetLayouts = &dsLayoutP_;
+    if (vkAllocateDescriptorSets(dev, &ai, &descSetP_) != VK_SUCCESS) {
+        std::fprintf(stderr, "gmix: blend: passthrough descSet alloc failed\n");
+        return false;
+    }
 
-    // Push constants: frameW, frameH, threshold, strength, radius, bboxMinX, bboxMinY, bboxMaxX, bboxMaxY
     VkPushConstantRange pcr{};
     pcr.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
     pcr.offset = 0;
-    pcr.size = 2 * sizeof(uint32_t) + 7 * sizeof(float); // 2 uints + 7 floats = 8+28=36 bytes
-    pcr.size = ((pcr.size + 15) / 16) * 16;  // align to 16 bytes = 48 bytes
+    pcr.size = 2 * sizeof(uint32_t);
 
     VkPipelineLayoutCreateInfo pli{};
     pli.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
     pli.setLayoutCount = 1;
-    pli.pSetLayouts = &dsLayout3_;
+    pli.pSetLayouts = &dsLayoutP_;
     pli.pushConstantRangeCount = 1;
     pli.pPushConstantRanges = &pcr;
-    if (vkCreatePipelineLayout(dev, &pli, nullptr, &pipeLayout3_) != VK_SUCCESS) return false;
+    if (vkCreatePipelineLayout(dev, &pli, nullptr, &pipeLayoutP_) != VK_SUCCESS) {
+        std::fprintf(stderr, "gmix: blend: passthrough pipeLayout failed\n");
+        return false;
+    }
 
-    auto code = readFile(GMIX_SHADER_DIR "/cursor_bloom.spv");
+    auto code = readFile(GMIX_SHADER_DIR "/passthrough.spv");
     if (code.empty()) {
-        std::fprintf(stderr, "gmix: blend: cannot read cursor_bloom.spv\n");
+        std::fprintf(stderr, "gmix: blend: cannot read passthrough.spv\n");
         return false;
     }
     VkShaderModuleCreateInfo smi{};
@@ -754,7 +758,7 @@ bool BlendEngine::createBloomPass() {
     smi.pCode = reinterpret_cast<const uint32_t*>(code.data());
     VkShaderModule mod{};
     if (vkCreateShaderModule(dev, &smi, nullptr, &mod) != VK_SUCCESS) {
-        std::fprintf(stderr, "gmix: blend: bloom shader module failed\n");
+        std::fprintf(stderr, "gmix: blend: passthrough shader module failed\n");
         return false;
     }
     VkComputePipelineCreateInfo cpi{};
@@ -763,13 +767,121 @@ bool BlendEngine::createBloomPass() {
     cpi.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
     cpi.stage.module = mod;
     cpi.stage.pName = "main";
-    cpi.layout = pipeLayout3_;
-    VkResult r = vkCreateComputePipelines(dev, VK_NULL_HANDLE, 1, &cpi, nullptr, &pipeline3_);
+    cpi.layout = pipeLayoutP_;
+    VkResult r = vkCreateComputePipelines(dev, VK_NULL_HANDLE, 1, &cpi, nullptr, &pipelineP_);
     vkDestroyShaderModule(dev, mod, nullptr);
     if (r != VK_SUCCESS) {
-        std::fprintf(stderr, "gmix: blend: bloom pipeline create failed (%d)\n", r);
+        std::fprintf(stderr, "gmix: blend: passthrough pipeline create failed (%d)\n", r);
         return false;
     }
+    return true;
+}
+
+bool BlendEngine::dispatchPassthrough(VkImageView srcView, uint32_t dstIdx,
+                                      VkSemaphore waitSem, uint64_t waitVal) {
+    if (!initialized_) return false;
+    if (dstIdx >= numDstBuffers_) return false;
+
+    VkDevice dev = vk_.device();
+
+    VkDescriptorImageInfo srcInfo{};
+    srcInfo.imageView = srcView;
+    srcInfo.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+    VkDescriptorImageInfo dstInfo{};
+    dstInfo.imageView = dstView_[dstIdx];
+    dstInfo.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+
+    VkWriteDescriptorSet writes[2]{};
+    writes[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    writes[0].dstSet = descSetP_;
+    writes[0].dstBinding = 0;
+    writes[0].descriptorCount = 1;
+    writes[0].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+    writes[0].pImageInfo = &srcInfo;
+    writes[1].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    writes[1].dstSet = descSetP_;
+    writes[1].dstBinding = 1;
+    writes[1].descriptorCount = 1;
+    writes[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+    writes[1].pImageInfo = &dstInfo;
+    vkUpdateDescriptorSets(dev, 2, writes, 0, nullptr);
+
+    VkCommandBuffer cmd = cmd_;
+    VkCommandBufferBeginInfo bi{};
+    bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+    bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    vkBeginCommandBuffer(cmd, &bi);
+
+    uint32_t gx = (width_  + 7) / 8;
+    uint32_t gy = (height_ + 7) / 8;
+
+    VkImageMemoryBarrier dstBar{};
+    dstBar.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+    dstBar.srcAccessMask = 0;
+    dstBar.dstAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+    dstBar.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    dstBar.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+    dstBar.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    dstBar.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    dstBar.image = dstImage_[dstIdx];
+    dstBar.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0,
+                         0, nullptr, 0, nullptr, 1, &dstBar);
+
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipelineP_);
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipeLayoutP_,
+                            0, 1, &descSetP_, 0, nullptr);
+    uint32_t pc[2] = { width_, height_ };
+    vkCmdPushConstants(cmd, pipeLayoutP_, VK_SHADER_STAGE_COMPUTE_BIT,
+                       0, sizeof(pc), pc);
+    vkCmdDispatch(cmd, gx, gy, 1);
+
+    VkImageMemoryBarrier dstOutBar{};
+    dstOutBar.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+    dstOutBar.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+    dstOutBar.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+    dstOutBar.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+    dstOutBar.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+    dstOutBar.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    dstOutBar.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    dstOutBar.image = dstImage_[dstIdx];
+    dstOutBar.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                         VK_PIPELINE_STAGE_TRANSFER_BIT, 0,
+                         0, nullptr, 0, nullptr, 1, &dstOutBar);
+
+    vkEndCommandBuffer(cmd);
+
+    uint64_t signalValue = ++blendValue_;
+    VkTimelineSemaphoreSubmitInfo tssi{};
+    tssi.sType = VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO;
+
+    VkPipelineStageFlags waitStage = VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
+    if (waitSem != VK_NULL_HANDLE) {
+        tssi.waitSemaphoreValueCount = 1;
+        tssi.pWaitSemaphoreValues = &waitVal;
+    }
+    tssi.signalSemaphoreValueCount = 1;
+    tssi.pSignalSemaphoreValues = &signalValue;
+
+    VkSubmitInfo si{};
+    si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+    si.pNext = &tssi;
+    si.waitSemaphoreCount = (waitSem != VK_NULL_HANDLE) ? 1 : 0;
+    si.pWaitSemaphores = (waitSem != VK_NULL_HANDLE) ? &waitSem : nullptr;
+    si.pWaitDstStageMask = (waitSem != VK_NULL_HANDLE) ? &waitStage : nullptr;
+    si.commandBufferCount = 1;
+    si.pCommandBuffers = &cmd;
+    si.signalSemaphoreCount = 1;
+    si.pSignalSemaphores = &blendTimeline_;
+
+    if (vkQueueSubmit(vk_.computeQueue(), 1, &si, VK_NULL_HANDLE) != VK_SUCCESS) {
+        --blendValue_;
+        return false;
+    }
+    inFlightValue_ = signalValue;
+    blendInFlight_ = true;
     return true;
 }
 
@@ -786,8 +898,7 @@ VkImageView BlendEngine::dispatch(VkImageView* srcViews, uint32_t srcCount,
 bool BlendEngine::dispatchAsync(VkImageView* srcViews, uint32_t srcCount, uint32_t dstIdx,
                                 const VkSemaphore* waitSems, const uint64_t* waitVals,
                                 uint32_t waitCount, ResampleParams resample,
-                                const CursorPathBlur& cursor,
-                                const BloomParams& bloom) {
+                                const CursorPathBlur& cursor) {
     if (!initialized_) return false;
     if (srcCount == 0 || srcCount > (uint32_t)kMaxBlendFrames) return false;
     if (dstIdx >= numDstBuffers_) return false;
@@ -937,7 +1048,7 @@ bool BlendEngine::dispatchAsync(VkImageView* srcViews, uint32_t srcCount, uint32
     cpc.blurWidth = cursor.width;
     cpc.blurStrength = cursor.strength;
     cpc.trailFade = cursor.trailFade;
-    cpc.trailFadeIn = trailFadeIn_;
+    cpc.splineSubdiv = cursor.splineSubdiv;
     // Tube bounding box: path extent + margin. Margin covers the tube radius
     // (blurWidth + trailFade) plus the head cap's forward reach plus rounding slack.
     {
@@ -959,113 +1070,6 @@ bool BlendEngine::dispatchAsync(VkImageView* srcViews, uint32_t srcCount, uint32
     vkCmdPushConstants(cmd, pipeLayout2_, VK_SHADER_STAGE_COMPUTE_BIT,
                        0, sizeof(CursorPC), &cpc);
     vkCmdDispatch(cmd, gx, gy, 1);
-
-// ── Pass 3: Bloom/glow on cursor trail (single-pass, bbox-culled) ─────────────
-    // Only run if bloom is enabled and radius > 0.
-    if (bloom.enabled && bloom.radius > 0.0f && bloom.strength > 0.0f) {
-        // Barrier: dst (pass-2 output) → GENERAL for bloom read/write (in-place).
-        VkImageMemoryBarrier bloomBar{};
-        bloomBar.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
-        bloomBar.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
-        bloomBar.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
-        bloomBar.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
-        bloomBar.newLayout = VK_IMAGE_LAYOUT_GENERAL;
-        bloomBar.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-        bloomBar.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-        bloomBar.image = dstImage_[dstIdx];
-        bloomBar.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
-        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                             VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0,
-                             0, nullptr, 0, nullptr, 1, &bloomBar);
-
-        // Descriptor set: src=dst (read), dst=dst (write) — in-place.
-        VkDescriptorImageInfo bloomSrcInfo{};
-        bloomSrcInfo.imageView = dstView_[dstIdx];
-        bloomSrcInfo.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
-        VkDescriptorImageInfo bloomDstInfo{};
-        bloomDstInfo.imageView = dstView_[dstIdx];
-        bloomDstInfo.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
-        VkWriteDescriptorSet bloomWrites[2]{};
-        bloomWrites[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-        bloomWrites[0].dstSet = descSet3_;
-        bloomWrites[0].dstBinding = 0;
-        bloomWrites[0].descriptorCount = 1;
-        bloomWrites[0].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
-        bloomWrites[0].pImageInfo = &bloomSrcInfo;
-        bloomWrites[1].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-        bloomWrites[1].dstSet = descSet3_;
-        bloomWrites[1].dstBinding = 1;
-        bloomWrites[1].descriptorCount = 1;
-        bloomWrites[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
-        bloomWrites[1].pImageInfo = &bloomDstInfo;
-        vkUpdateDescriptorSets(dev, 2, bloomWrites, 0, nullptr);
-
-        // Single-pass bloom with bbox culling (same bbox as cursor path).
-        struct BloomPC {
-            uint32_t frameW;
-            uint32_t frameH;
-            float    bloomThreshold;
-            float    bloomStrength;
-            float    bloomRadius;
-            float    bboxMinX;
-            float    bboxMinY;
-            float    bboxMaxX;
-            float    bboxMaxY;
-        };
-        BloomPC bpc{};
-        bpc.frameW = width_;
-        bpc.frameH = height_;
-        bpc.bloomThreshold = bloom.threshold;
-        bpc.bloomStrength = bloom.strength;
-        bpc.bloomRadius = bloom.radius;
-        bpc.bboxMinX = cpc.bboxMinX;
-        bpc.bboxMinY = cpc.bboxMinY;
-        bpc.bboxMaxX = cpc.bboxMaxX;
-        bpc.bboxMaxY = cpc.bboxMaxY;
-        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline3_);
-        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipeLayout3_,
-                                0, 1, &descSet3_, 0, nullptr);
-        vkCmdPushConstants(cmd, pipeLayout3_, VK_SHADER_STAGE_COMPUTE_BIT,
-                           0, sizeof(BloomPC), &bpc);
-        vkCmdDispatch(cmd, gx, gy, 1);
-    }
-
-    // Trail fade state for cursor path blur (pass 2).
-    // Track fade state for release delay (smooth fade-out when cursor becomes invalid).
-    bool cursorValid = cursor.enabled && cursor.pointCount > 0;
-    double now = 0.0;
-    {
-        static uint64_t dispatchCount = 0;
-        now = dispatchCount * (1.0 / 60.0);
-        dispatchCount++;
-    }
-
-    if (cursorValid) {
-        cursorFade_ = 1.0f;
-        lastValidCursorTime_ = now;
-        if (trailFadeIn_ == 0.0f) {
-            lastTrailStartTime_ = now;
-        }
-    } else if (cursorFade_ > 0.0f) {
-        float elapsed = static_cast<float>(now - lastValidCursorTime_);
-        cursorFade_ = 1.0f - (elapsed / 0.3f);  // fixed 0.3s release for trail
-        if (cursorFade_ < 0.0f) cursorFade_ = 0.0f;
-    }
-
-    // Trail fade-in: only ramp up if trailFadeInTime > 0
-    bool trailActive = cursorValid || cursorFade_ > 0.0f;
-    if (cursor.trailFadeInTime > 0.0f) {
-        if (trailActive) {
-            if (cursorValid && trailFadeIn_ < 1.0f) {
-                float elapsed = static_cast<float>(now - lastTrailStartTime_);
-                trailFadeIn_ = std::min(1.0f, elapsed / cursor.trailFadeInTime);
-            }
-        } else {
-            trailFadeIn_ = 0.0f;
-        }
-    } else {
-        trailFadeIn_ = 1.0f;
-    }
 
     // dst → TRANSFER_SRC_OPTIMAL for the presenter to blit from.
     VkImageMemoryBarrier dstBar{};
